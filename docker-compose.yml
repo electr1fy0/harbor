@@ -1,0 +1,14 @@
+services:
+  harbor:
+    build: .
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - /Users/ayush/.orbstack/run/docker.sock:/Users/ayush/.orbstack/run/docker.sock
+    networks:
+      - harbor-network-1
+
+networks:
+  harbor-network-1:
+    name: harbor-network-1

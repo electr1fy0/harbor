@@ -2,44 +2,45 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"sync"
+	"strings"
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 )
 
-const defaultNetwork = "3a4928457ca6aa6b5cbae418fe577db8b7e4324d9d328f05f8d8b87af8eecee1"
-
-var hostMap = struct {
-	sync.RWMutex
-	mappings map[string]*httputil.ReverseProxy
-}{mappings: make(map[string]*httputil.ReverseProxy)}
-
 type deployRequest struct {
+	Name  string `json:"name"`
 	Image string `json:"image"`
-	Host  string `json:"host"`
 }
 
 type deployResponse struct {
 	ContainerID string                    `json:"container_id"`
 	Status      string                    `json:"status"`
-	Host        string                    `json:"host"`
 	Container   container.InspectResponse `json:"container"`
 }
 
+var harborNetwork = "harbor-network-1"
+
 func main() {
-	cli, err := client.New(client.FromEnv)
+	cli, err := client.New(client.WithHost("unix:///Users/ayush/.orbstack/run/docker.sock"))
 	if err != nil {
 		log.Fatalf("failed to create docker client: %v", err)
 	}
 
-	http.HandleFunc("POST /deploy", deployHandler(cli))
+	http.HandleFunc("POST /deployments", createDeployment(cli))
+	http.HandleFunc("GET /deployments", listDeployments(cli))
+	http.HandleFunc("POST /deployments/{id}/stop", stopDeployment(cli))
+	http.HandleFunc("POST /deployments/{id}/start", startDeployment(cli))
+	http.HandleFunc("DELETE /deployments/{id}", deleteDeployment(cli))
+	http.HandleFunc("GET /deployments/{id}/logs", getDeploymentLogs(cli))
+
 	go func() {
 		log.Println("api listening on :8080")
 		log.Fatal(http.ListenAndServe(":8080", nil))
@@ -57,16 +58,14 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		host = r.Host
 	}
 
-	hostMap.RLock()
-	proxy, ok := hostMap.mappings[host]
-	hostMap.RUnlock()
-
-	if !ok {
-		http.Error(w, "no backend for host", http.StatusBadGateway)
+	name := strings.Split(host, ".")[0]
+	if name == "" {
+		http.Error(w, "no container for host", http.StatusBadGateway)
 		return
 	}
 
-	proxy.ServeHTTP(w, r)
+	target, _ := url.Parse("http://" + name)
+	httputil.NewSingleHostReverseProxy(target).ServeHTTP(w, r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -75,19 +74,19 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func deployHandler(cli *client.Client) http.HandlerFunc {
+func createDeployment(cli *client.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req deployRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
-		if req.Image == "" {
-			http.Error(w, "image is required", http.StatusBadRequest)
+		if req.Name == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
 			return
 		}
-		if req.Host == "" {
-			http.Error(w, "host is required", http.StatusBadRequest)
+		if req.Image == "" {
+			http.Error(w, "image is required", http.StatusBadRequest)
 			return
 		}
 
@@ -102,13 +101,14 @@ func deployHandler(cli *client.Client) http.HandlerFunc {
 		pullResp.Wait(ctx)
 
 		result, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
-			Image: req.Image,
+			Name: req.Name,
 			Config: &container.Config{
 				Env: []string{
 					"POSTGRES_USER=harbordbuser",
 					"POSTGRES_PASSWORD=harbordbpass",
 				},
 			},
+			Image: req.Image,
 		})
 		if err != nil {
 			http.Error(w, "failed to create container: "+err.Error(), http.StatusInternalServerError)
@@ -120,7 +120,7 @@ func deployHandler(cli *client.Client) http.HandlerFunc {
 			return
 		}
 
-		if _, err := cli.NetworkConnect(ctx, defaultNetwork, client.NetworkConnectOptions{
+		if _, err := cli.NetworkConnect(ctx, harborNetwork, client.NetworkConnectOptions{
 			Container:      result.ID,
 			EndpointConfig: &network.EndpointSettings{},
 		}); err != nil {
@@ -134,27 +134,79 @@ func deployHandler(cli *client.Client) http.HandlerFunc {
 			return
 		}
 
-		var containerIP string
-		if netSettings, ok := inspect.Container.NetworkSettings.Networks[defaultNetwork]; ok {
-			containerIP = netSettings.IPAddress.String()
-		}
-		if containerIP == "" {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not determine container ip"})
-			return
-		}
-
-		target, _ := url.Parse("http://" + containerIP)
-		proxy := httputil.NewSingleHostReverseProxy(target)
-
-		hostMap.Lock()
-		hostMap.mappings[req.Host] = proxy
-		hostMap.Unlock()
-
 		writeJSON(w, http.StatusOK, deployResponse{
 			ContainerID: result.ID,
 			Status:      "started",
-			Host:        req.Host,
 			Container:   inspect.Container,
 		})
+	}
+}
+
+func listDeployments(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		result, err := cli.ContainerList(r.Context(), client.ContainerListOptions{
+			All:     true,
+			Filters: client.Filters{}.Add("network", harborNetwork),
+		})
+		if err != nil {
+			http.Error(w, "failed to list containers: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, result.Items)
+	}
+}
+
+func stopDeployment(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if _, err := cli.ContainerStop(r.Context(), id, client.ContainerStopOptions{}); err != nil {
+			http.Error(w, "failed to stop container: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+	}
+}
+
+func startDeployment(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if _, err := cli.ContainerStart(r.Context(), id, client.ContainerStartOptions{}); err != nil {
+			http.Error(w, "failed to start container: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
+	}
+}
+
+func deleteDeployment(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if _, err := cli.ContainerRemove(r.Context(), id, client.ContainerRemoveOptions{
+			Force: true,
+		}); err != nil {
+			http.Error(w, "failed to remove container: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	}
+}
+
+func getDeploymentLogs(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+
+		result, err := cli.ContainerLogs(r.Context(), id, client.ContainerLogsOptions{
+			ShowStdout: true,
+			ShowStderr: true,
+		})
+		if err != nil {
+			http.Error(w, "failed to get logs: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer result.Close()
+
+		w.Header().Set("Content-Type", "text/plain")
+		io.Copy(w, result)
 	}
 }
