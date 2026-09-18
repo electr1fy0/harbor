@@ -1,0 +1,21 @@
+# Build output
+/bin/
+/dist/
+/tmp/
+
+# Markdown notes and planning documents
+*.md
+
+# Go tooling
+*.test
+*.out
+coverage.out
+
+# Local runtime state
+.paas/
+paasd.sock
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
