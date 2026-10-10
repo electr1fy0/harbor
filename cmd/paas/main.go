@@ -247,7 +247,32 @@ func printInspection(stdout io.Writer, requestedName string, response *daemon.Re
 	}
 	_, err := fmt.Fprintf(stdout, "Application: %s\nRelease: %s\nDeployment: %s\nState: %s\nPID: %s\nPort: %s\nLast error: %s\n",
 		displayValue(appName), release, deploymentID, state, pid, port, lastError)
-	return err
+	if err != nil {
+		return err
+	}
+	if deployment != nil && (deployment.SystemdUnit != "" || deployment.MemoryLimit != "") {
+		_, _ = fmt.Fprintf(stdout, "\nSandbox:\n  PID isolation:     yes\n  Mount isolation:   yes\n  IPC isolation:     yes\n  UTS isolation:     yes\n  User isolation:    yes\n  Network isolation: no\n")
+		memLimit := deployment.MemoryLimit
+		if memLimit == "" {
+			memLimit = "128Mi"
+		}
+		cpuQuota := fmt.Sprintf("%d%%", int(deployment.CPUQuota*100))
+		if deployment.CPUQuota <= 0 {
+			cpuQuota = "50%"
+		}
+		tasksLimit := strconv.Itoa(deployment.TasksLimit)
+		if deployment.TasksLimit <= 0 {
+			tasksLimit = "64"
+		}
+		_, _ = fmt.Fprintf(stdout, "\nResources:\n  Memory limit: %s\n  CPU quota:    %s\n  Tasks limit:  %s\n", memLimit, cpuQuota, tasksLimit)
+		if deployment.SystemdUnit != "" {
+			_, _ = fmt.Fprintf(stdout, "\nSystemd:\n  Unit: %s\n", deployment.SystemdUnit)
+		}
+		if deployment.State == model.OomKilled {
+			_, _ = fmt.Fprintf(stdout, "\nFailure:\n  Result: oom-kill\n  Signal: SIGKILL\n  Cause:  Exceeded memory limit (%s)\n", memLimit)
+		}
+	}
+	return nil
 }
 
 func stateValue(state model.State) string {

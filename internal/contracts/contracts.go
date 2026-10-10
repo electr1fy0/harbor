@@ -44,12 +44,15 @@ type Sandbox interface {
 
 // SandboxSpec describes the process that should be started.
 type SandboxSpec struct {
-	ID      string
-	Command []string
-	Dir     string
-	Env     []string
-	User    string
-	LogPath string
+	ID        string
+	Command   []string
+	Dir       string
+	Env       []string
+	User      string
+	LogPath   string
+	MemoryMax string
+	CPUQuota  float64
+	TasksMax  int
 }
 
 // SandboxHandle is returned after a process has been started.
@@ -60,10 +63,15 @@ type SandboxHandle struct {
 
 // SandboxInfo is the read-only runtime view used by orchestration and CLI.
 type SandboxInfo struct {
-	ID       string
-	PID      int
-	Running  bool
-	ExitCode *int
+	ID            string
+	PID           int
+	Running       bool
+	ExitCode      *int
+	OOMKilled     bool
+	Result        string
+	SystemdUnit   string
+	MemoryCurrent int64
+	TasksCurrent  int
 }
 
 // Router owns hostname-to-upstream routing.

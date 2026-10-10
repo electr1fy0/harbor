@@ -10,8 +10,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -157,12 +159,24 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 			return s.fail(&d, model.StartFailed, portErr)
 		}
 		d.Port = port
+		d.SystemdUnit = fmt.Sprintf("paas-deploy-%s.service", d.ID)
+		d.SandboxID = d.ID
+		d.MemoryLimit = cfg.Resources.Memory
+		d.CPUQuota = cfg.Resources.CPU
+		d.TasksLimit = cfg.Resources.Tasks
 		handle, err = s.sandbox.Start(ctx, contracts.SandboxSpec{
 			ID: d.ID, Command: release.Command, Dir: release.ArtifactDir,
-			Env:  []string{"PORT=" + strconv.Itoa(port), "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp"},
-			User: s.opts.RuntimeUser, LogPath: d.LogPath,
+			Env:       []string{"PORT=" + strconv.Itoa(port), "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp"},
+			User:      s.opts.RuntimeUser, LogPath: d.LogPath,
+			MemoryMax: cfg.Resources.Memory,
+			CPUQuota:  cfg.Resources.CPU,
+			TasksMax:  cfg.Resources.Tasks,
 		})
 		if err != nil {
+			info, _ := s.sandbox.Inspect(context.Background(), d.ID)
+			if info != nil && (info.OOMKilled || info.Result == "oom-kill") {
+				return s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
+			}
 			return s.fail(&d, model.StartFailed, err)
 		}
 		d.PID = handle.PID
@@ -180,6 +194,9 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 		}
 		info, inspectErr := s.sandbox.Inspect(context.Background(), d.ID)
 		_ = s.sandbox.Stop(context.Background(), d.ID)
+		if inspectErr == nil && (info.OOMKilled || info.Result == "oom-kill") {
+			return s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
+		}
 		if inspectErr == nil && !info.Running && attempt < 2 && ctx.Err() == nil {
 			d.State = model.Starting
 			if updateErr := s.db.UpdateDeployment(d); updateErr != nil {
@@ -193,11 +210,18 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 		return s.fail(&d, model.Unhealthy, err)
 	}
 	if err != nil {
+		info, _ := s.sandbox.Inspect(context.Background(), d.ID)
+		if info != nil && (info.OOMKilled || info.Result == "oom-kill") {
+			return s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
+		}
 		return s.fail(&d, model.StartFailed, err)
 	}
 	info, err := s.sandbox.Inspect(ctx, d.ID)
 	if err != nil || !info.Running {
 		_ = s.sandbox.Stop(context.Background(), d.ID)
+		if info != nil && (info.OOMKilled || info.Result == "oom-kill") {
+			return s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
+		}
 		return s.fail(&d, model.StartFailed, fmt.Errorf("process exited before route publication"))
 	}
 	d.State = model.Running
@@ -236,6 +260,17 @@ func (s *Service) Logs(name string) (string, error) {
 	d, err := s.Inspect(name)
 	if err != nil {
 		return "", err
+	}
+	if d.SystemdUnit != "" {
+		args := []string{}
+		if os.Geteuid() != 0 {
+			args = append(args, "--user")
+		}
+		args = append(args, "-u", d.SystemdUnit, "--no-pager", "-n", "500", "-o", "cat")
+		cmd := exec.Command("journalctl", args...)
+		if out, err := cmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			return string(out), nil
+		}
 	}
 	file, err := os.Open(d.LogPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -333,11 +368,15 @@ func (s *Service) monitor() {
 					}
 					if err != nil || !info.Running {
 						_ = s.sandbox.Stop(context.Background(), d.ID)
-						message := "runtime process exited"
-						if info != nil && info.ExitCode != nil {
-							message = fmt.Sprintf("runtime process exited with code %d", *info.ExitCode)
+						if info != nil && (info.OOMKilled || info.Result == "oom-kill") {
+							_, _ = s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
+						} else {
+							message := "runtime process exited"
+							if info != nil && info.ExitCode != nil {
+								message = fmt.Sprintf("runtime process exited with code %d", *info.ExitCode)
+							}
+							_, _ = s.fail(&d, model.Crashed, errors.New(message))
 						}
-						_, _ = s.fail(&d, model.Crashed, errors.New(message))
 					}
 				}
 			}

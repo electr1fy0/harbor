@@ -62,11 +62,16 @@ func TestStorePersistsRecordsAcrossReopen(t *testing.T) {
 		Port:      43210,
 		State:     model.Stopped,
 		Error:     "process exited",
-		PID:       1234,
-		LogPath:   "/var/log/paas/dep_1.log",
-		CreatedAt: createdAt,
-		StartedAt: &startedAt,
-		StoppedAt: &stoppedAt,
+		PID:         1234,
+		LogPath:     "/var/log/paas/dep_1.log",
+		SystemdUnit: "paas-deploy-dep_1.service",
+		SandboxID:   "sbx_1",
+		MemoryLimit: "128Mi",
+		CPUQuota:    0.5,
+		TasksLimit:  64,
+		CreatedAt:   createdAt,
+		StartedAt:   &startedAt,
+		StoppedAt:   &stoppedAt,
 	}
 	if err := first.CreateDeployment(deployment); err != nil {
 		t.Fatal(err)
@@ -105,7 +110,13 @@ func TestStorePersistsRecordsAcrossReopen(t *testing.T) {
 		gotDeployment.AppID != deployment.AppID || gotDeployment.ReleaseID != deployment.ReleaseID ||
 		gotDeployment.Port != deployment.Port || gotDeployment.State != deployment.State ||
 		gotDeployment.Error != deployment.Error || gotDeployment.PID != deployment.PID ||
-		gotDeployment.LogPath != deployment.LogPath || !gotDeployment.CreatedAt.Equal(createdAt) ||
+		gotDeployment.LogPath != deployment.LogPath ||
+		gotDeployment.SystemdUnit != deployment.SystemdUnit ||
+		gotDeployment.SandboxID != deployment.SandboxID ||
+		gotDeployment.MemoryLimit != deployment.MemoryLimit ||
+		gotDeployment.CPUQuota != deployment.CPUQuota ||
+		gotDeployment.TasksLimit != deployment.TasksLimit ||
+		!gotDeployment.CreatedAt.Equal(createdAt) ||
 		gotDeployment.StartedAt == nil || !gotDeployment.StartedAt.Equal(startedAt) ||
 		gotDeployment.StoppedAt == nil || !gotDeployment.StoppedAt.Equal(stoppedAt) {
 		t.Fatalf("Deployment() = %#v, want persisted fields from %#v", gotDeployment, deployment)

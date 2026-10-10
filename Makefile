@@ -15,7 +15,7 @@ vet:
 	go vet ./...
 
 fmt:
-	gofmt -w $$(rg --files -g '*.go')
+	gofmt -w $$(find . -name '*.go')
 
 spikes:
 	./scripts/spikes/run-all.sh

@@ -46,7 +46,7 @@ MEMORY_HOG_MB=8 "$root/bin/memory-hog" >/tmp/harbor-example-hog.out 2>&1 &
 hog_pid=$!
 i=0
 while [ "$i" -lt 50 ]; do
-	if rg -q 'allocated 8 MiB' /tmp/harbor-example-hog.out 2>/dev/null; then
+	if grep -q 'allocated 8 MiB' /tmp/harbor-example-hog.out 2>/dev/null; then
 		break
 	fi
 	i=$((i + 1))

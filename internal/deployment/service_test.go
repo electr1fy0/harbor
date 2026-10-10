@@ -219,6 +219,17 @@ func (s *fakeSandbox) markExited(id string, code int) {
 	s.mu.Unlock()
 }
 
+func (s *fakeSandbox) markOOM(id string) {
+	s.mu.Lock()
+	entry := s.entries[id]
+	if entry != nil {
+		entry.info.Running = false
+		entry.info.OOMKilled = true
+		entry.info.Result = "oom-kill"
+	}
+	s.mu.Unlock()
+}
+
 func (s *fakeSandbox) close() {
 	s.mu.Lock()
 	servers := make([]*http.Server, 0, len(s.entries))
@@ -422,6 +433,22 @@ func TestCrashSupervisionContinuesDuringBlockedHealthCheck(t *testing.T) {
 	if second.err != nil || second.deployment.State != model.Running {
 		t.Fatalf("Deploy(beta) = %#v, %v; want running after readiness", second.deployment, second.err)
 	}
+}
+
+func TestCrashSupervisionClassifiesOOM(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	d, err := h.service.Deploy(context.Background(), h.source, "oomapp")
+	if err != nil {
+		t.Fatalf("Deploy(oomapp) error = %v", err)
+	}
+
+	h.sandbox.markOOM(d.ID)
+
+	waitFor(t, "oomapp crash supervision classifies OOM", func() bool {
+		latest, inspectErr := h.service.Inspect("oomapp")
+		return inspectErr == nil && latest.State == model.OomKilled && strings.Contains(latest.Error, "OOM")
+	})
+	assertNoRoute(t, h, "oomapp.localhost")
 }
 
 func TestStopCancelsBuildAndWaitsForDeployment(t *testing.T) {

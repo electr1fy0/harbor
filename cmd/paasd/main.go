@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"paas/internal/builder"
+	"paas/internal/contracts"
 	"paas/internal/daemon"
 	"paas/internal/deployment"
 	"paas/internal/router"
@@ -30,6 +31,7 @@ func main() {
 	buildUser := flag.String("build-user", "paas-build", "build user when daemon runs as root")
 	runtimeUser := flag.String("runtime-user", "paas-runtime", "runtime user when daemon runs as root")
 	buildTimeout := flag.Duration("build-timeout", 5*time.Minute, "maximum build duration")
+	sandboxType := flag.String("sandbox", "default", "sandbox implementation: default, systemd, bubblewrap, host")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		log.Fatal("unexpected positional argument")
@@ -86,7 +88,28 @@ func main() {
 	}
 	defer db.Close()
 	hostRouter := router.New()
-	service, err := deployment.New(db, builder.New(builder.Options{DataDir: dataDir, BuildUser: *buildUser, Timeout: *buildTimeout}), sandbox.NewHost(), hostRouter, deployment.Options{DataDir: dataDir, RuntimeUser: *runtimeUser})
+	var sb contracts.Sandbox
+	switch *sandboxType {
+	case "host":
+		sb = sandbox.NewHost()
+	case "bubblewrap":
+		var sbErr error
+		sb, sbErr = sandbox.NewBubblewrap()
+		if sbErr != nil {
+			log.Fatalf("initialize bubblewrap sandbox: %v", sbErr)
+		}
+	case "systemd":
+		var sbErr error
+		sb, sbErr = sandbox.NewSystemd()
+		if sbErr != nil {
+			log.Fatalf("initialize systemd sandbox: %v", sbErr)
+		}
+	case "default", "":
+		sb = sandbox.NewDefault()
+	default:
+		log.Fatalf("unknown sandbox type %q: must be default, systemd, bubblewrap, or host", *sandboxType)
+	}
+	service, err := deployment.New(db, builder.New(builder.Options{DataDir: dataDir, BuildUser: *buildUser, Timeout: *buildTimeout}), sb, hostRouter, deployment.Options{DataDir: dataDir, RuntimeUser: *runtimeUser})
 	if err != nil {
 		log.Fatal(err)
 	}

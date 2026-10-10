@@ -57,7 +57,7 @@ func TestDeploymentLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		command = exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", socket, "-data-dir", data, "-listen", "127.0.0.1:0", "-build-timeout", buildTimeout)
+		command = exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", socket, "-data-dir", data, "-listen", "127.0.0.1:0", "-build-timeout", buildTimeout, "-sandbox", "host")
 		command.Stdout = log
 		command.Stderr = log
 		if err := command.Start(); err != nil {

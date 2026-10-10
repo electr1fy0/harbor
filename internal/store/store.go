@@ -19,7 +19,7 @@ import (
 
 var ErrNotFound = errors.New("store: not found")
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
@@ -99,9 +99,11 @@ func (s *Store) CreateDeployment(d model.Deployment) error {
 	_, err := s.db.Exec(`
 		INSERT INTO deployments (
 			id, app_id, release_id, port, state, error, pid, log_path,
+			systemd_unit, sandbox_id, memory_limit, cpu_quota, tasks_limit,
 			created_at, started_at, stopped_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		d.ID, d.AppID, nullableString(d.ReleaseID), d.Port, string(d.State), d.Error, d.PID, d.LogPath,
+		d.SystemdUnit, d.SandboxID, d.MemoryLimit, d.CPUQuota, d.TasksLimit,
 		encodeTime(d.CreatedAt), nullableTime(d.StartedAt), nullableTime(d.StoppedAt))
 	if err != nil {
 		return fmt.Errorf("store: create deployment: %w", err)
@@ -290,7 +292,8 @@ func (s *Store) Finish(d model.Deployment, hostname string) error {
 
 const deploymentSelect = `
 	SELECT d.id, d.app_id, a.name, d.release_id, d.port, d.state, d.error,
-		d.pid, d.log_path, d.created_at, d.started_at, d.stopped_at
+		d.pid, d.log_path, d.systemd_unit, d.sandbox_id, d.memory_limit, d.cpu_quota, d.tasks_limit,
+		d.created_at, d.started_at, d.stopped_at
 	FROM deployments AS d
 	JOIN apps AS a ON a.id = d.app_id
 	`
@@ -306,7 +309,8 @@ func scanDeployment(row scanner) (*model.Deployment, error) {
 	var startedAt, stoppedAt sql.NullString
 	if err := row.Scan(
 		&d.ID, &d.AppID, &d.AppName, &releaseID, &d.Port, &state, &d.Error,
-		&d.PID, &d.LogPath, &createdAt, &startedAt, &stoppedAt,
+		&d.PID, &d.LogPath, &d.SystemdUnit, &d.SandboxID, &d.MemoryLimit, &d.CPUQuota, &d.TasksLimit,
+		&createdAt, &startedAt, &stoppedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -357,10 +361,12 @@ func updateDeployment(db execer, d model.Deployment) error {
 	result, err := db.Exec(`
 		UPDATE deployments SET
 			app_id = ?, release_id = ?, port = ?, state = ?, error = ?, pid = ?,
-			log_path = ?, created_at = ?, started_at = ?, stopped_at = ?
+			log_path = ?, systemd_unit = ?, sandbox_id = ?, memory_limit = ?, cpu_quota = ?, tasks_limit = ?,
+			created_at = ?, started_at = ?, stopped_at = ?
 		WHERE id = ?`,
 		d.AppID, nullableString(d.ReleaseID), d.Port, string(d.State), d.Error, d.PID,
-		d.LogPath, encodeTime(d.CreatedAt), nullableTime(d.StartedAt), nullableTime(d.StoppedAt), d.ID)
+		d.LogPath, d.SystemdUnit, d.SandboxID, d.MemoryLimit, d.CPUQuota, d.TasksLimit,
+		encodeTime(d.CreatedAt), nullableTime(d.StartedAt), nullableTime(d.StoppedAt), d.ID)
 	if err != nil {
 		return fmt.Errorf("store: update deployment: %w", err)
 	}
@@ -428,7 +434,25 @@ func migrate(db *sql.DB) error {
 				return err
 			}
 		}
-		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+		if _, err := tx.Exec(`PRAGMA user_version = 1`); err != nil {
+			return err
+		}
+		version = 1
+	}
+	if version < 2 {
+		statements := []string{
+			`ALTER TABLE deployments ADD COLUMN systemd_unit TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE deployments ADD COLUMN sandbox_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE deployments ADD COLUMN memory_limit TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE deployments ADD COLUMN cpu_quota REAL NOT NULL DEFAULT 0`,
+			`ALTER TABLE deployments ADD COLUMN tasks_limit INTEGER NOT NULL DEFAULT 0`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(statement); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 2`); err != nil {
 			return err
 		}
 	}
