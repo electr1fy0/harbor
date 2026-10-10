@@ -150,7 +150,9 @@ func reportDeployment(stdout, stderr io.Writer, command string, request daemon.R
 			if state == "" {
 				state = "UNKNOWN"
 			}
-			fmt.Fprintf(stdout, "State: %s\nDeployment: %s\n", state, displayValue(deployment.ID))
+			if _, err := fmt.Fprintf(stdout, "State: %s\nDeployment: %s\n", state, displayValue(deployment.ID)); err != nil {
+				fmt.Fprintf(stderr, "write deployment result: %v\n", err)
+			}
 		}
 
 		message := responseMessage

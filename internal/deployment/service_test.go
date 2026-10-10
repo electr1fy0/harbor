@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,121 @@ type buildBehavior struct {
 	err             error
 	enteredOnce     sync.Once
 	cancelOnce      sync.Once
+}
+
+type blockedStartSandbox struct {
+	contracts.Sandbox
+	entered chan struct{}
+}
+
+func (s *blockedStartSandbox) Start(ctx context.Context, _ contracts.SandboxSpec) (*contracts.SandboxHandle, error) {
+	close(s.entered)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestStopDuringSandboxStart(t *testing.T) {
+	for _, sameApp := range []bool{true, false} {
+		t.Run(fmt.Sprintf("same app=%v", sameApp), func(t *testing.T) {
+			h := newServiceHarness(t, testConfig)
+			name := "demo"
+			if !sameApp {
+				name = "other"
+				if _, err := h.service.Deploy(context.Background(), h.source, name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			blocked := &blockedStartSandbox{Sandbox: h.sandbox, entered: make(chan struct{})}
+			h.service.mu.Lock()
+			h.service.sandbox = blocked
+			h.service.mu.Unlock()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			deployDone := make(chan deployResult, 1)
+			go func() {
+				d, err := h.service.Deploy(ctx, h.source, "demo")
+				deployDone <- deployResult{deployment: d, err: err}
+			}()
+			waitSignal(t, blocked.entered, "sandbox startup")
+			stopDone := make(chan deployResult, 1)
+			go func() {
+				d, err := h.service.Stop(context.Background(), name)
+				stopDone <- deployResult{deployment: d, err: err}
+			}()
+			select {
+			case stopped := <-stopDone:
+				if stopped.err != nil || stopped.deployment.State != model.Stopped {
+					t.Errorf("Stop during startup = %+v", stopped)
+				}
+			case <-time.After(time.Second):
+				t.Error("sandbox startup blocked Stop")
+				cancel()
+				awaitDeploy(t, stopDone)
+			}
+			cancel()
+			if deployed := awaitDeploy(t, deployDone); !errors.Is(deployed.err, context.Canceled) {
+				t.Errorf("startup cancellation = %v", deployed.err)
+			}
+		})
+	}
+}
+
+func TestStopPreservesFinishedFailure(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	h.builder.setBehavior("demo", &buildBehavior{err: errors.New("compiler diagnostic")})
+	failed, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err == nil {
+		t.Fatal("build unexpectedly succeeded")
+	}
+	stopped, err := h.service.Stop(context.Background(), "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := h.db.Deployment(failed.ID)
+	if err != nil || !reflect.DeepEqual(stopped, failed) || !reflect.DeepEqual(persisted, failed) {
+		t.Fatalf("Stop rewrote completed failure: before=%+v returned=%+v stored=%+v error=%v", failed, stopped, persisted, err)
+	}
+}
+
+func TestCanceledStopLeavesRuntimeUntouched(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	active, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	behavior := &buildBehavior{entered: make(chan struct{}), release: make(chan struct{})}
+	h.builder.setBehavior("demo", behavior)
+	done := make(chan deployResult, 1)
+	go func() {
+		d, err := h.service.Deploy(context.Background(), h.source, "demo")
+		done <- deployResult{deployment: d, err: err}
+	}()
+	waitSignal(t, behavior.entered, "candidate build")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := h.service.Stop(ctx, "demo"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Stop error = %v", err)
+	}
+	persisted, err := h.db.Deployment(active.ID)
+	if err != nil || !reflect.DeepEqual(persisted, active) {
+		t.Fatalf("canceled Stop changed runtime: %+v %v", persisted, err)
+	}
+	close(behavior.release)
+	if candidate := awaitDeploy(t, done); candidate.err != nil {
+		t.Fatalf("canceled Stop canceled candidate: %v", candidate.err)
+	}
+}
+
+func TestHealthFailureIncludesInspectionError(t *testing.T) {
+	h := newServiceHarness(t, testConfig+"health:\n  path: /ready\n")
+	h.sandbox.ready = &atomic.Bool{}
+	h.sandbox.inspectErr = errors.New("runtime manager unavailable")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	d, err := h.service.Deploy(ctx, h.source, "demo")
+	if err == nil || !strings.Contains(err.Error(), "runtime manager unavailable") || !strings.Contains(d.Error, "runtime manager unavailable") {
+		t.Fatalf("runtime inspection failure lost: %+v %v", d, err)
+	}
 }
 
 type fakeBuilder struct {

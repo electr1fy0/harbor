@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 
@@ -41,7 +42,7 @@ func NewPlatformServerWithServices(socketPath string, service *deployment.Servic
 			if r.Method != http.MethodPost {
 				w.Header().Set("Allow", "POST")
 				w.WriteHeader(405)
-				_ = json.NewEncoder(w).Encode(Response{Error: "method not allowed"})
+				writeResponse(w, command, Response{Error: "method not allowed"})
 				return
 			}
 			r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
@@ -50,12 +51,12 @@ func NewPlatformServerWithServices(socketPath string, service *deployment.Servic
 			var input *Request
 			if err := decoder.Decode(&input); err != nil || input == nil {
 				w.WriteHeader(400)
-				_ = json.NewEncoder(w).Encode(Response{Error: "invalid JSON request"})
+				writeResponse(w, command, Response{Error: "invalid JSON request"})
 				return
 			}
 			if err := decoder.Decode(new(any)); err != io.EOF {
 				w.WriteHeader(400)
-				_ = json.NewEncoder(w).Encode(Response{Error: "request must contain one JSON object"})
+				writeResponse(w, command, Response{Error: "request must contain one JSON object"})
 				return
 			}
 			var output Response
@@ -129,9 +130,15 @@ func NewPlatformServerWithServices(socketPath string, service *deployment.Servic
 			if output.Deployment != nil {
 				output.URL = "http://" + output.Deployment.AppName + ".localhost:" + port
 			}
-			_ = json.NewEncoder(w).Encode(output)
+			writeResponse(w, command, output)
 		})
 	}
 	server.http.Handler = mux
 	return server
+}
+
+func writeResponse(w http.ResponseWriter, command string, response Response) {
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("write %s response: %v", command, err)
+	}
 }

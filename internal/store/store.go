@@ -219,7 +219,25 @@ func (s *Store) Deployment(id string) (*model.Deployment, error) {
 
 // Deployments returns deployments newest first.
 func (s *Store) Deployments() ([]model.Deployment, error) {
-	rows, err := s.db.Query(deploymentSelect + `ORDER BY d.created_at DESC, d.id DESC`)
+	return s.queryDeployments(deploymentSelect + `ORDER BY d.created_at DESC, d.id DESC`)
+}
+
+// UnfinishedDeployments returns candidates, running deployments, and failed
+// runtime cleanups. An empty name selects all applications. Completed history
+// stays out of admission checks and the frequent supervision loop.
+func (s *Store) UnfinishedDeployments(name string) ([]model.Deployment, error) {
+	query := deploymentSelect + `WHERE (d.state IN (?, ?, ?, ?, ?, ?)
+		OR (d.sandbox_id != '' AND d.stopped_at IS NULL))`
+	args := []any{model.Queued, model.Building, model.Built, model.Starting, model.HealthChecking, model.Running}
+	if name != "" {
+		query += ` AND a.name = ?`
+		args = append(args, name)
+	}
+	return s.queryDeployments(query+` ORDER BY d.created_at DESC, d.id DESC`, args...)
+}
+
+func (s *Store) queryDeployments(query string, args ...any) ([]model.Deployment, error) {
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: list deployments: %w", err)
 	}

@@ -68,7 +68,7 @@ func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox,
 	}
 	// Host processes are owned by this daemon session. Preserve history, but
 	// never present a previous session's unverifiable PID as a live process.
-	all, err := db.Deployments()
+	all, err := db.UnfinishedDeployments("")
 	if err != nil {
 		cancel()
 		return nil, err
@@ -236,13 +236,13 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 	if s.stopping[name] > 0 {
 		return nil, fmt.Errorf("application %s is stopping", name)
 	}
-	all, err := s.db.Deployments()
+	all, err := s.db.UnfinishedDeployments(name)
 	if err != nil {
 		return nil, err
 	}
 	for _, d := range all {
 		_, pending := s.pending[d.ID]
-		if d.AppName == name && (needsCleanup(d) || d.State.Active() && d.State != model.Running && !pending) {
+		if needsCleanup(d) || d.State.Active() && d.State != model.Running && !pending {
 			return nil, fmt.Errorf("application %s still has runtime cleanup pending", name)
 		}
 	}
@@ -383,14 +383,21 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 				}
 			}
 		}
+
+		// Startup can wait on a runtime manager. Stop must be able to cancel
+		// this candidate, and other applications must remain manageable.
+		s.mu.Unlock()
+		locked = false
 		handle, err = s.sandbox.Start(ctx, contracts.SandboxSpec{
 			ID: d.ID, Command: release.Command, Dir: release.ArtifactDir,
-			Env:       deployEnv,
-			User:      s.opts.RuntimeUser, LogPath: d.LogPath,
+			Env:  deployEnv,
+			User: s.opts.RuntimeUser, LogPath: d.LogPath,
 			MemoryMax: cfg.Resources.Memory,
 			CPUQuota:  cfg.Resources.CPU,
 			TasksMax:  cfg.Resources.Tasks,
 		})
+		s.mu.Lock()
+		locked = true
 		if err != nil {
 			info, inspectErr := s.inspectRuntime(d.ID)
 			if isOOM(info) {
@@ -438,7 +445,7 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 		if inspectErr == nil && info != nil && !info.Running {
 			return s.fail(&d, model.StartFailed, err)
 		}
-		return s.fail(&d, model.Unhealthy, err)
+		return s.fail(&d, model.Unhealthy, errors.Join(err, inspectErr))
 	}
 	if err := ctx.Err(); err != nil {
 		return s.fail(&d, model.StartFailed, err)
@@ -597,13 +604,20 @@ func logTail(path string) (string, error) {
 }
 
 func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
 	d, err := s.Inspect(name)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
 	}
-	all, err := s.db.Deployments()
+	all, err := s.db.UnfinishedDeployments(name)
 	if err != nil {
 		s.mu.Unlock()
 		return d, err
@@ -620,15 +634,15 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 		s.mu.Unlock()
 	}()
 	targets := map[string]bool{d.ID: true}
+	canceled := make(map[string]bool)
 	var pendingDone []<-chan struct{}
 	for _, other := range all {
-		if other.AppName == name && (other.State.Active() || needsCleanup(other)) {
-			targets[other.ID] = true
-		}
+		targets[other.ID] = true
 	}
 	for id, pending := range s.pending {
 		if pending.appName == name {
 			targets[id] = true
+			canceled[id] = true
 			pending.cancel()
 			pendingDone = append(pendingDone, pending.done)
 		}
@@ -650,6 +664,11 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 			failures = append(failures, err)
 			continue
 		}
+		// A completed attempt owns no runtime. Repeated stop must preserve
+		// its failure state, diagnostics, and original stop timestamp.
+		if !current.State.Active() && !needsCleanup(*current) && !canceled[id] {
+			continue
+		}
 		if current.SandboxID != "" && (current.State.Active() || needsCleanup(*current)) {
 			if err := ctx.Err(); err != nil {
 				failures = append(failures, err)
@@ -669,7 +688,6 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 			s.router.Delete(name + ".localhost")
 		}
 		current.State = model.Stopped
-		current.Error = ""
 		now := time.Now().UTC()
 		current.StoppedAt = &now
 		if err := s.db.Finish(*current, name+".localhost"); err != nil {
@@ -692,11 +710,11 @@ func (s *Service) monitor() {
 		case <-s.ctx.Done():
 			return
 		case <-tick.C:
-			// Skip a busy lifecycle transition; builds/readiness release mu.
+			// Skip a busy lifecycle transition; builds/startup/readiness release mu.
 			if !s.mu.TryLock() {
 				continue
 			}
-			all, err := s.db.Deployments()
+			all, err := s.db.UnfinishedDeployments("")
 			if err == nil {
 				activeRoutes, routeErr := s.db.Routes()
 				if routeErr != nil {
@@ -784,7 +802,7 @@ func (s *Service) Close() error {
 	s.inflight.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	all, err := s.db.Deployments()
+	all, err := s.db.UnfinishedDeployments("")
 	if err != nil {
 		return err
 	}

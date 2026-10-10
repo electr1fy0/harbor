@@ -3,6 +3,7 @@ package router
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -26,8 +27,9 @@ type route struct {
 // replacement is atomic from a request's perspective and safe to perform
 // while requests are in flight.
 type HostRouter struct {
-	mu     sync.Mutex
-	routes map[string]*route
+	updateMu sync.Mutex
+	mu       sync.Mutex
+	routes   map[string]*route
 }
 
 // New creates an empty hostname router.
@@ -70,16 +72,21 @@ func (r *HostRouter) SwitchRoute(host, upstream string, commit func() error) (<-
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		log.Printf("proxy %s to %s: %v", host, target.Redacted(), err)
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// Serialize mutations across the durable commit and route replacement,
+	// while continuing to serve and drain requests on the current routes.
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
 	if commit != nil {
 		if err := commit(); err != nil {
 			return nil, err
 		}
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	old := r.routes[host]
 	r.routes[host] = &route{proxy: proxy, drained: make(chan struct{})}
 	if old == nil {
@@ -93,6 +100,8 @@ func (r *HostRouter) SwitchRoute(host, upstream string, commit func() error) (<-
 
 // Delete removes a route if it exists.
 func (r *HostRouter) Delete(host string) {
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
 	r.mu.Lock()
 	host = normalizeHost(host)
 	if old := r.routes[host]; old != nil {

@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"bytes"
+	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +18,27 @@ func TestPlatformRejectsMalformedRequests(t *testing.T) {
 		if recorder.Code != http.StatusBadRequest {
 			t.Fatalf("request %q status=%d", body[:min(len(body), 40)], recorder.Code)
 		}
+	}
+}
+
+type failedResponseWriter struct {
+	*httptest.ResponseRecorder
+}
+
+func (failedResponseWriter) Write([]byte) (int, error) {
+	return 0, errors.New("client disconnected")
+}
+
+func TestPlatformLogsResponseWriteFailure(t *testing.T) {
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(previous)
+	server := NewPlatformServer("", nil)
+	writer := failedResponseWriter{httptest.NewRecorder()}
+	server.http.Handler.ServeHTTP(writer, httptest.NewRequest(http.MethodGet, "/rollback", nil))
+	if !strings.Contains(output.String(), "write rollback response: client disconnected") {
+		t.Fatalf("response write failure lost: %q", output.String())
 	}
 }
 
