@@ -16,7 +16,7 @@ import (
 	"paas/internal/model"
 )
 
-const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME}"
+const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]}"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -31,7 +31,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch command {
-	case "ping", "deploy", "apps", "inspect", "logs", "stop":
+	case "ping", "deploy", "apps", "inspect", "logs", "stop", "releases", "rollback":
 	default:
 		return reportUsageError(stderr, fmt.Errorf("unknown command %q", command))
 	}
@@ -42,7 +42,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	timeout := 5 * time.Second
-	if command == "deploy" {
+	if command == "deploy" || command == "rollback" {
 		timeout = 6 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -62,8 +62,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	response, executeErr := daemon.Execute(ctx, socket, command, request)
-	if command == "deploy" {
-		return reportDeployment(stdout, stderr, request, response, executeErr)
+	if command == "deploy" || command == "rollback" {
+		return reportDeployment(stdout, stderr, command, request, response, executeErr)
 	}
 	if err := responseError(response, executeErr); err != nil {
 		fmt.Fprintf(stderr, "paas %s: %v\n", command, err)
@@ -74,6 +74,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "apps":
 		if err := printApps(stdout, response.Apps); err != nil {
 			fmt.Fprintf(stderr, "write apps: %v\n", err)
+			return 1
+		}
+	case "releases":
+		if err := printReleases(stdout, response.Releases); err != nil {
+			fmt.Fprintf(stderr, "write releases: %v\n", err)
 			return 1
 		}
 	case "inspect":
@@ -114,7 +119,7 @@ func responseError(response *daemon.Response, err error) error {
 	return nil
 }
 
-func reportDeployment(stdout, stderr io.Writer, request daemon.Request, response *daemon.Response, executeErr error) int {
+func reportDeployment(stdout, stderr io.Writer, command string, request daemon.Request, response *daemon.Response, executeErr error) int {
 	deployment := deploymentFromResponse(response, request.Name)
 	responseMessage := ""
 	if response != nil {
@@ -140,7 +145,7 @@ func reportDeployment(stdout, stderr io.Writer, request daemon.Request, response
 		if message == "" {
 			message = "deployment did not reach RUNNING"
 		}
-		fmt.Fprintf(stderr, "paas deploy: %s\n", message)
+		fmt.Fprintf(stderr, "paas %s: %s\n", command, message)
 		return 1
 	}
 
@@ -206,6 +211,30 @@ func printApps(stdout io.Writer, apps []daemon.AppView) error {
 			port = strconv.Itoa(app.Deployment.Port)
 		}
 		if _, err := fmt.Fprintf(stdout, "%s %s %s %s\n", name, state, release, port); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func printReleases(stdout io.Writer, releases []model.ReleaseView) error {
+	if _, err := fmt.Fprintln(stdout, "RELEASE SOURCE_HASH CREATED ACTIVE"); err != nil {
+		return err
+	}
+	for _, r := range releases {
+		active := "no"
+		if r.IsActive {
+			active = "yes"
+		}
+		hash := r.SourceHash
+		if len(hash) > 12 {
+			hash = hash[:12]
+		}
+		if hash == "" {
+			hash = "-"
+		}
+		created := r.CreatedAt.UTC().Format(time.RFC3339)
+		if _, err := fmt.Fprintf(stdout, "%s %s %s %s\n", r.ID, hash, created, active); err != nil {
 			return err
 		}
 	}
@@ -341,7 +370,7 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 			return request, fmt.Errorf("deploy source %q is not a directory", absoluteSource)
 		}
 		request.SourceDir = absoluteSource
-	case "inspect", "logs", "stop":
+	case "inspect", "logs", "stop", "releases":
 		if len(args) == 0 || args[0] == "" {
 			return request, fmt.Errorf("%s requires NAME", command)
 		}
@@ -352,6 +381,41 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 			return request, commandArgumentError(command, args[1])
 		}
 		request.Name = args[0]
+	case "rollback":
+		if len(args) == 0 || args[0] == "" || strings.HasPrefix(args[0], "-") {
+			return request, fmt.Errorf("rollback requires NAME")
+		}
+		request.Name = args[0]
+		releaseSet := false
+		for i := 1; i < len(args); i++ {
+			arg := args[i]
+			isRelease := arg == "--release" || arg == "-release" || strings.HasPrefix(arg, "--release=") || strings.HasPrefix(arg, "-release=")
+			if isRelease && releaseSet {
+				return request, fmt.Errorf("--release may only be specified once")
+			}
+			switch {
+			case arg == "--release" || arg == "-release":
+				if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
+					return request, fmt.Errorf("--release requires a release ID")
+				}
+				request.ReleaseID = args[i+1]
+				i++
+			case strings.HasPrefix(arg, "--release="):
+				request.ReleaseID = strings.TrimPrefix(arg, "--release=")
+			case strings.HasPrefix(arg, "-release="):
+				request.ReleaseID = strings.TrimPrefix(arg, "-release=")
+			case strings.HasPrefix(arg, "-"):
+				return request, fmt.Errorf("unknown option %q", arg)
+			default:
+				return request, commandArgumentError(command, arg)
+			}
+			if isRelease {
+				if request.ReleaseID == "" || strings.HasPrefix(request.ReleaseID, "-") {
+					return request, fmt.Errorf("--release requires a release ID")
+				}
+				releaseSet = true
+			}
+		}
 	}
 	return request, nil
 }

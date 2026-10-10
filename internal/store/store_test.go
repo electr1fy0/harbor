@@ -364,7 +364,7 @@ func assertForeignKeyError(t *testing.T, err error) {
 }
 
 func TestStoreUpgradesExistingDeploymentSchemasWithoutInventingBackend(t *testing.T) {
-	for _, version := range []int{1, 2} {
+	for _, version := range []int{1, 2, 3} {
 		t.Run(fmt.Sprintf("version %d", version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "upgrade.sqlite")
 			db, err := Open(path)
@@ -379,7 +379,7 @@ func TestStoreUpgradesExistingDeploymentSchemasWithoutInventingBackend(t *testin
 			if err := db.CreateDeployment(d); err != nil {
 				t.Fatal(err)
 			}
-			columns := []string{"sandbox_type"}
+			columns := []string{"sandbox_type", "health_path", "promoted_at"}
 			if version == 1 {
 				columns = append(columns, "systemd_unit", "sandbox_id", "memory_limit", "cpu_quota", "tasks_limit")
 			}
@@ -408,5 +408,308 @@ func TestStoreUpgradesExistingDeploymentSchemasWithoutInventingBackend(t *testin
 				t.Fatalf("schema=%d err=%v", schema, err)
 			}
 		})
+	}
+}
+func TestStoreCycle3Features(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "cycle3.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	app, err := s.CreateApp("testapp")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.ActiveDeployment("testapp")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ActiveDeployment before publish = %v, want ErrNotFound", err)
+	}
+
+	rel1 := &contracts.Release{
+		ID:          "rel_1",
+		SourceHash:  "hash1",
+		Runtime:     "go",
+		ArtifactDir: "/tmp/rel1",
+		Command:     []string{"server1"},
+		CreatedAt:   time.Now().Add(-10 * time.Minute).UTC(),
+	}
+	if err := s.SaveRelease(app.ID, rel1); err != nil {
+		t.Fatal(err)
+	}
+
+	dep1 := testDeployment(app, rel1.ID, "dep_1", rel1.CreatedAt)
+	dep1.Port = 41001
+	if err := s.CreateDeployment(dep1); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Publish(dep1, "testapp.localhost"); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := s.ActiveDeployment("testapp")
+	if err != nil || active.ID != "dep_1" {
+		t.Fatalf("ActiveDeployment = %#v, %v; want dep_1", active, err)
+	}
+
+	// Create candidate deployment dep2
+	rel2 := &contracts.Release{
+		ID:          "rel_2",
+		SourceHash:  "hash2",
+		Runtime:     "go",
+		ArtifactDir: "/tmp/rel2",
+		Command:     []string{"server2"},
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := s.SaveRelease(app.ID, rel2); err != nil {
+		t.Fatal(err)
+	}
+
+	dep2 := testDeployment(app, rel2.ID, "dep_2", rel2.CreatedAt)
+	dep2.Port = 41002
+	if err := s.CreateDeployment(dep2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Active deployment should still be dep_1
+	active, err = s.ActiveDeployment("testapp")
+	if err != nil || active.ID != "dep_1" {
+		t.Fatalf("ActiveDeployment during candidate = %#v, %v; want dep_1", active, err)
+	}
+
+	// Promote dep2
+	prevID, err := s.Promote(dep2, "testapp.localhost")
+	if err != nil {
+		t.Fatalf("Promote() error = %v", err)
+	}
+	if prevID != "dep_1" {
+		t.Fatalf("Promote() prevID = %q, want dep_1", prevID)
+	}
+
+	active, err = s.ActiveDeployment("testapp")
+	if err != nil || active.ID != "dep_2" || active.State != model.Running {
+		t.Fatalf("ActiveDeployment after promote = %#v, %v; want running dep_2", active, err)
+	}
+
+	// Test ReleasesForApp
+	releases, err := s.ReleasesForApp("testapp")
+	if err != nil {
+		t.Fatalf("ReleasesForApp() error = %v", err)
+	}
+	if len(releases) != 2 {
+		t.Fatalf("Releases count = %d, want 2", len(releases))
+	}
+	// Ordered by created_at DESC: rel_2 should be first and active
+	if releases[0].ID != "rel_2" || !releases[0].IsActive {
+		t.Fatalf("newest release = %#v, want rel_2 active", releases[0])
+	}
+	if releases[1].ID != "rel_1" || releases[1].IsActive {
+		t.Fatalf("older release = %#v, want rel_1 inactive", releases[1])
+	}
+
+	// Test Events
+	if err := s.RecordEvent(dep2.ID, app.ID, model.EventBuildStarted, "test payload"); err != nil {
+		t.Fatalf("RecordEvent() error = %v", err)
+	}
+	if err := s.RecordEvent(dep2.ID, app.ID, model.EventRouteSwitched, "upstream=http://127.0.0.1:41002"); err != nil {
+		t.Fatalf("RecordEvent() error = %v", err)
+	}
+	events, err := s.Events(dep2.ID)
+	if err != nil {
+		t.Fatalf("Events() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("Events count = %d, want 2", len(events))
+	}
+	if events[0].Type != model.EventBuildStarted || events[1].Type != model.EventRouteSwitched {
+		t.Fatalf("Events = %#v, want BuildStarted and RouteSwitched", events)
+	}
+
+	// Test PreviousRelease
+	prevRel, err := s.PreviousRelease("testapp")
+	if err != nil {
+		t.Fatalf("PreviousRelease() error = %v", err)
+	}
+	if prevRel.ID != "rel_1" {
+		t.Fatalf("PreviousRelease() = %q, want rel_1", prevRel.ID)
+	}
+
+	// Candidate failure must not pollute PreviousRelease
+	rel3 := &contracts.Release{
+		ID:          "rel_3",
+		SourceHash:  "hash3",
+		Runtime:     "go",
+		ArtifactDir: "/tmp/rel3",
+		Command:     []string{"server3"},
+		CreatedAt:   time.Now().Add(time.Minute).UTC(),
+	}
+	if err := s.SaveRelease(app.ID, rel3); err != nil {
+		t.Fatal(err)
+	}
+	dep3 := testDeployment(app, rel3.ID, "dep_3", rel3.CreatedAt)
+	dep3.State = model.Unhealthy
+	dep3.Error = "health check failed"
+	if err := s.CreateDeployment(dep3); err != nil {
+		t.Fatal(err)
+	}
+	prevRelAfterFailedCandidate, err := s.PreviousRelease("testapp")
+	if err != nil {
+		t.Fatalf("PreviousRelease() after failed candidate error = %v", err)
+	}
+	if prevRelAfterFailedCandidate.ID != "rel_1" {
+		t.Fatalf("PreviousRelease() after failed candidate = %q, want rel_1 (NOT rel_3)", prevRelAfterFailedCandidate.ID)
+	}
+
+	// Test DeploymentForRelease
+	depForRel2, err := s.DeploymentForRelease("rel_2")
+	if err != nil {
+		t.Fatalf("DeploymentForRelease(rel_2) error = %v", err)
+	}
+	if depForRel2.ID != "dep_2" {
+		t.Fatalf("DeploymentForRelease(rel_2) = %q, want dep_2", depForRel2.ID)
+	}
+
+	// Test nonexistent app
+	if _, err := s.ReleasesForApp("nonexistent"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ReleasesForApp(nonexistent) error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.PreviousRelease("nonexistent"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("PreviousRelease(nonexistent) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMigrationReconcilesLocalVersionThree(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "local-v3.sqlite")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := db.CreateApp("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := testDeployment(app, "", "local", time.Now().UTC())
+	d.SandboxType = "host"
+	if err := db.CreateDeployment(d); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`DROP TABLE events`, `ALTER TABLE deployments DROP COLUMN health_path`,
+		`ALTER TABLE deployments DROP COLUMN promoted_at`, `PRAGMA user_version = 3`,
+	} {
+		if _, err := db.db.Exec(query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	got, err := upgraded.Deployment(d.ID)
+	if err != nil || got.SandboxType != "host" {
+		t.Fatalf("lost backend: %+v %v", got, err)
+	}
+	if err := upgraded.RecordEvent(d.ID, app.ID, model.EventBuildStarted, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPreviousReleaseTracksPromotionEvenAfterCrash(t *testing.T) {
+	s := openTestStore(t)
+	app, err := s.CreateApp("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range []string{"good", "current", "failed"} {
+		r := saveTestRelease(t, s, app.ID, id, time.Now().Add(time.Duration(i)*time.Second))
+		d := testDeployment(app, r.ID, "dep-"+id, r.CreatedAt)
+		if err := s.CreateDeployment(d); err != nil {
+			t.Fatal(err)
+		}
+		if id != "failed" {
+			if _, err := s.Promote(d, "demo.localhost"); err != nil {
+				t.Fatal(err)
+			}
+			d, err := s.Deployment(d.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if id == "good" {
+				d.State = model.Crashed
+				d.Error = "later crash"
+			}
+			if err := s.UpdateDeployment(*d); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			// A stopped/canceled candidate never passed readiness.
+			d.State = model.Stopped
+			if err := s.UpdateDeployment(d); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	r, err := s.PreviousRelease("demo")
+	if err != nil || r.ID != "good" {
+		t.Fatalf("previous=%+v err=%v", r, err)
+	}
+}
+
+func TestMigrationUsesRemotePromotionEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "remote-v3.sqlite")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := db.CreateApp("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"published", "canceled"} {
+		r := saveTestRelease(t, db, app.ID, "rel-"+id, time.Now().UTC())
+		d := testDeployment(app, r.ID, "dep-"+id, r.CreatedAt)
+		d.State = model.Stopped
+		if id == "published" {
+			d.State = model.Crashed
+			d.Error = "runtime crashed after publication"
+		}
+		if err := db.CreateDeployment(d); err != nil {
+			t.Fatal(err)
+		}
+		if id == "published" {
+			if err := db.RecordEvent(d.ID, app.ID, model.EventDeploymentSucceeded, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, column := range []string{"sandbox_type", "health_path", "promoted_at"} {
+		if _, err := db.db.Exec("ALTER TABLE deployments DROP COLUMN " + column); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.db.Exec("PRAGMA user_version = 3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	published, err := upgraded.Deployment("dep-published")
+	if err != nil || published.PromotedAt == nil || published.ReadinessKnown {
+		t.Fatalf("bad published migration: %+v %v", published, err)
+	}
+	canceled, err := upgraded.Deployment("dep-canceled")
+	if err != nil || canceled.PromotedAt != nil {
+		t.Fatalf("canceled candidate became rollback target: %+v %v", canceled, err)
 	}
 }

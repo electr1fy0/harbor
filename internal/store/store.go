@@ -19,7 +19,7 @@ import (
 
 var ErrNotFound = errors.New("store: not found")
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
@@ -99,11 +99,11 @@ func (s *Store) CreateDeployment(d model.Deployment) error {
 	_, err := s.db.Exec(`
 		INSERT INTO deployments (
 			id, app_id, release_id, port, state, error, pid, log_path,
-			systemd_unit, sandbox_type, sandbox_id, memory_limit, cpu_quota, tasks_limit,
+			systemd_unit, sandbox_type, sandbox_id, memory_limit, cpu_quota, tasks_limit, health_path, promoted_at,
 			created_at, started_at, stopped_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		d.ID, d.AppID, nullableString(d.ReleaseID), d.Port, string(d.State), d.Error, d.PID, d.LogPath,
-		d.SystemdUnit, d.SandboxType, d.SandboxID, d.MemoryLimit, d.CPUQuota, d.TasksLimit,
+		d.SystemdUnit, d.SandboxType, d.SandboxID, d.MemoryLimit, d.CPUQuota, d.TasksLimit, nullableHealthPath(d), nullableTime(d.PromotedAt),
 		encodeTime(d.CreatedAt), nullableTime(d.StartedAt), nullableTime(d.StoppedAt))
 	if err != nil {
 		return fmt.Errorf("store: create deployment: %w", err)
@@ -190,6 +190,21 @@ func (s *Store) LatestDeployment(name string) (*model.Deployment, error) {
 	return d, nil
 }
 
+// ActiveDeployment returns the deployment currently mapped to hostname in routes.
+func (s *Store) ActiveDeployment(name string) (*model.Deployment, error) {
+	hostname := name + ".localhost"
+	d, err := scanDeployment(s.db.QueryRow(deploymentSelect+`
+		JOIN routes AS r ON r.deployment_id = d.id
+		WHERE r.hostname = ?`, hostname))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: active deployment for application %q", ErrNotFound, name)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read active deployment: %w", err)
+	}
+	return d, nil
+}
+
 // Deployment returns the deployment with id.
 func (s *Store) Deployment(id string) (*model.Deployment, error) {
 	d, err := scanDeployment(s.db.QueryRow(deploymentSelect+`WHERE d.id = ?`, id))
@@ -248,26 +263,8 @@ func (s *Store) Routes() (map[string]string, error) {
 
 // Publish marks d as running and switches hostname to it in one transaction.
 func (s *Store) Publish(d model.Deployment, hostname string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("store: begin publish: %w", err)
-	}
-	defer tx.Rollback()
-
-	d.State = model.Running
-	if err := updateDeployment(tx, d); err != nil {
-		return err
-	}
-	_, err = tx.Exec(`
-		INSERT INTO routes (hostname, deployment_id) VALUES (?, ?)
-		ON CONFLICT(hostname) DO UPDATE SET deployment_id = excluded.deployment_id`, hostname, d.ID)
-	if err != nil {
-		return fmt.Errorf("store: publish route: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit publish: %w", err)
-	}
-	return nil
+	_, err := s.Promote(d, hostname)
+	return err
 }
 
 // Finish stores d and removes hostname only when it still points to d.
@@ -290,9 +287,188 @@ func (s *Store) Finish(d model.Deployment, hostname string) error {
 	return nil
 }
 
+// Promote atomically switches the route from any previous deployment to candidate d,
+// marking candidate d as RUNNING. It returns the ID of the replaced deployment if one existed.
+func (s *Store) Promote(d model.Deployment, hostname string) (string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", fmt.Errorf("store: begin promote: %w", err)
+	}
+	defer tx.Rollback()
+
+	var previousDeploymentID sql.NullString
+	if err := tx.QueryRow(`SELECT deployment_id FROM routes WHERE hostname = ?`, hostname).Scan(&previousDeploymentID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("store: read previous route: %w", err)
+	}
+
+	d.State = model.Running
+	if d.PromotedAt == nil {
+		now := time.Now().UTC()
+		d.PromotedAt = &now
+	}
+	if err := updateDeployment(tx, d); err != nil {
+		return "", err
+	}
+	_, err = tx.Exec(`
+		INSERT INTO routes (hostname, deployment_id) VALUES (?, ?)
+		ON CONFLICT(hostname) DO UPDATE SET deployment_id = excluded.deployment_id`, hostname, d.ID)
+	if err != nil {
+		return "", fmt.Errorf("store: promote route: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("store: commit promote: %w", err)
+	}
+	if previousDeploymentID.Valid && previousDeploymentID.String != d.ID {
+		return previousDeploymentID.String, nil
+	}
+	return "", nil
+}
+
+// RecordEvent appends a lifecycle event for a deployment.
+func (s *Store) RecordEvent(deploymentID, appID string, eventType model.EventType, payload string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO events (deployment_id, app_id, type, payload, created_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		deploymentID, appID, string(eventType), payload, encodeTime(time.Now().UTC()))
+	if err != nil {
+		return fmt.Errorf("store: record event: %w", err)
+	}
+	return nil
+}
+
+// Events returns the lifecycle events for a deployment in chronological order.
+func (s *Store) Events(deploymentID string) ([]model.Event, error) {
+	rows, err := s.db.Query(`
+		SELECT id, deployment_id, app_id, type, payload, created_at
+		FROM events WHERE deployment_id = ? ORDER BY id ASC`, deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list events: %w", err)
+	}
+	defer rows.Close()
+
+	events := make([]model.Event, 0)
+	for rows.Next() {
+		var e model.Event
+		var typeStr, createdAt string
+		if err := rows.Scan(&e.ID, &e.DeploymentID, &e.AppID, &typeStr, &e.Payload, &createdAt); err != nil {
+			return nil, fmt.Errorf("store: scan event: %w", err)
+		}
+		e.Type = model.EventType(typeStr)
+		var decodeErr error
+		if e.CreatedAt, decodeErr = decodeTime(createdAt); decodeErr != nil {
+			return nil, fmt.Errorf("store: decode event creation time: %w", decodeErr)
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list events: %w", err)
+	}
+	return events, nil
+}
+
+// ReleasesForApp returns all immutable releases for the application newest first,
+// indicating which release is currently mapped to the active route.
+func (s *Store) ReleasesForApp(appName string) ([]model.ReleaseView, error) {
+	var appID string
+	err := s.db.QueryRow(`SELECT id FROM apps WHERE name = ?`, appName).Scan(&appID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: application %q", ErrNotFound, appName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: check application: %w", err)
+	}
+
+	rows, err := s.db.Query(`
+		SELECT r.id, r.app_id, a.name, r.source_hash, r.runtime, r.artifact_dir, r.created_at,
+		       CASE WHEN routes.deployment_id IS NOT NULL AND d.release_id = r.id THEN 1 ELSE 0 END AS is_active
+		FROM releases AS r
+		JOIN apps AS a ON a.id = r.app_id
+		LEFT JOIN routes ON routes.hostname = a.name || '.localhost'
+		LEFT JOIN deployments AS d ON d.id = routes.deployment_id
+		WHERE a.name = ?
+		ORDER BY r.created_at DESC, r.id DESC`, appName)
+	if err != nil {
+		return nil, fmt.Errorf("store: list releases: %w", err)
+	}
+	defer rows.Close()
+
+	releases := make([]model.ReleaseView, 0)
+	for rows.Next() {
+		var r model.ReleaseView
+		var createdAt string
+		var isActive int
+		if err := rows.Scan(&r.ID, &r.AppID, &r.AppName, &r.SourceHash, &r.Runtime, &r.ArtifactDir, &createdAt, &isActive); err != nil {
+			return nil, fmt.Errorf("store: scan release view: %w", err)
+		}
+		var decodeErr error
+		if r.CreatedAt, decodeErr = decodeTime(createdAt); decodeErr != nil {
+			return nil, fmt.Errorf("store: decode release creation time: %w", decodeErr)
+		}
+		r.IsActive = isActive == 1
+		releases = append(releases, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list releases: %w", err)
+	}
+	return releases, nil
+}
+
+// PreviousRelease returns the most recent successfully deployed release prior to the current active release.
+func (s *Store) PreviousRelease(appName string) (*contracts.Release, error) {
+	active, err := s.ActiveDeployment(appName)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	currentID := ""
+	if active != nil {
+		currentID = active.ReleaseID
+	}
+	r, err := scanRelease(s.db.QueryRow(`
+		SELECT r.id, r.source_hash, r.runtime, r.artifact_dir, r.command, r.created_at
+		FROM deployments AS d JOIN releases AS r ON r.id = d.release_id
+		JOIN apps AS a ON a.id = d.app_id
+		WHERE a.name = ? AND d.promoted_at IS NOT NULL AND r.id != ?
+		ORDER BY d.promoted_at DESC, d.created_at DESC, d.id DESC LIMIT 1`, appName, currentID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: no previous release available for application %q", ErrNotFound, appName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read previous release: %w", err)
+	}
+	return r, nil
+}
+
+// ReleaseForApp refuses release IDs owned by other applications.
+func (s *Store) ReleaseForApp(appName, releaseID string) (*contracts.Release, error) {
+	r, err := scanRelease(s.db.QueryRow(`
+		SELECT r.id, r.source_hash, r.runtime, r.artifact_dir, r.command, r.created_at
+		FROM releases AS r JOIN apps AS a ON a.id = r.app_id
+		WHERE a.name = ? AND r.id = ?`, appName, releaseID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: release %q for application %q", ErrNotFound, releaseID, appName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read application release: %w", err)
+	}
+	return r, nil
+}
+
+// DeploymentForRelease prefers the last successful launch configuration, falling
+// back to the newest candidate when this release has never been promoted.
+func (s *Store) DeploymentForRelease(releaseID string) (*model.Deployment, error) {
+	d, err := scanDeployment(s.db.QueryRow(deploymentSelect+`WHERE d.release_id = ? ORDER BY d.promoted_at DESC, d.created_at DESC, d.id DESC LIMIT 1`, releaseID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: deployment for release %q", ErrNotFound, releaseID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read deployment for release: %w", err)
+	}
+	return d, nil
+}
+
 const deploymentSelect = `
 	SELECT d.id, d.app_id, a.name, d.release_id, d.port, d.state, d.error,
-		d.pid, d.log_path, d.systemd_unit, d.sandbox_type, d.sandbox_id, d.memory_limit, d.cpu_quota, d.tasks_limit,
+		d.pid, d.log_path, d.systemd_unit, d.sandbox_type, d.sandbox_id, d.memory_limit, d.cpu_quota, d.tasks_limit, d.health_path, d.promoted_at,
 		d.created_at, d.started_at, d.stopped_at
 	FROM deployments AS d
 	JOIN apps AS a ON a.id = d.app_id
@@ -306,19 +482,27 @@ func scanDeployment(row scanner) (*model.Deployment, error) {
 	var d model.Deployment
 	var state, createdAt string
 	var releaseID sql.NullString
-	var startedAt, stoppedAt sql.NullString
+	var startedAt, stoppedAt, promotedAt, healthPath sql.NullString
 	if err := row.Scan(
 		&d.ID, &d.AppID, &d.AppName, &releaseID, &d.Port, &state, &d.Error,
-		&d.PID, &d.LogPath, &d.SystemdUnit, &d.SandboxType, &d.SandboxID, &d.MemoryLimit, &d.CPUQuota, &d.TasksLimit,
+		&d.PID, &d.LogPath, &d.SystemdUnit, &d.SandboxType, &d.SandboxID, &d.MemoryLimit, &d.CPUQuota, &d.TasksLimit, &healthPath, &promotedAt,
 		&createdAt, &startedAt, &stoppedAt,
 	); err != nil {
 		return nil, err
 	}
+	d.HealthPath, d.ReadinessKnown = healthPath.String, healthPath.Valid
 	d.ReleaseID = releaseID.String
 	d.State = model.State(state)
 	var err error
 	if d.CreatedAt, err = decodeTime(createdAt); err != nil {
 		return nil, fmt.Errorf("decode creation time: %w", err)
+	}
+	if promotedAt.Valid {
+		t, err := decodeTime(promotedAt.String)
+		if err != nil {
+			return nil, fmt.Errorf("decode promotion time: %w", err)
+		}
+		d.PromotedAt = &t
 	}
 	if startedAt.Valid {
 		t, err := decodeTime(startedAt.String)
@@ -361,11 +545,11 @@ func updateDeployment(db execer, d model.Deployment) error {
 	result, err := db.Exec(`
 		UPDATE deployments SET
 			app_id = ?, release_id = ?, port = ?, state = ?, error = ?, pid = ?,
-			log_path = ?, systemd_unit = ?, sandbox_type = ?, sandbox_id = ?, memory_limit = ?, cpu_quota = ?, tasks_limit = ?,
+			log_path = ?, systemd_unit = ?, sandbox_type = ?, sandbox_id = ?, memory_limit = ?, cpu_quota = ?, tasks_limit = ?, health_path = ?, promoted_at = ?,
 			created_at = ?, started_at = ?, stopped_at = ?
 		WHERE id = ?`,
 		d.AppID, nullableString(d.ReleaseID), d.Port, string(d.State), d.Error, d.PID,
-		d.LogPath, d.SystemdUnit, d.SandboxType, d.SandboxID, d.MemoryLimit, d.CPUQuota, d.TasksLimit,
+		d.LogPath, d.SystemdUnit, d.SandboxType, d.SandboxID, d.MemoryLimit, d.CPUQuota, d.TasksLimit, nullableHealthPath(d), nullableTime(d.PromotedAt),
 		encodeTime(d.CreatedAt), nullableTime(d.StartedAt), nullableTime(d.StoppedAt), d.ID)
 	if err != nil {
 		return fmt.Errorf("store: update deployment: %w", err)
@@ -455,15 +639,59 @@ func migrate(db *sql.DB) error {
 		if _, err := tx.Exec(`PRAGMA user_version = 2`); err != nil {
 			return err
 		}
+		version = 2
 	}
-	if version < 3 {
-		if _, err := tx.Exec(`ALTER TABLE deployments ADD COLUMN sandbox_type TEXT NOT NULL DEFAULT ''`); err != nil {
+	if version < 4 {
+		// Two branches shipped distinct version-3 migrations. Reconcile both
+		// schemas by inspecting the column, rather than trusting the version.
+		var backendColumns int
+		if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('deployments') WHERE name = 'sandbox_type'`).Scan(&backendColumns); err != nil {
 			return err
 		}
-		// Version 2 wrote fictitious systemd metadata for every backend. Leave its
-		// backend unknown; it cannot safely be inferred from the old columns.
-		if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil {
+		if backendColumns == 0 {
+			if _, err := tx.Exec(`ALTER TABLE deployments ADD COLUMN sandbox_type TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+		var eventTables int
+		if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'`).Scan(&eventTables); err != nil {
 			return err
+		}
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+				app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+				type TEXT NOT NULL CHECK (length(type) > 0),
+				payload TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS events_deployment_idx ON events(deployment_id, id ASC)`,
+			`CREATE INDEX IF NOT EXISTS events_app_idx ON events(app_id, id DESC)`,
+			`CREATE INDEX IF NOT EXISTS releases_app_created_idx ON releases(app_id, created_at DESC, id DESC)`,
+			`ALTER TABLE deployments ADD COLUMN health_path TEXT`,
+			`ALTER TABLE deployments ADD COLUMN promoted_at TEXT`,
+			`PRAGMA user_version = 4`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(statement); err != nil {
+				return err
+			}
+		}
+		if eventTables > 0 {
+			// Cycle 3 logged publication; terminal state alone cannot distinguish
+			// a successful release from a canceled candidate later stopped.
+			if _, err := tx.Exec(`UPDATE deployments SET promoted_at =
+				(SELECT MAX(created_at) FROM events WHERE deployment_id = deployments.id AND type = 'DeploymentSucceeded')
+				WHERE release_id IS NOT NULL`); err != nil {
+				return err
+			}
+		} else {
+			// Older schemas could publish only one runtime per app. Preserve the
+			// history they recorded, without fabricating readiness configuration.
+			if _, err := tx.Exec(`UPDATE deployments SET promoted_at = COALESCE(started_at, created_at)
+				WHERE release_id IS NOT NULL AND state IN ('RUNNING', 'STOPPED') AND error = ''`); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -532,4 +760,13 @@ func nullableString(value string) any {
 		return nil
 	}
 	return value
+}
+
+// A NULL path means a legacy release's readiness configuration is unknown.
+// An explicitly empty path is a recorded TCP readiness check.
+func nullableHealthPath(d model.Deployment) any {
+	if !d.ReadinessKnown {
+		return nil
+	}
+	return d.HealthPath
 }
