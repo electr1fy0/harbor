@@ -250,26 +250,32 @@ func printInspection(stdout io.Writer, requestedName string, response *daemon.Re
 	if err != nil {
 		return err
 	}
-	if deployment != nil && (deployment.SystemdUnit != "" || deployment.MemoryLimit != "") {
-		_, _ = fmt.Fprintf(stdout, "\nSandbox:\n  PID isolation:     yes\n  Mount isolation:   yes\n  IPC isolation:     yes\n  UTS isolation:     yes\n  User isolation:    yes\n  Network isolation: no\n")
-		memLimit := deployment.MemoryLimit
-		if memLimit == "" {
-			memLimit = "128Mi"
+	if deployment != nil && deployment.SandboxType != "" {
+		isolation := "no"
+		if deployment.SandboxType == "systemd" || deployment.SandboxType == "bubblewrap" {
+			isolation = "yes"
 		}
-		cpuQuota := fmt.Sprintf("%d%%", int(deployment.CPUQuota*100))
-		if deployment.CPUQuota <= 0 {
-			cpuQuota = "50%"
+		if _, err := fmt.Fprintf(stdout, "\nSandbox:\n  Backend: %s\n  PID isolation:     %s\n  Mount isolation:   %s\n  IPC isolation:     %s\n  UTS isolation:     %s\n  User isolation:    %s\n  Network isolation: no\n", deployment.SandboxType, isolation, isolation, isolation, isolation, isolation); err != nil {
+			return err
 		}
-		tasksLimit := strconv.Itoa(deployment.TasksLimit)
-		if deployment.TasksLimit <= 0 {
-			tasksLimit = "64"
+		if deployment.SandboxType == "systemd" {
+			if _, err := fmt.Fprintf(stdout, "\nResources:\n  Memory limit: %s\n  CPU quota:    %s%%\n  Tasks limit:  %d\n", deployment.MemoryLimit, strconv.FormatFloat(deployment.CPUQuota*100, 'f', -1, 64), deployment.TasksLimit); err != nil {
+				return err
+			}
+			if deployment.SystemdUnit != "" {
+				if _, err := fmt.Fprintf(stdout, "\nSystemd:\n  Unit: %s\n", deployment.SystemdUnit); err != nil {
+					return err
+				}
+			}
+		} else {
+			if _, err := fmt.Fprint(stdout, "\nResources:\n  Limits: not enforced by this backend\n"); err != nil {
+				return err
+			}
 		}
-		_, _ = fmt.Fprintf(stdout, "\nResources:\n  Memory limit: %s\n  CPU quota:    %s\n  Tasks limit:  %s\n", memLimit, cpuQuota, tasksLimit)
-		if deployment.SystemdUnit != "" {
-			_, _ = fmt.Fprintf(stdout, "\nSystemd:\n  Unit: %s\n", deployment.SystemdUnit)
-		}
-		if deployment.State == model.OomKilled {
-			_, _ = fmt.Fprintf(stdout, "\nFailure:\n  Result: oom-kill\n  Signal: SIGKILL\n  Cause:  Exceeded memory limit (%s)\n", memLimit)
+	}
+	if deployment != nil && deployment.State == model.OOMKilled {
+		if _, err := fmt.Fprintf(stdout, "\nFailure:\n  Result: oom-kill\n  Cause:  Memory limit exceeded (%s)\n", displayValue(deployment.MemoryLimit)); err != nil {
+			return err
 		}
 	}
 	return nil

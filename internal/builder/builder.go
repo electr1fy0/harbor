@@ -505,7 +505,7 @@ func (b *GoBuilder) publish(dataDir, outputDir, runtimeName, sourceHash string) 
 	id := "rel_" + hex.EncodeToString(idBytes)
 	createdAt := time.Now().UTC()
 	artifactDir := filepath.Join(releasesDir, id, "app")
-	command := []string{"/bin/sh", "-c", "exec " + shellQuote(filepath.Join(artifactDir, "server"))}
+	command := []string{filepath.Join(artifactDir, "server")}
 
 	stagingDir, err := os.MkdirTemp(releasesDir, ".staging-")
 	if err != nil {
@@ -602,10 +602,6 @@ func freezeRelease(root string) error {
 		}
 	}
 	return nil
-}
-
-func shellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func removeTree(path string) {

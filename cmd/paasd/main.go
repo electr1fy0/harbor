@@ -93,22 +93,18 @@ func main() {
 	case "host":
 		sb = sandbox.NewHost()
 	case "bubblewrap":
-		var sbErr error
-		sb, sbErr = sandbox.NewBubblewrap()
-		if sbErr != nil {
-			log.Fatalf("initialize bubblewrap sandbox: %v", sbErr)
-		}
+		sb, err = sandbox.NewBubblewrap()
 	case "systemd":
-		var sbErr error
-		sb, sbErr = sandbox.NewSystemd()
-		if sbErr != nil {
-			log.Fatalf("initialize systemd sandbox: %v", sbErr)
-		}
+		sb, err = sandbox.NewSystemd()
 	case "default", "":
-		sb = sandbox.NewDefault()
+		sb, err = sandbox.NewDefault()
 	default:
 		log.Fatalf("unknown sandbox type %q: must be default, systemd, bubblewrap, or host", *sandboxType)
 	}
+	if err != nil {
+		log.Fatalf("initialize %s sandbox: %v", *sandboxType, err)
+	}
+	log.Printf("runtime sandbox=%s", sb.Kind())
 	service, err := deployment.New(db, builder.New(builder.Options{DataDir: dataDir, BuildUser: *buildUser, Timeout: *buildTimeout}), sb, hostRouter, deployment.Options{DataDir: dataDir, RuntimeUser: *runtimeUser})
 	if err != nil {
 		log.Fatal(err)

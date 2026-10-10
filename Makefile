@@ -15,7 +15,7 @@ vet:
 	go vet ./...
 
 fmt:
-	gofmt -w $$(find . -name '*.go')
+	find . -name '*.go' -print0 | xargs -0 gofmt -w
 
 spikes:
 	./scripts/spikes/run-all.sh

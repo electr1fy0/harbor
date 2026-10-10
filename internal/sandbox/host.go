@@ -42,6 +42,8 @@ func NewHost() *HostSandbox {
 	return &HostSandbox{processes: make(map[string]*managedProcess)}
 }
 
+func (*HostSandbox) Kind() string { return "host" }
+
 // Start launches a process group. The context is used to reject canceled
 // startup requests; the running process is managed independently afterward.
 func (h *HostSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) (*contracts.SandboxHandle, error) {
@@ -238,7 +240,7 @@ func makeEnvironment(explicit []string) ([]string, error) {
 	values := make(map[string]string, len(explicit))
 	for _, entry := range explicit {
 		key, value, ok := strings.Cut(entry, "=")
-		if !ok || key == "" || strings.Contains(key, "=") {
+		if !ok || key == "" || strings.ContainsRune(entry, 0) {
 			return nil, fmt.Errorf("invalid environment entry %q", entry)
 		}
 		values[key] = value

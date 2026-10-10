@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +22,7 @@ import (
 	"paas/internal/health"
 	"paas/internal/model"
 	"paas/internal/router"
+	"paas/internal/sandbox"
 	"paas/internal/store"
 )
 
@@ -49,12 +50,12 @@ type pendingDeploy struct {
 	done   chan struct{}
 }
 
-func New(db *store.Store, b contracts.Builder, sandbox contracts.Sandbox, routes *router.HostRouter, opts Options) (*Service, error) {
+func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox, routes *router.HostRouter, opts Options) (*Service, error) {
 	if err := os.MkdirAll(filepath.Join(opts.DataDir, "logs"), 0700); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Service{db: db, builder: b, sandbox: sandbox, router: routes, opts: opts, ctx: ctx, cancel: cancel, done: make(chan struct{}), pending: make(map[string]pendingDeploy)}
+	s := &Service{db: db, builder: b, sandbox: runtimeSandbox, router: routes, opts: opts, ctx: ctx, cancel: cancel, done: make(chan struct{}), pending: make(map[string]pendingDeploy)}
 	// Host processes are owned by this daemon session. Preserve history, but
 	// never present a previous session's unverifiable PID as a live process.
 	all, err := db.Deployments()
@@ -63,7 +64,22 @@ func New(db *store.Store, b contracts.Builder, sandbox contracts.Sandbox, routes
 		return nil, err
 	}
 	for _, d := range all {
-		if d.State.Active() {
+		if d.State.Active() || needsCleanup(d) {
+			// Transient systemd services outlive the daemon. Reclaim them before
+			// clearing the persisted active state, including legacy v2 records.
+			if d.SystemdUnit != "" && (d.SandboxType == "systemd" || d.SandboxType == "" && runtime.GOOS == "linux") {
+				if expected, unitErr := sandbox.SystemdUnitName(d.ID); unitErr != nil || expected != d.SystemdUnit {
+					cancel()
+					return nil, fmt.Errorf("invalid persisted systemd unit for deployment %s", d.ID)
+				}
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 6*time.Second)
+				stopErr := sandbox.StopSystemdDeployment(cleanupCtx, d.ID)
+				cleanupCancel()
+				if stopErr != nil {
+					cancel()
+					return nil, fmt.Errorf("reclaim previous runtime %s: %w", d.ID, stopErr)
+				}
+			}
 			d.State = model.Stopped
 			d.Error = "daemon restarted; previous runtime session is not managed"
 			now := time.Now().UTC()
@@ -99,7 +115,7 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
-	if err == nil && existing.State.Active() {
+	if err == nil && (existing.State.Active() || needsCleanup(*existing)) {
 		return nil, fmt.Errorf("application %s is active; stop it before deploying again", name)
 	}
 	app, err := s.db.CreateApp(name)
@@ -147,6 +163,17 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 	if err = s.state(&d, model.Built); err != nil {
 		return &d, err
 	}
+	d.SandboxType = s.sandbox.Kind()
+	d.SandboxID = d.ID
+	if d.SandboxType == "systemd" {
+		d.SystemdUnit, err = sandbox.SystemdUnitName(d.ID)
+		if err != nil {
+			return s.fail(&d, model.StartFailed, err)
+		}
+	}
+	d.MemoryLimit = cfg.Resources.Memory
+	d.CPUQuota = cfg.Resources.CPU
+	d.TasksLimit = cfg.Resources.Tasks
 	if err = s.state(&d, model.Starting); err != nil {
 		return &d, err
 	}
@@ -159,32 +186,30 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 			return s.fail(&d, model.StartFailed, portErr)
 		}
 		d.Port = port
-		d.SystemdUnit = fmt.Sprintf("paas-deploy-%s.service", d.ID)
-		d.SandboxID = d.ID
-		d.MemoryLimit = cfg.Resources.Memory
-		d.CPUQuota = cfg.Resources.CPU
-		d.TasksLimit = cfg.Resources.Tasks
+
 		handle, err = s.sandbox.Start(ctx, contracts.SandboxSpec{
 			ID: d.ID, Command: release.Command, Dir: release.ArtifactDir,
-			Env:       []string{"PORT=" + strconv.Itoa(port), "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp"},
-			User:      s.opts.RuntimeUser, LogPath: d.LogPath,
+			Env:  []string{"PORT=" + strconv.Itoa(port), "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp"},
+			User: s.opts.RuntimeUser, LogPath: d.LogPath,
 			MemoryMax: cfg.Resources.Memory,
 			CPUQuota:  cfg.Resources.CPU,
 			TasksMax:  cfg.Resources.Tasks,
 		})
 		if err != nil {
-			info, _ := s.sandbox.Inspect(context.Background(), d.ID)
-			if info != nil && (info.OOMKilled || info.Result == "oom-kill") {
-				return s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
+			info, inspectErr := s.inspectRuntime(d.ID)
+			if isOOM(info) {
+				return s.fail(&d, model.OOMKilled, errors.Join(errors.New("memory limit exceeded (OOM killed)"), err))
 			}
-			return s.fail(&d, model.StartFailed, err)
+			if errors.Is(inspectErr, sandbox.ErrSandboxNotFound) {
+				inspectErr = nil
+			}
+			return s.fail(&d, model.StartFailed, errors.Join(err, inspectErr))
 		}
 		d.PID = handle.PID
 		now := time.Now().UTC()
 		d.StartedAt = &now
 		if err = s.state(&d, model.HealthChecking); err != nil {
-			_ = s.sandbox.Stop(context.Background(), d.ID)
-			return &d, err
+			return &d, errors.Join(err, s.stopRuntime(d.ID))
 		}
 		s.mu.Unlock()
 		err = health.Check(ctx, port, cfg.Health.Path)
@@ -192,46 +217,39 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 		if err == nil {
 			break
 		}
-		info, inspectErr := s.sandbox.Inspect(context.Background(), d.ID)
-		_ = s.sandbox.Stop(context.Background(), d.ID)
-		if inspectErr == nil && (info.OOMKilled || info.Result == "oom-kill") {
-			return s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
+		info, inspectErr := s.inspectRuntime(d.ID)
+		stopErr := s.stopRuntime(d.ID)
+		if stopErr != nil {
+			return s.fail(&d, model.StartFailed, errors.Join(err, inspectErr, stopErr))
 		}
-		if inspectErr == nil && !info.Running && attempt < 2 && ctx.Err() == nil {
+		if inspectErr == nil && isOOM(info) {
+			return s.fail(&d, model.OOMKilled, errors.New("memory limit exceeded (OOM killed)"))
+		}
+		if inspectErr == nil && info != nil && !info.Running && attempt < 2 && ctx.Err() == nil {
 			d.State = model.Starting
 			if updateErr := s.db.UpdateDeployment(d); updateErr != nil {
 				return &d, updateErr
 			}
 			continue
 		}
-		if inspectErr == nil && !info.Running {
+		if inspectErr == nil && info != nil && !info.Running {
 			return s.fail(&d, model.StartFailed, err)
 		}
 		return s.fail(&d, model.Unhealthy, err)
 	}
-	if err != nil {
-		info, _ := s.sandbox.Inspect(context.Background(), d.ID)
-		if info != nil && (info.OOMKilled || info.Result == "oom-kill") {
-			return s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
-		}
-		return s.fail(&d, model.StartFailed, err)
-	}
 	info, err := s.sandbox.Inspect(ctx, d.ID)
-	if err != nil || !info.Running {
-		_ = s.sandbox.Stop(context.Background(), d.ID)
-		if info != nil && (info.OOMKilled || info.Result == "oom-kill") {
-			return s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
+	if err != nil || info == nil || !info.Running {
+		if isOOM(info) {
+			return s.fail(&d, model.OOMKilled, errors.New("memory limit exceeded (OOM killed)"))
 		}
-		return s.fail(&d, model.StartFailed, fmt.Errorf("process exited before route publication"))
+		return s.fail(&d, model.StartFailed, errors.Join(errors.New("process exited before route publication"), err))
 	}
 	d.State = model.Running
 	d.Error = ""
 	if err = s.db.Publish(d, name+".localhost"); err != nil {
-		_ = s.sandbox.Stop(context.Background(), d.ID)
 		return s.fail(&d, model.StartFailed, err)
 	}
 	if err = s.router.SetRoute(name+".localhost", "http://127.0.0.1:"+strconv.Itoa(d.Port)); err != nil {
-		_ = s.sandbox.Stop(context.Background(), d.ID)
 		return s.fail(&d, model.StartFailed, err)
 	}
 	return &d, nil
@@ -243,10 +261,19 @@ func (s *Service) state(d *model.Deployment, state model.State) error {
 }
 
 func (s *Service) fail(d *model.Deployment, state model.State, cause error) (*model.Deployment, error) {
+	// A failed deployment must not leave an unsupervised live runtime behind.
+	var stopErr error
+	if d.SandboxID != "" {
+		stopErr = s.stopRuntime(d.SandboxID)
+		cause = errors.Join(cause, stopErr)
+	}
 	d.State = state
 	d.Error = cause.Error()
-	now := time.Now().UTC()
-	d.StoppedAt = &now
+	d.StoppedAt = nil
+	if stopErr == nil {
+		now := time.Now().UTC()
+		d.StoppedAt = &now
+	}
 	s.router.Delete(d.AppName + ".localhost")
 	if err := s.db.Finish(*d, d.AppName+".localhost"); err != nil {
 		return d, errors.Join(cause, err)
@@ -261,18 +288,28 @@ func (s *Service) Logs(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if d.SystemdUnit != "" {
-		args := []string{}
-		if os.Geteuid() != 0 {
-			args = append(args, "--user")
-		}
-		args = append(args, "-u", d.SystemdUnit, "--no-pager", "-n", "500", "-o", "cat")
-		cmd := exec.Command("journalctl", args...)
-		if out, err := cmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
-			return string(out), nil
-		}
+	buildLogs, err := logTail(d.LogPath)
+	if err != nil {
+		return "", err
 	}
-	file, err := os.Open(d.LogPath)
+	if d.SystemdUnit == "" || d.SandboxType != "systemd" {
+		return buildLogs, nil
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer cancel()
+	runtimeLogs, err := sandbox.JournalLogs(ctx, d.SystemdUnit)
+	if err != nil {
+		return "", err
+	}
+	logs := buildLogs + runtimeLogs
+	if len(logs) > 1<<20 {
+		logs = logs[len(logs)-(1<<20):]
+	}
+	return logs, nil
+}
+
+func logTail(path string) (string, error) {
+	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
@@ -323,13 +360,18 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 		if err != nil {
 			return nil, err
 		}
+		if needsCleanup(*d) {
+			if err := s.stopRuntime(d.SandboxID); err != nil {
+				return d, err
+			}
+		}
 		d.State = model.Stopped
 		d.Error = ""
 		now := time.Now().UTC()
 		d.StoppedAt = &now
 		return d, s.db.Finish(*d, name+".localhost")
 	}
-	if !d.State.Active() {
+	if !d.State.Active() && !needsCleanup(*d) {
 		return d, nil
 	}
 	s.router.Delete(name + ".localhost")
@@ -359,6 +401,18 @@ func (s *Service) monitor() {
 			all, err := s.db.Deployments()
 			if err == nil {
 				for _, d := range all {
+					if needsCleanup(d) {
+						if err := s.stopRuntime(d.SandboxID); err != nil {
+							log.Printf("retry runtime cleanup %s: %v", d.ID, err)
+							continue
+						}
+						now := time.Now().UTC()
+						d.StoppedAt = &now
+						if err := s.db.Finish(d, d.AppName+".localhost"); err != nil {
+							log.Printf("record runtime cleanup %s: %v", d.ID, err)
+						}
+						continue
+					}
 					if d.State != model.Running {
 						continue
 					}
@@ -366,16 +420,23 @@ func (s *Service) monitor() {
 					if s.ctx.Err() != nil {
 						break
 					}
-					if err != nil || !info.Running {
-						_ = s.sandbox.Stop(context.Background(), d.ID)
-						if info != nil && (info.OOMKilled || info.Result == "oom-kill") {
-							_, _ = s.fail(&d, model.OomKilled, errors.New("memory limit exceeded (OOM killed)"))
+					if err != nil && !errors.Is(err, sandbox.ErrSandboxNotFound) {
+						log.Printf("inspect runtime %s: %v", d.ID, err)
+						continue
+					}
+					if err != nil || info == nil || !info.Running {
+						if isOOM(info) {
+							if _, err := s.fail(&d, model.OOMKilled, errors.New("memory limit exceeded (OOM killed)")); err != nil {
+								log.Printf("finish runtime %s: %v", d.ID, err)
+							}
 						} else {
 							message := "runtime process exited"
 							if info != nil && info.ExitCode != nil {
 								message = fmt.Sprintf("runtime process exited with code %d", *info.ExitCode)
 							}
-							_, _ = s.fail(&d, model.Crashed, errors.New(message))
+							if _, err := s.fail(&d, model.Crashed, errors.New(message)); err != nil {
+								log.Printf("finish runtime %s: %v", d.ID, err)
+							}
 						}
 					}
 				}
@@ -403,12 +464,12 @@ func (s *Service) Close() error {
 	var resultMu sync.Mutex
 	var stopped sync.WaitGroup
 	for _, d := range all {
-		if d.State.Active() {
+		if d.State.Active() || needsCleanup(d) {
 			s.router.Delete(d.AppName + ".localhost")
 			stopped.Add(1)
 			go func(d model.Deployment) {
 				defer stopped.Done()
-				err := s.sandbox.Stop(context.Background(), d.ID)
+				err := s.stopRuntime(d.ID)
 				if err == nil {
 					d.State = model.Stopped
 					now := time.Now().UTC()
@@ -425,6 +486,32 @@ func (s *Service) Close() error {
 	}
 	stopped.Wait()
 	return errors.Join(failures...)
+}
+
+// A terminal deployment without a stop timestamp still owns a runtime whose
+// cleanup failed. Keep supervising it and block replacement until reclaimed.
+func needsCleanup(d model.Deployment) bool {
+	return !d.State.Active() && d.SandboxID != "" && d.StoppedAt == nil
+}
+
+func isOOM(info *contracts.SandboxInfo) bool {
+	return info != nil && (info.OOMKilled || info.Result == "oom-kill")
+}
+
+func (s *Service) inspectRuntime(id string) (*contracts.SandboxInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	return s.sandbox.Inspect(ctx, id)
+}
+
+func (s *Service) stopRuntime(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	err := s.sandbox.Stop(ctx, id)
+	if errors.Is(err, sandbox.ErrSandboxNotFound) {
+		return nil
+	}
+	return err
 }
 
 func allocatePort() (int, error) {

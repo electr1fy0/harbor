@@ -12,27 +12,6 @@ import (
 	"paas/internal/contracts"
 )
 
-func TestParseMemoryBytes(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected int64
-	}{
-		{"64Mi", 64 * 1024 * 1024},
-		{"128M", 128 * 1024 * 1024},
-		{"1Gi", 1024 * 1024 * 1024},
-		{"512Ki", 512 * 1024},
-		{"1048576", 1048576},
-		{"", 128 * 1024 * 1024},
-	}
-
-	for _, tt := range tests {
-		got := parseMemoryBytes(tt.input)
-		if got != tt.expected {
-			t.Errorf("parseMemoryBytes(%q) = %d, want %d", tt.input, got, tt.expected)
-		}
-	}
-}
-
 func TestSystemdSandboxLifecycle(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("skipping Linux-only systemd sandbox test")
@@ -49,7 +28,7 @@ func TestSystemdSandboxLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tmpDir := t.TempDir()
+	tmpDir := sandboxArtifactDir(t)
 	spec := contracts.SandboxSpec{
 		ID:        "sys-test-1",
 		Dir:       tmpDir,
@@ -63,6 +42,11 @@ func TestSystemdSandboxLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	t.Cleanup(func() {
+		if err := sbx.Stop(context.Background(), spec.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	handle, err := sbx.Start(ctx, spec)
 	if err != nil {
 		t.Fatalf("SystemdSandbox.Start failed: %v", err)
@@ -93,6 +77,23 @@ func TestSystemdSandboxLifecycle(t *testing.T) {
 	if infoAfter.Running {
 		t.Error("expected unit to be stopped")
 	}
+	// A clean exit with RemainAfterExit must also be reported as stopped.
+	spec.Command = []string{"/bin/sh", "-c", "exit 0"}
+	_, startErr := sbx.Start(ctx, spec)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		info, err = sbx.Inspect(ctx, spec.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.Running && info.ExitCode != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if info.Running || info.ExitCode == nil || *info.ExitCode != 0 {
+		t.Fatalf("clean exit incorrectly reported: %+v startErr=%v", info, startErr)
+	}
 }
 
 func TestSystemdSandboxMemoryOOM(t *testing.T) {
@@ -115,9 +116,10 @@ func TestSystemdSandboxMemoryOOM(t *testing.T) {
 		t.Skip("examples/memory-hog not found")
 	}
 
-	tmpDir := t.TempDir()
+	tmpDir := sandboxArtifactDir(t)
 	binPath := filepath.Join(tmpDir, "server")
-	buildCmd := exec.Command("go", "build", "-o", binPath, memHogSrc)
+	buildCmd := exec.Command("go", "build", "-o", binPath, filepath.Join(memHogSrc, "main.go"))
+	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("build memory-hog failed: %v: %s", err, string(out))
 	}
@@ -140,6 +142,11 @@ func TestSystemdSandboxMemoryOOM(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
+	t.Cleanup(func() {
+		if err := sbx.Stop(context.Background(), spec.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	handle, err := sbx.Start(ctx, spec)
 	t.Logf("Start err=%v handle=%+v", err, handle)
 
@@ -148,15 +155,14 @@ func TestSystemdSandboxMemoryOOM(t *testing.T) {
 	for i := 0; i < 40; i++ {
 		time.Sleep(100 * time.Millisecond)
 		info, err = sbx.Inspect(ctx, spec.ID)
-		t.Logf("iter %d: running=%v result=%q oom=%v err=%v", i, info.Running, info.Result, info.OOMKilled, err)
+		if err != nil {
+			t.Fatalf("Inspect: %v", err)
+		}
+		t.Logf("iter %d: running=%v result=%q oom=%v", i, info.Running, info.Result, info.OOMKilled)
 		if err == nil && !info.Running {
 			break
 		}
 	}
-
-	t.Cleanup(func() {
-		_ = sbx.Stop(context.Background(), spec.ID)
-	})
 
 	if info == nil || info.Running {
 		t.Fatal("expected memory-hog unit to be stopped/killed by OOM killer")

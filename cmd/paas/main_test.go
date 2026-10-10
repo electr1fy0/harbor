@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"os"
@@ -352,4 +353,54 @@ func startFakeDaemon(t *testing.T, handler http.Handler) string {
 		_ = server.Shutdown(ctx)
 	})
 	return socket
+}
+
+type failAfterWrites struct {
+	writes, allow int
+	err           error
+}
+
+func (w *failAfterWrites) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes > w.allow {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
+func TestInspectionDoesNotInventIsolationOrLimits(t *testing.T) {
+	for _, kind := range []string{"host", "bubblewrap", "systemd", ""} {
+		t.Run(kind, func(t *testing.T) {
+			d := &model.Deployment{AppName: "demo", SandboxType: kind, SystemdUnit: "paas-deploy-test.service", MemoryLimit: "64Mi", CPUQuota: 0.005, TasksLimit: 32}
+			var output bytes.Buffer
+			if err := printInspection(&output, "demo", &daemon.Response{Deployment: d}); err != nil {
+				t.Fatal(err)
+			}
+			text := output.String()
+			if kind == "host" && strings.Contains(text, "PID isolation:     yes") {
+				t.Fatal("host isolation fabricated")
+			}
+			if kind == "" && strings.Contains(text, "Sandbox:") {
+				t.Fatal("legacy unknown backend fabricated")
+			}
+			if kind == "systemd" {
+				if !strings.Contains(text, "CPU quota:    0.5%") {
+					t.Fatalf("fractional CPU lost: %s", text)
+				}
+			} else if strings.Contains(text, "Memory limit:") || strings.Contains(text, "Systemd:") {
+				t.Fatalf("unenforced limits or fictitious unit reported: %s", text)
+			}
+		})
+	}
+}
+
+func TestInspectionPropagatesEveryOutputError(t *testing.T) {
+	expected := errors.New("broken writer")
+	d := &model.Deployment{AppName: "demo", SandboxType: "systemd", SystemdUnit: "paas-deploy-test.service", MemoryLimit: "64Mi", CPUQuota: 0.5, TasksLimit: 32, State: model.OOMKilled}
+	for allow := 0; allow < 5; allow++ {
+		writer := &failAfterWrites{allow: allow, err: expected}
+		if err := printInspection(writer, "demo", &daemon.Response{Deployment: d}); !errors.Is(err, expected) {
+			t.Fatalf("after %d writes, error=%v", allow, err)
+		}
+	}
 }

@@ -1,19 +1,20 @@
 package sandbox
 
 import (
-	"runtime"
-
+	"fmt"
 	"paas/internal/contracts"
+	"runtime"
 )
 
-// NewDefault returns the best available Sandbox implementation for the host.
-// On Linux with systemd and Bubblewrap, it returns a SystemdSandbox.
-// Otherwise, it falls back to a HostSandbox.
-func NewDefault() contracts.Sandbox {
+// NewDefault requires isolation and resource limits on Linux. Host execution
+// remains available there only through an explicit -sandbox=host selection.
+func NewDefault() (contracts.Sandbox, error) {
 	if runtime.GOOS == "linux" {
-		if sbx, err := NewSystemd(); err == nil {
-			return sbx
+		sb, err := NewSystemd()
+		if err != nil {
+			return nil, fmt.Errorf("initialize default Linux sandbox: %w", err)
 		}
+		return sb, nil
 	}
-	return NewHost()
+	return NewHost(), nil
 }

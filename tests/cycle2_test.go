@@ -4,6 +4,7 @@ package tests
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -11,308 +12,295 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"paas/internal/daemon"
+	"paas/internal/model"
+	"paas/internal/sandbox"
 )
 
-func TestCycle2RuntimeIsolationAndLimits(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("skipping Linux-only Cycle 2 integration test")
-	}
+type cycle2Harness struct{ root, socket, routerURL string }
 
+func newCycle2Harness(t *testing.T) *cycle2Harness {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux, systemd, cgroup v2, and Bubblewrap")
+	}
+	if _, err := sandbox.NewSystemd(); err != nil {
+		t.Fatalf("Cycle 2 sandbox prerequisites: %v", err)
+	}
 	root, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	work, err := os.MkdirTemp("/tmp", "harbor-cycle2-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = os.RemoveAll(work)
+		// Releases are immutable directories; restore owner permissions for cleanup.
+		if err := filepath.WalkDir(work, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return os.Chmod(path, 0700)
+			}
+			return nil
+		}); err != nil {
+			t.Errorf("prepare cleanup: %v", err)
+		}
+		if err := os.RemoveAll(work); err != nil {
+			t.Errorf("remove workspace: %v", err)
+		}
 	})
-	_ = os.Chmod(work, 0755)
-
-	data := filepath.Join(work, "data")
-	socket := filepath.Join(work, "paasd.sock")
+	if err := os.Chmod(work, 0755); err != nil {
+		t.Fatal(err)
+	}
+	h := &cycle2Harness{root: root, socket: filepath.Join(work, "paasd.sock")}
 	logPath := filepath.Join(work, "daemon.log")
-
-	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	daemonCmd := exec.Command(
-		filepath.Join(root, "bin", "paasd"),
-		"-socket", socket,
-		"-data-dir", data,
-		"-listen", "127.0.0.1:0",
-		"-build-timeout", "2m",
-	)
-	daemonCmd.Stdout = log
-	daemonCmd.Stderr = log
-	if err := daemonCmd.Start(); err != nil {
-		_ = log.Close()
+	command := exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", h.socket, "-data-dir", filepath.Join(work, "data"), "-listen", "127.0.0.1:0", "-sandbox", "systemd")
+	command.Stdout, command.Stderr = logFile, logFile
+	if err := command.Start(); err != nil {
+		logFile.Close()
+		t.Fatal(err)
+	}
+	if err := logFile.Close(); err != nil {
 		t.Fatal(err)
 	}
 	exited := make(chan error, 1)
-	go func() { exited <- daemonCmd.Wait(); _ = log.Close() }()
-
+	go func() { exited <- command.Wait() }()
 	t.Cleanup(func() {
-		if daemonCmd != nil && daemonCmd.Process != nil {
-			_ = daemonCmd.Process.Signal(syscall.SIGTERM)
-			select {
-			case <-exited:
-			case <-time.After(5 * time.Second):
-				_ = daemonCmd.Process.Kill()
-				<-exited
+		if err := command.Process.Signal(syscall.SIGTERM); err != nil && !strings.Contains(err.Error(), "already finished") {
+			t.Errorf("signal daemon: %v", err)
+		}
+		select {
+		case err := <-exited:
+			if err != nil {
+				t.Errorf("daemon exit: %v", err)
 			}
+		case <-time.After(15 * time.Second):
+			_ = command.Process.Kill()
+			<-exited
+			t.Error("daemon shutdown timed out")
 		}
 	})
-
-	// Wait for daemon ping and discover router port
-	var routerURL string
+	routerPattern := regexp.MustCompile(`router=http://([^ ]+) `)
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_, pingErr := daemon.Ping(ctx, socket)
+		_, pingErr := daemon.Ping(ctx, h.socket)
 		cancel()
 		if pingErr == nil {
-			body, _ := os.ReadFile(logPath)
-			match := regexp.MustCompile("router=http://([^ ]+) ").FindStringSubmatch(string(body))
-			if len(match) > 1 {
-				routerURL = "http://" + match[1]
-				break
+			body, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if match := routerPattern.FindStringSubmatch(string(body)); len(match) > 1 {
+				h.routerURL = "http://" + match[1]
+				return h
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if routerURL == "" {
-		body, _ := os.ReadFile(logPath)
-		t.Fatalf("daemon failed to become ready: %s", string(body))
-	}
+	body, err := os.ReadFile(logPath)
+	t.Fatalf("daemon readiness: %v\n%s", err, body)
+	return nil
+}
 
-	cli := func(args ...string) string {
-		cmd := exec.Command(filepath.Join(root, "bin", "paas"), append([]string{"--socket", socket}, args...)...)
-		out, err := cmd.CombinedOutput()
+func (h *cycle2Harness) call(t *testing.T, op, name, source string) (*daemon.Response, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+	return daemon.Execute(ctx, h.socket, op, daemon.Request{Name: name, SourceDir: source})
+}
+func (h *cycle2Harness) cli(t *testing.T, args ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, filepath.Join(h.root, "bin", "paas"), append([]string{"--socket", h.socket}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI %v: %v: %s", args, err, out)
+	}
+	return string(out)
+}
+func (h *cycle2Harness) route(t *testing.T, name string, want int) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, h.routerURL+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = name + ".localhost"
+	response, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != want {
+		t.Fatalf("route %s status=%d want=%d body=%s", name, response.StatusCode, want, body)
+	}
+	return string(body)
+}
+
+func TestCycle2RuntimeIsolationAndLimits(t *testing.T) {
+	h := newCycle2Harness(t)
+	response, err := h.call(t, "deploy", "hello", filepath.Join(h.root, "examples", "hello-go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := response.Deployment
+	if d == nil || d.State != model.Running || d.SandboxType != "systemd" || d.SystemdUnit == "" {
+		t.Fatalf("incomplete systemd deployment: %+v", d)
+	}
+	if body := h.route(t, "hello", http.StatusOK); !strings.Contains(body, "hello from harbor") {
+		t.Fatalf("unexpected body: %s", body)
+	}
+	sb, err := sandbox.NewSystemd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	info, err := sb.Inspect(ctx, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cgroup := filepath.Join("/sys/fs/cgroup", info.ControlGroup)
+	for file, want := range map[string]string{"memory.max": "134217728", "memory.swap.max": "0", "pids.max": "64"} {
+		body, err := os.ReadFile(filepath.Join(cgroup, file))
 		if err != nil {
-			t.Fatalf("paas %s failed: %v: %s", strings.Join(args, " "), err, string(out))
+			t.Fatal(err)
 		}
-		return string(out)
-	}
-
-	// 1. Deploy hello-go
-	helloSrc := filepath.Join(root, "examples", "hello-go")
-	deployOut := cli("deploy", helloSrc, "--name", "hello")
-	if !strings.Contains(deployOut, "State: RUNNING") {
-		t.Fatalf("unexpected deploy output: %s", deployOut)
-	}
-
-	// 2. Query application via router
-	req, _ := http.NewRequest("GET", routerURL+"/", nil)
-	req.Host = "hello.localhost"
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("HTTP request to hello.localhost failed: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("expected status 200, got %d", resp.StatusCode)
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(respBody), "hello from harbor") {
-		t.Fatalf("unexpected response body: %s", string(respBody))
-	}
-
-	// 3. Inspect hello - verify Sandbox, Resources, Systemd blocks
-	inspectOut := cli("inspect", "hello")
-	expectedBlocks := []string{
-		"State: RUNNING",
-		"Sandbox:",
-		"PID isolation:     yes",
-		"Mount isolation:   yes",
-		"IPC isolation:     yes",
-		"UTS isolation:     yes",
-		"User isolation:    yes",
-		"Network isolation: no",
-		"Resources:",
-		"Memory limit: 128Mi",
-		"CPU quota:    50%",
-		"Tasks limit:  64",
-		"Systemd:",
-		"Unit: paas-deploy-dep_",
-	}
-	for _, expected := range expectedBlocks {
-		if !strings.Contains(inspectOut, expected) {
-			t.Errorf("inspect output missing %q; got:\n%s", expected, inspectOut)
+		if strings.TrimSpace(string(body)) != want {
+			t.Fatalf("%s=%q want=%s", file, body, want)
 		}
 	}
-
-	// 4. Logs hello - verify journald captures output
-	logsOut := cli("logs", "hello")
-	if !strings.Contains(logsOut, "hello-go listening on 127.0.0.1:") {
-		t.Errorf("logs output missing listening message; got:\n%s", logsOut)
-	}
-
-	// 5. Stop hello
-	stopOut := cli("stop", "hello")
-	if !strings.Contains(stopOut, "Stopped hello") {
-		t.Errorf("unexpected stop output: %s", stopOut)
-	}
-
-	// 6. Verify route withdrawn
-	req404, _ := http.NewRequest("GET", routerURL+"/", nil)
-	req404.Host = "hello.localhost"
-	resp404, err := http.DefaultClient.Do(req404)
+	cpu, err := os.ReadFile(filepath.Join(cgroup, "cpu.max"))
 	if err != nil {
-		t.Fatalf("HTTP request to withdrawn route failed: %v", err)
+		t.Fatal(err)
 	}
-	resp404.Body.Close()
-	if resp404.StatusCode != 404 {
-		t.Errorf("expected 404 after stop, got %d", resp404.StatusCode)
+	parts := strings.Fields(string(cpu))
+	if len(parts) != 2 {
+		t.Fatalf("invalid cpu.max=%q", cpu)
+	}
+	quota, qerr := strconv.ParseFloat(parts[0], 64)
+	period, perr := strconv.ParseFloat(parts[1], 64)
+	if qerr != nil || perr != nil || period <= 0 || quota/period != 0.5 {
+		t.Fatalf("CPU quota unenforced: %q", cpu)
+	}
+	assertRuntimeNamespaces(t, cgroup)
+	output := h.cli(t, "inspect", "hello")
+	for _, expected := range []string{"State: RUNNING", "PID isolation:     yes", "Mount isolation:   yes", "Memory limit: 128Mi", "CPU quota:    50%", "Tasks limit:  64", "Unit: paas-deploy-dep_"} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("inspect missing %q:\n%s", expected, output)
+		}
+	}
+	logs := h.cli(t, "logs", "hello")
+	if !strings.Contains(logs, "hello-go listening on 127.0.0.1:") {
+		t.Errorf("runtime logs missing:\n%s", logs)
+	}
+	if _, err := h.call(t, "stop", "hello", ""); err != nil {
+		t.Fatal(err)
+	}
+	h.route(t, "hello", http.StatusNotFound)
+}
+
+func assertRuntimeNamespaces(t *testing.T, cgroup string) {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(cgroup, "cgroup.procs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid := ""
+	if os.Geteuid() == 0 {
+		out, err := exec.Command("id", "-u", "paas-runtime").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		uid = strings.TrimSpace(string(out))
+	}
+	isolated := false
+	for _, pid := range strings.Fields(string(body)) {
+		if uid != "" {
+			status, err := os.ReadFile(filepath.Join("/proc", pid, "status"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			matched := false
+			for _, line := range strings.Split(string(status), "\n") {
+				if strings.HasPrefix(line, "Uid:") {
+					fields := strings.Fields(line)
+					matched = len(fields) == 5 && fields[1] == uid && fields[2] == uid
+				}
+			}
+			if !matched {
+				t.Fatalf("runtime process %s does not run as paas-runtime:\n%s", pid, status)
+			}
+		}
+		all := true
+		for _, ns := range []string{"pid", "mnt", "ipc", "uts", "user", "net"} {
+			host, err := os.Readlink(filepath.Join("/proc/self/ns", ns))
+			if err != nil {
+				t.Fatal(err)
+			}
+			child, err := os.Readlink(filepath.Join("/proc", pid, "ns", ns))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ns == "net" {
+				if child != host {
+					t.Fatalf("runtime unexpectedly isolated networking")
+				}
+			} else if child == host {
+				all = false
+			}
+		}
+		isolated = isolated || all
+	}
+	if !isolated {
+		t.Fatal("no runtime process has the required namespace isolation")
 	}
 }
 
 func TestCycle2MemoryHogOOMKill(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("skipping Linux-only Cycle 2 integration test")
+	h := newCycle2Harness(t)
+	response, deployErr := h.call(t, "deploy", "memhog", filepath.Join(h.root, "examples", "memory-hog"))
+	if response == nil || response.Deployment == nil {
+		t.Fatalf("deploy produced no deployment: %v", deployErr)
 	}
-
-	root, err := filepath.Abs("..")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	work, err := os.MkdirTemp("/tmp", "harbor-cycle2-oom-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = os.RemoveAll(work)
-	})
-	_ = os.Chmod(work, 0755)
-
-	data := filepath.Join(work, "data")
-	socket := filepath.Join(work, "paasd.sock")
-	logPath := filepath.Join(work, "daemon.log")
-
-	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	daemonCmd := exec.Command(
-		filepath.Join(root, "bin", "paasd"),
-		"-socket", socket,
-		"-data-dir", data,
-		"-listen", "127.0.0.1:0",
-		"-build-timeout", "2m",
-	)
-	daemonCmd.Stdout = log
-	daemonCmd.Stderr = log
-	if err := daemonCmd.Start(); err != nil {
-		_ = log.Close()
-		t.Fatal(err)
-	}
-	exited := make(chan error, 1)
-	go func() { exited <- daemonCmd.Wait(); _ = log.Close() }()
-
-	t.Cleanup(func() {
-		if daemonCmd != nil && daemonCmd.Process != nil {
-			_ = daemonCmd.Process.Signal(syscall.SIGTERM)
-			select {
-			case <-exited:
-			case <-time.After(5 * time.Second):
-				_ = daemonCmd.Process.Kill()
-				<-exited
-			}
-		}
-	})
-
-	// Wait for daemon ping and discover router port
-	var routerURL string
 	deadline := time.Now().Add(10 * time.Second)
+	var d *model.Deployment
 	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_, pingErr := daemon.Ping(ctx, socket)
-		cancel()
-		if pingErr == nil {
-			body, _ := os.ReadFile(logPath)
-			match := regexp.MustCompile("router=http://([^ ]+) ").FindStringSubmatch(string(body))
-			if len(match) > 1 {
-				routerURL = "http://" + match[1]
-				break
-			}
+		response, err := h.call(t, "inspect", "memhog", "")
+		if err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(50 * time.Millisecond)
+		d = response.Deployment
+		if d != nil && d.State == model.OOMKilled {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	if routerURL == "" {
-		body, _ := os.ReadFile(logPath)
-		t.Fatalf("daemon failed to become ready: %s", string(body))
+	if d == nil || d.State != model.OOMKilled {
+		t.Fatalf("expected OOM_KILLED; deployErr=%v deployment=%+v", deployErr, d)
 	}
-
-	cli := func(args ...string) (string, error) {
-		cmd := exec.Command(filepath.Join(root, "bin", "paas"), append([]string{"--socket", socket}, args...)...)
-		out, err := cmd.CombinedOutput()
-		return string(out), err
-	}
-
-	// Deploy memory-hog (which requests 64Mi in paas.yaml and tries to allocate 256 MiB)
-	memHogSrc := filepath.Join(root, "examples", "memory-hog")
-	deployOut, err := cli("deploy", memHogSrc, "--name", "memhog")
-	t.Logf("deploy memhog result: %s (err: %v)", deployOut, err)
-
-	// Poll inspect memhog until state becomes OOM_KILLED
-	var inspectOut string
-	oomDetected := false
-	pollDeadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(pollDeadline) {
-		time.Sleep(200 * time.Millisecond)
-		out, inspectErr := cli("inspect", "memhog")
-		if inspectErr == nil {
-			inspectOut = out
-			if strings.Contains(out, "State: OOM_KILLED") {
-				oomDetected = true
-				break
-			}
+	output := h.cli(t, "inspect", "memhog")
+	for _, expected := range []string{"State: OOM_KILLED", "Failure:", "Result: oom-kill", fmt.Sprintf("Memory limit: %s", d.MemoryLimit)} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("inspect missing %q:\n%s", expected, output)
 		}
 	}
-
-	if !oomDetected {
-		t.Fatalf("timed out waiting for memhog to become OOM_KILLED; inspect output:\n%s", inspectOut)
-	}
-
-	// Verify inspect output contains failure block details
-	expectedFailureDetails := []string{
-		"State: OOM_KILLED",
-		"Failure:",
-		"Result: oom-kill",
-		"Signal: SIGKILL",
-		"Cause:  Exceeded memory limit (128Mi)",
-		"Memory limit: 128Mi",
-	}
-	for _, expected := range expectedFailureDetails {
-		if !strings.Contains(inspectOut, expected) {
-			t.Errorf("inspect output missing %q; got:\n%s", expected, inspectOut)
-		}
-	}
-
-	// Verify route is withdrawn
-	req, _ := http.NewRequest("GET", routerURL+"/", nil)
-	req.Host = "memhog.localhost"
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("HTTP request to memhog route failed: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 404 {
-		t.Errorf("expected 404 for OOM-killed app, got %d", resp.StatusCode)
-	}
-
-	_, _ = cli("stop", "memhog")
+	h.route(t, "memhog", http.StatusNotFound)
 }

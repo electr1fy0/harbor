@@ -2,12 +2,12 @@
 
 Harbor deploys local Go HTTP applications to a single machine:
 
-    source → unprivileged build → immutable release → host process → health check → hostname route
+    source → unprivileged build → immutable release → Bubblewrap + systemd → health check → hostname route
 
 The target is Ubuntu/Debian Linux with Go, a C compiler (SQLite), Git, systemd,
-cgroup v2, Bubblewrap, and curl. Runtime namespace isolation, runtime resource
-limits, safe replacement/rollback, PostgreSQL, Node, Git URL deployment, and
-public HTTPS are not implemented yet. Apps must be trusted: this is a local
+cgroup v2, Bubblewrap, and curl. Linux runtimes use namespace isolation and
+systemd resource limits. Safe replacement/rollback, PostgreSQL, Node, Git URL
+deployment, and public HTTPS are not implemented yet. Apps must be trusted: this is a local
 development platform, not multi-tenant hosting.
 
 ## Linux setup and demo
@@ -36,7 +36,7 @@ cold Go builds on small VMs can take minutes even though daemon startup is quick
 Releases under `/var/lib/paas/releases` are daemon-owned and read-only; deleting
 the original source does not affect a running app. The setup script creates
 accounts/directories and, where needed, a scoped Bubblewrap AppArmor profile
-for the Linux probes; it does not disable global user-namespace restrictions.
+for the runtime and Linux probes; it does not disable global user-namespace restrictions.
 
 ## Application contract
 
@@ -59,21 +59,32 @@ The current start contract is exactly `/app/server`; the build must create an
 executable at `$PAAS_OUT/server`. Examples compile `main.go` instead of `.`
 because they share the repository's module. Source/output symlinks and special
 files are rejected. Apps must honor injected `PORT` and bind to `127.0.0.1`.
-Runtime resource fields are validated but not enforced yet. Omit `health.path`
+The default Linux backend enforces memory, CPU, and task limits through cgroup v2. Omit `health.path`
 for TCP readiness; otherwise HTTP 200–399 is accepted. Routing follows readiness.
 
 Deploy is synchronous; inspect can show intermediate states while it runs.
 Success returns a release ID, port, and URL. Failed deployments persist
 BUILD_FAILED, START_FAILED, or UNHEALTHY with errors/logs, and get no route.
-Unexpected runtime exits become CRASHED and withdraw the route. Unknown hosts
-return 404. Logs returns the last 1 MiB; rotation/streaming are not implemented.
+Unexpected runtime exits become CRASHED; memory-limit kills become OOM_KILLED.
+Both withdraw the route. Unknown hosts
+return 404. Logs combines build output with up to 500 journal entries, bounded to 1 MiB; rotation/streaming are not implemented.
 
 Stop an active app before deploying it again. Graceful daemon shutdown stops
 its apps. Restart preserves history/releases but does not auto-restart apps.
-On Linux the direct runtime process also dies if the daemon dies abruptly.
-Host processes are not namespace-isolated and share a runtime account.
-Forked workers that deliberately outlive their parent are not guaranteed to
-be reclaimed after a hard daemon crash; full runtime supervision is still pending.
+Linux defaults to the systemd backend and fails startup if its prerequisites
+are missing. `-sandbox=bubblewrap` provides namespace isolation without resource
+limits; `-sandbox=host` explicitly selects host execution without those controls.
+Inspect reports the selected backend and whether it enforces resource limits.
+Non-root Linux execution requires a user systemd manager with delegated CPU,
+memory, and task controllers; missing delegation is a deployment error.
+Run `make test-privileged` after setup to verify the root daemon configuration.
+Applications share the host network and runtime account.
+
+Transient systemd units can survive an abrupt daemon crash. The next startup
+reclaims persisted application units before marking their deployments stopped;
+a cleanup failure prevents startup rather than losing ownership of a live unit.
+Graceful shutdown stops and waits for each runtime. Failed cleanup is recorded
+and retried, and replacement is blocked until it succeeds.
 
 ## Local macOS development
 
@@ -128,8 +139,9 @@ Run the suites sequentially. `make test` includes a real deployment test;
 `test-privileged` additionally verifies dedicated identities, effective
 systemd build constraints, and denied release writes. Linux probes may
 report SKIP if WSL lacks a usable user systemd manager; that is not proof
-that those capabilities passed. Bubblewrap failures indicate a host setup
-problem even though the current application runtime does not use it.
+that those capabilities passed. Bubblewrap failures indicate a host setup problem. Cycle 2 acceptance checks
+actual namespaces, runtime identity, cgroup limits, journal output, and OOM
+classification on Linux.
 WSL-specific acceptance has not yet been run on a WSL installation.
 
 After the suites finish, use the Linux setup/demo commands above for a
@@ -154,5 +166,5 @@ history, and duplicate-daemon protection. A fresh clone reproduces the demo
 using the setup/build commands above.
 
 The examples stay as regression fixtures: healthy Go server, broken build,
-unhealthy server, and memory hog. Do not deploy the memory hog expecting runtime
-memory enforcement yet; its cgroup spike verifies host feasibility separately.
+unhealthy server, and memory hog. The memory hog verifies OOM classification with the default Linux backend.
+Host and direct Bubblewrap backends do not enforce runtime resource limits.

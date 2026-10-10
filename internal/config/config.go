@@ -14,6 +14,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Default resource requests are shared by configuration and runtime enforcement.
+const (
+	DefaultMemory = "128Mi"
+	DefaultCPU    = 0.5
+	DefaultTasks  = 64
+)
+
 // Config describes how to build and start one application.
 type Config struct {
 	Name      string    `yaml:"name"`
@@ -93,17 +100,17 @@ func Load(sourceDir string) (*Config, error) {
 		Health:  document.Health,
 	}
 	if document.Resources == nil || document.Resources.Memory == nil {
-		cfg.Resources.Memory = "128Mi"
+		cfg.Resources.Memory = DefaultMemory
 	} else {
 		cfg.Resources.Memory = *document.Resources.Memory
 	}
 	if document.Resources == nil || document.Resources.CPU == nil {
-		cfg.Resources.CPU = 0.5
+		cfg.Resources.CPU = DefaultCPU
 	} else {
 		cfg.Resources.CPU = *document.Resources.CPU
 	}
 	if document.Resources == nil || document.Resources.Tasks == nil {
-		cfg.Resources.Tasks = 64
+		cfg.Resources.Tasks = DefaultTasks
 	} else {
 		cfg.Resources.Tasks = *document.Resources.Tasks
 	}
@@ -120,10 +127,10 @@ func Load(sourceDir string) (*Config, error) {
 	if strings.TrimSpace(cfg.Start.Command) == "" {
 		return nil, fmt.Errorf("start.command must not be empty")
 	}
-	if !validMemory(cfg.Resources.Memory) {
-		return nil, fmt.Errorf("resources.memory must be a positive byte quantity with a supported unit")
+	if _, err := ParseMemoryBytes(cfg.Resources.Memory); err != nil {
+		return nil, fmt.Errorf("resources.memory: %w", err)
 	}
-	if cfg.Resources.CPU <= 0 || math.IsNaN(cfg.Resources.CPU) || math.IsInf(cfg.Resources.CPU, 0) {
+	if cfg.Resources.CPU <= 0 || math.IsNaN(cfg.Resources.CPU) || math.IsInf(cfg.Resources.CPU*100, 0) {
 		return nil, fmt.Errorf("resources.cpu must be a finite positive number")
 	}
 	if cfg.Resources.Tasks < 1 {
@@ -136,25 +143,36 @@ func Load(sourceDir string) (*Config, error) {
 	return cfg, nil
 }
 
-func validMemory(value string) bool {
-	units := []string{"Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "K", "M", "G", "T", "P", "E", "B", ""}
-	number := value
+// ParseMemoryBytes parses a positive binary byte quantity that fits in int64.
+// Configuration validation and runtime enforcement share this parser.
+func ParseMemoryBytes(value string) (int64, error) {
+	units := []struct {
+		suffix string
+		shift  uint
+	}{
+		{"Ki", 10}, {"Mi", 20}, {"Gi", 30}, {"Ti", 40}, {"Pi", 50}, {"Ei", 60},
+		{"K", 10}, {"M", 20}, {"G", 30}, {"T", 40}, {"P", 50}, {"E", 60}, {"B", 0}, {"", 0},
+	}
 	for _, unit := range units {
-		if strings.HasSuffix(value, unit) {
-			number = strings.TrimSuffix(value, unit)
+		if !strings.HasSuffix(value, unit.suffix) {
+			continue
+		}
+		number := strings.TrimSuffix(value, unit.suffix)
+		if number == "" {
 			break
 		}
-	}
-	if number == "" {
-		return false
-	}
-	for _, digit := range number {
-		if digit < '0' || digit > '9' {
-			return false
+		for _, digit := range number {
+			if digit < '0' || digit > '9' {
+				return 0, fmt.Errorf("invalid memory quantity %q", value)
+			}
 		}
+		amount, err := strconv.ParseUint(number, 10, 64)
+		if err != nil || amount == 0 || amount > uint64(math.MaxInt64)>>unit.shift {
+			break
+		}
+		return int64(amount << unit.shift), nil
 	}
-	amount, err := strconv.ParseUint(number, 10, 64)
-	return err == nil && amount > 0
+	return 0, fmt.Errorf("invalid or overflowing memory quantity %q", value)
 }
 
 // ValidName reports whether name is a lowercase application slug of at most

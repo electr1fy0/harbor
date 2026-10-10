@@ -120,6 +120,10 @@ type fakeSandbox struct {
 	unreadyProbe chan struct{}
 	ready        *atomic.Bool
 	startErr     error
+	stopErr      error
+	inspectErr   error
+	inspectCalls int
+	specs        []contracts.SandboxSpec
 	stopEntered  chan string
 	stopRelease  chan struct{}
 }
@@ -132,7 +136,12 @@ func newFakeSandbox() *fakeSandbox {
 	}
 }
 
+func (*fakeSandbox) Kind() string { return "host" }
+
 func (s *fakeSandbox) Start(_ context.Context, spec contracts.SandboxSpec) (*contracts.SandboxHandle, error) {
+	s.mu.Lock()
+	s.specs = append(s.specs, spec)
+	s.mu.Unlock()
 	if s.startErr != nil {
 		return nil, s.startErr
 	}
@@ -183,6 +192,11 @@ func (s *fakeSandbox) Stop(_ context.Context, id string) error {
 		<-s.stopRelease
 	}
 	s.mu.Lock()
+	if s.stopErr != nil {
+		err := s.stopErr
+		s.mu.Unlock()
+		return err
+	}
 	entry := s.entries[id]
 	if entry != nil {
 		entry.info.Running = false
@@ -197,6 +211,10 @@ func (s *fakeSandbox) Stop(_ context.Context, id string) error {
 func (s *fakeSandbox) Inspect(_ context.Context, id string) (*contracts.SandboxInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.inspectCalls++
+	if s.inspectErr != nil {
+		return nil, s.inspectErr
+	}
 	entry := s.entries[id]
 	if entry == nil {
 		return nil, fmt.Errorf("unknown sandbox %q", id)
@@ -446,7 +464,7 @@ func TestCrashSupervisionClassifiesOOM(t *testing.T) {
 
 	waitFor(t, "oomapp crash supervision classifies OOM", func() bool {
 		latest, inspectErr := h.service.Inspect("oomapp")
-		return inspectErr == nil && latest.State == model.OomKilled && strings.Contains(latest.Error, "OOM")
+		return inspectErr == nil && latest.State == model.OOMKilled && strings.Contains(latest.Error, "OOM")
 	})
 	assertNoRoute(t, h, "oomapp.localhost")
 }
@@ -725,4 +743,161 @@ func waitFor(t *testing.T, what string, condition func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestDeploymentPersistsActualBackendAndPassesConfiguredLimits(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	d, err := h.service.Deploy(context.Background(), h.source, "metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, err := h.service.Inspect("metadata")
+	if err != nil || latest.SandboxType != "host" || latest.SystemdUnit != "" || latest.SandboxID != d.ID {
+		t.Fatalf("fictitious runtime metadata: %+v %v", latest, err)
+	}
+	h.sandbox.mu.Lock()
+	spec := h.sandbox.specs[0]
+	h.sandbox.mu.Unlock()
+	if spec.MemoryMax != "128Mi" || spec.CPUQuota != 0.5 || spec.TasksMax != 64 || spec.User != "nobody" {
+		t.Fatalf("runtime configuration lost: %+v", spec)
+	}
+}
+
+func TestTransientInspectionFailureDoesNotKillHealthyDeployment(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	if _, err := h.service.Deploy(context.Background(), h.source, "transient"); err != nil {
+		t.Fatal(err)
+	}
+	h.sandbox.mu.Lock()
+	h.sandbox.inspectErr = errors.New("temporary manager outage")
+	calls := h.sandbox.inspectCalls
+	h.sandbox.mu.Unlock()
+	waitFor(t, "monitor to see temporary inspection error", func() bool { h.sandbox.mu.Lock(); defer h.sandbox.mu.Unlock(); return h.sandbox.inspectCalls > calls })
+	d, err := h.service.Inspect("transient")
+	if err != nil || d.State != model.Running {
+		t.Fatalf("healthy app killed on inspection error: %+v %v", d, err)
+	}
+	h.sandbox.mu.Lock()
+	h.sandbox.inspectErr = nil
+	h.sandbox.mu.Unlock()
+}
+
+func TestFailedCleanupIsPersistedRetriedAndBlocksReplacement(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	h.sandbox.startErr = errors.New("startup failure")
+	h.sandbox.mu.Lock()
+	h.sandbox.stopErr = errors.New("stop failure")
+	h.sandbox.mu.Unlock()
+	d, err := h.service.Deploy(context.Background(), h.source, "cleanup")
+	if err == nil || !strings.Contains(err.Error(), "startup failure") || !strings.Contains(err.Error(), "stop failure") || d.StoppedAt != nil {
+		t.Fatalf("cleanup failure swallowed: %+v %v", d, err)
+	}
+	if _, err := h.service.Deploy(context.Background(), h.source, "cleanup"); err == nil {
+		t.Fatal("replacement admitted before cleanup")
+	}
+	h.sandbox.mu.Lock()
+	h.sandbox.stopErr = nil
+	h.sandbox.mu.Unlock()
+	waitFor(t, "cleanup retry to record stop", func() bool { d, err := h.service.Inspect("cleanup"); return err == nil && d.StoppedAt != nil })
+}
+
+func TestRestartReclaimsSystemdRuntimeBeforeClearingState(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stop failure=%v", fail), func(t *testing.T) {
+			root := t.TempDir()
+			marker := filepath.Join(root, "stopped")
+			t.Setenv("HARBOR_RECOVERY_MARKER", marker)
+			script := `#!/bin/sh
+case " $* " in
+ *" show "*)
+  if [ -f "$HARBOR_RECOVERY_MARKER" ]; then
+   printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n'
+   exit 4
+  fi
+  printf 'LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nExecMainCode=0\nResult=success\n'
+  ;;
+ *" stop "*) touch "$HARBOR_RECOVERY_MARKER" ;;
+esac
+`
+			if fail {
+				script = "#!/bin/sh\necho manager-unavailable >&2\nexit 1\n"
+			}
+			if err := os.WriteFile(filepath.Join(root, "systemctl"), []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+			db, err := store.Open(filepath.Join(root, "paas.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			app, err := db.CreateApp("restart")
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := model.Deployment{ID: "dep_restart", AppID: app.ID, AppName: app.Name, State: model.Starting, CreatedAt: time.Now().UTC(), SandboxType: "systemd", SandboxID: "dep_restart", SystemdUnit: "paas-deploy-dep_restart.service"}
+			if err := db.CreateDeployment(d); err != nil {
+				t.Fatal(err)
+			}
+			service, err := New(db, &fakeBuilder{}, newFakeSandbox(), router.New(), Options{DataDir: root})
+			if fail {
+				if err == nil {
+					service.Close()
+					t.Fatal("startup accepted unreclaimed unit")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer service.Close()
+				if _, err := os.Stat(marker); err != nil {
+					t.Fatalf("unit not reclaimed: %v", err)
+				}
+			}
+			latest, err := db.Deployment(d.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fail && latest.State != model.Starting || !fail && latest.State != model.Stopped {
+				t.Fatalf("incorrect recovery state: %+v", latest)
+			}
+		})
+	}
+}
+
+func TestSystemdLogsIncludeBuildOutputAndSurfaceJournalErrors(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	d, err := h.service.Deploy(context.Background(), h.source, "logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.SandboxType = "systemd"
+	d.SystemdUnit = "paas-deploy-" + d.ID + ".service"
+	if err := h.db.UpdateDeployment(*d); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(d.LogPath, []byte("build output\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	toolsDir := t.TempDir()
+	journal := filepath.Join(toolsDir, "journalctl")
+	if err := os.WriteFile(journal, []byte("#!/bin/sh\nprintf 'runtime stdout\\nruntime stderr\\n'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", toolsDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	logs, err := h.service.Logs("logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"build output", "runtime stdout", "runtime stderr"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("logs missing %q: %s", want, logs)
+		}
+	}
+	if err := os.WriteFile(journal, []byte("#!/bin/sh\necho journal-unavailable >&2\nexit 3\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.Logs("logs"); err == nil || !strings.Contains(err.Error(), "journal-unavailable") {
+		t.Fatalf("journal failure silently swallowed: %v", err)
+	}
 }

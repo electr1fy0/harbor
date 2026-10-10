@@ -15,7 +15,7 @@ import (
 )
 
 func TestBubblewrapBuildArgs(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := sandboxArtifactDir(t)
 	spec := contracts.SandboxSpec{
 		ID:      "test-1",
 		Command: []string{"/app/server", "--arg1"},
@@ -76,7 +76,7 @@ func TestBubblewrapMountIsolationAndTmpfs(t *testing.T) {
 		t.Skip("bwrap not installed")
 	}
 
-	tmpDir := t.TempDir()
+	tmpDir := sandboxArtifactDir(t)
 	markerFile := filepath.Join(tmpDir, "marker.txt")
 	if err := os.WriteFile(markerFile, []byte("hello read-only"), 0644); err != nil {
 		t.Fatal(err)
@@ -103,6 +103,11 @@ func TestBubblewrapMountIsolationAndTmpfs(t *testing.T) {
 		LogPath: logPath,
 	}
 
+	t.Cleanup(func() {
+		if err := sbx.Stop(context.Background(), spec.ID); err != nil {
+			t.Errorf("stop sandbox: %v", err)
+		}
+	})
 	handle, err := sbx.Start(ctx, spec)
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -135,7 +140,7 @@ func TestBubblewrapPIDNamespace(t *testing.T) {
 		t.Skip("bwrap not installed")
 	}
 
-	tmpDir := t.TempDir()
+	tmpDir := sandboxArtifactDir(t)
 	sbx, err := NewBubblewrap()
 	if err != nil {
 		t.Fatal(err)
@@ -156,6 +161,11 @@ func TestBubblewrapPIDNamespace(t *testing.T) {
 		Env: []string{"PATH=/bin:/usr/bin"},
 	}
 
+	t.Cleanup(func() {
+		if err := sbx.Stop(context.Background(), spec.ID); err != nil {
+			t.Errorf("stop sandbox: %v", err)
+		}
+	})
 	handle, err := sbx.Start(ctx, spec)
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -176,4 +186,61 @@ func TestBubblewrapPIDNamespace(t *testing.T) {
 	if info.ExitCode == nil || *info.ExitCode != 0 {
 		t.Fatalf("expected exit code 0 (host PID %s hidden), got %v", hostPid, info.ExitCode)
 	}
+}
+
+func TestBubblewrapPathsAndEnvironmentAreNotSilentlyRewritten(t *testing.T) {
+	dir := t.TempDir()
+	literal := "message contains " + dir + "/server"
+	spec := contracts.SandboxSpec{ID: "path-test", Dir: dir, Command: []string{filepath.Join(dir, "server"), literal, dir + "-sibling/server"}}
+	args, err := BuildBwrapArgs(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--", "/app/server", literal, dir + "-sibling/server"}
+	if !slices.Equal(args[len(args)-len(want):], want) {
+		t.Fatalf("unexpected command suffix: %v", args)
+	}
+	if index := slices.Index(args, "--chdir"); index < 0 || args[index+1] != "/app" {
+		t.Fatal("missing artifact working directory")
+	}
+	for i, arg := range args {
+		if arg == "--ro-bind" && args[i+1] == "/etc" {
+			t.Fatal("host /etc exposed wholesale")
+		}
+	}
+	spec.Command[0] = dir + "-sibling/server"
+	args, err = BuildBwrapArgs(spec)
+	if err != nil || args[len(args)-3] != spec.Command[0] {
+		t.Fatalf("sibling executable rewritten: %v %v", args, err)
+	}
+	spec.Env = []string{"broken"}
+	if _, err := BuildBwrapArgs(spec); err == nil {
+		t.Fatal("malformed environment silently accepted")
+	}
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	spec.Env = nil
+	spec.Dir = file
+	if _, err := BuildBwrapArgs(spec); err == nil {
+		t.Fatal("file accepted as artifact directory")
+	}
+}
+
+func sandboxArtifactDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "harbor-sandbox-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove artifacts: %v", err)
+		}
+	})
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

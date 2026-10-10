@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -55,16 +56,17 @@ func TestStorePersistsRecordsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	deployment := model.Deployment{
-		ID:        "dep_1",
-		AppID:     app.ID,
-		AppName:   app.Name,
-		ReleaseID: release.ID,
-		Port:      43210,
-		State:     model.Stopped,
-		Error:     "process exited",
+		ID:          "dep_1",
+		AppID:       app.ID,
+		AppName:     app.Name,
+		ReleaseID:   release.ID,
+		Port:        43210,
+		State:       model.Stopped,
+		Error:       "process exited",
 		PID:         1234,
 		LogPath:     "/var/log/paas/dep_1.log",
 		SystemdUnit: "paas-deploy-dep_1.service",
+		SandboxType: "systemd",
 		SandboxID:   "sbx_1",
 		MemoryLimit: "128Mi",
 		CPUQuota:    0.5,
@@ -112,6 +114,7 @@ func TestStorePersistsRecordsAcrossReopen(t *testing.T) {
 		gotDeployment.Error != deployment.Error || gotDeployment.PID != deployment.PID ||
 		gotDeployment.LogPath != deployment.LogPath ||
 		gotDeployment.SystemdUnit != deployment.SystemdUnit ||
+		gotDeployment.SandboxType != deployment.SandboxType ||
 		gotDeployment.SandboxID != deployment.SandboxID ||
 		gotDeployment.MemoryLimit != deployment.MemoryLimit ||
 		gotDeployment.CPUQuota != deployment.CPUQuota ||
@@ -357,5 +360,53 @@ func assertForeignKeyError(t *testing.T, err error) {
 	}
 	if sqliteErr.ExtendedCode != sqlite3.ErrConstraintForeignKey {
 		t.Fatalf("SQLite extended code = %v, want foreign key constraint", sqliteErr.ExtendedCode)
+	}
+}
+
+func TestStoreUpgradesExistingDeploymentSchemasWithoutInventingBackend(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("version %d", version), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "upgrade.sqlite")
+			db, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			app, err := db.CreateApp("legacy")
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := model.Deployment{ID: "old", AppID: app.ID, State: model.Stopped, CreatedAt: time.Now().UTC(), LogPath: "/tmp/old.log"}
+			if err := db.CreateDeployment(d); err != nil {
+				t.Fatal(err)
+			}
+			columns := []string{"sandbox_type"}
+			if version == 1 {
+				columns = append(columns, "systemd_unit", "sandbox_id", "memory_limit", "cpu_quota", "tasks_limit")
+			}
+			for _, column := range columns {
+				if _, err := db.db.Exec("ALTER TABLE deployments DROP COLUMN " + column); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := db.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			upgraded, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer upgraded.Close()
+			got, err := upgraded.Deployment(d.ID)
+			if err != nil || got.LogPath != d.LogPath || got.SandboxType != "" {
+				t.Fatalf("legacy record damaged or backend fabricated: %+v %v", got, err)
+			}
+			var schema int
+			if err := upgraded.db.QueryRow("PRAGMA user_version").Scan(&schema); err != nil || schema != schemaVersion {
+				t.Fatalf("schema=%d err=%v", schema, err)
+			}
+		})
 	}
 }

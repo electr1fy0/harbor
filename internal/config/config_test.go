@@ -122,3 +122,18 @@ func writeConfig(t *testing.T, dir, contents string) {
 		t.Fatal(err)
 	}
 }
+
+func TestMemoryQuantitiesShareOverflowSafeRuntimeParser(t *testing.T) {
+	valid := map[string]int64{"64Mi": 64 << 20, "128M": 128 << 20, "1Gi": 1 << 30, "1Pi": 1 << 50, "1Ei": 1 << 60, "512Ki": 512 << 10, "1048576": 1048576, "1B": 1, "9223372036854775807": 9223372036854775807}
+	for input, want := range valid {
+		got, err := ParseMemoryBytes(input)
+		if err != nil || got != want {
+			t.Errorf("ParseMemoryBytes(%q)=%d,%v want %d", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"", "0", "-1Mi", "+1Mi", "1.5Gi", "1mi", " 1Mi", "8Ei", "9223372036854775808", "18446744073709551615Ki"} {
+		if _, err := ParseMemoryBytes(input); err == nil {
+			t.Errorf("accepted %q", input)
+		}
+	}
+}

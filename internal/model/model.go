@@ -15,7 +15,7 @@ const (
 	StartFailed    State = "START_FAILED"
 	Unhealthy      State = "UNHEALTHY"
 	Crashed        State = "CRASHED"
-	OomKilled      State = "OOM_KILLED"
+	OOMKilled      State = "OOM_KILLED"
 	Stopped        State = "STOPPED"
 )
 
@@ -40,6 +40,7 @@ type Deployment struct {
 	PID         int
 	LogPath     string
 	SystemdUnit string
+	SandboxType string
 	SandboxID   string
 	MemoryLimit string
 	CPUQuota    float64

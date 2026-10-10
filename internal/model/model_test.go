@@ -8,7 +8,7 @@ func TestActiveStates(t *testing.T) {
 			t.Errorf("%s must be active", state)
 		}
 	}
-	for _, state := range []State{BuildFailed, StartFailed, Unhealthy, Crashed, OomKilled, Stopped, "", "UNKNOWN"} {
+	for _, state := range []State{BuildFailed, StartFailed, Unhealthy, Crashed, OOMKilled, Stopped, "", "UNKNOWN"} {
 		if state.Active() {
 			t.Errorf("%s must not be active", state)
 		}

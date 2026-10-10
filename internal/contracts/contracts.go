@@ -33,10 +33,10 @@ type Release struct {
 	CreatedAt   time.Time
 }
 
-// Sandbox starts and manages one application process. The initial
-// implementation is a host process; Bubblewrap and systemd implementations
-// can follow without changing the interface.
+// Sandbox executes and manages application runtimes. Kind identifies the
+// backend used for persisted metadata and inspection.
 type Sandbox interface {
+	Kind() string
 	Start(context.Context, SandboxSpec) (*SandboxHandle, error)
 	Stop(context.Context, string) error
 	Inspect(context.Context, string) (*SandboxInfo, error)
@@ -66,10 +66,12 @@ type SandboxInfo struct {
 	ID            string
 	PID           int
 	Running       bool
+	Transitioning bool
 	ExitCode      *int
 	OOMKilled     bool
 	Result        string
 	SystemdUnit   string
+	ControlGroup  string
 	MemoryCurrent int64
 	TasksCurrent  int
 }

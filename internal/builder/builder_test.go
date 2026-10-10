@@ -16,6 +16,7 @@ import (
 
 	"paas/internal/config"
 	"paas/internal/contracts"
+	"paas/internal/sandbox"
 )
 
 func TestBuildPublishesDeterministicImmutableReleases(t *testing.T) {
@@ -58,8 +59,12 @@ func TestBuildPublishesDeterministicImmutableReleases(t *testing.T) {
 	if first.ArtifactDir != filepath.Join(dataDir, "releases", first.ID, "app") {
 		t.Fatalf("artifact directory is not release-local: %q", first.ArtifactDir)
 	}
-	if len(first.Command) != 3 || first.Command[0] != "/bin/sh" || first.Command[1] != "-c" || !strings.Contains(first.Command[2], filepath.Join(first.ArtifactDir, "server")) {
-		t.Fatalf("start command was not resolved into the release: %#v", first.Command)
+	if len(first.Command) != 1 || first.Command[0] != filepath.Join(first.ArtifactDir, "server") {
+		t.Fatalf("release command is not a direct executable: %#v", first.Command)
+	}
+	args, err := sandbox.BuildBwrapArgs(contracts.SandboxSpec{ID: "release-contract", Command: first.Command, Dir: first.ArtifactDir})
+	if err != nil || args[len(args)-1] != "/app/server" {
+		t.Fatalf("release cannot start in Bubblewrap: %v %v", args, err)
 	}
 
 	server := filepath.Join(first.ArtifactDir, "server")
@@ -389,4 +394,8 @@ func isZombie(pid int) bool {
 	}
 	fields := strings.Fields(string(data))
 	return len(fields) > 2 && fields[2] == "Z"
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }

@@ -1,279 +1,435 @@
-// Package sandbox provides execution environments for applications.
 package sandbox
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"paas/internal/config"
 	"paas/internal/contracts"
 )
 
 var _ contracts.Sandbox = (*SystemdSandbox)(nil)
 
-// SystemdSandbox executes applications inside Bubblewrap sandboxes supervised
-// by systemd transient service units and cgroups v2.
+// SystemdSandbox supervises Bubblewrap processes in transient cgroup v2 units.
+// Terminal snapshots survive Stop so callers can classify startup failures.
 type SystemdSandbox struct {
-	bwrapPath string
-	mu        sync.RWMutex
-	units     map[string]string // deploymentID -> unitName
+	bwrapPath    string
+	mu           sync.Mutex
+	units        map[string]*contracts.SandboxInfo
+	run          func(context.Context, string, ...string) ([]byte, error)
+	verifyLimits func(*contracts.SandboxInfo, contracts.SandboxSpec) error
 }
 
-// NewSystemd creates a new SystemdSandbox after checking systemd and bubblewrap tools.
 func NewSystemd() (*SystemdSandbox, error) {
-	if _, err := exec.LookPath("systemd-run"); err != nil {
-		return nil, fmt.Errorf("systemd-run is not installed: %w", err)
+	if runtime.GOOS != "linux" {
+		return nil, errors.New("systemd sandbox requires Linux")
 	}
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		return nil, fmt.Errorf("systemctl is not installed: %w", err)
+	for _, tool := range []string{"systemd-run", "systemctl", "journalctl"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			return nil, fmt.Errorf("%s is not installed: %w", tool, err)
+		}
 	}
 	bwrapPath, err := exec.LookPath("bwrap")
 	if err != nil {
 		return nil, fmt.Errorf("bubblewrap is not installed: %w", err)
 	}
-
-	return &SystemdSandbox{
-		bwrapPath: bwrapPath,
-		units:     make(map[string]string),
-	}, nil
+	controllers, err := os.ReadFile("/sys/fs/cgroup/cgroup.controllers")
+	if err != nil {
+		return nil, fmt.Errorf("cgroup v2 is required: %w", err)
+	}
+	available := " " + strings.Join(strings.Fields(string(controllers)), " ") + " "
+	for _, controller := range []string{"cpu", "memory", "pids"} {
+		if !strings.Contains(available, " "+controller+" ") {
+			return nil, fmt.Errorf("cgroup v2 controller %s is unavailable", controller)
+		}
+	}
+	s := &SystemdSandbox{bwrapPath: bwrapPath, units: make(map[string]*contracts.SandboxInfo), run: runSystemdCommand, verifyLimits: verifyCgroupLimits}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := s.run(ctx, "systemctl", append(managerArgs(), "show", "--property=Version")...); err != nil {
+		return nil, fmt.Errorf("connect to systemd manager: %w", err)
+	}
+	return s, nil
 }
 
-func (s *SystemdSandbox) systemdArgs() []string {
+func (*SystemdSandbox) Kind() string { return "systemd" }
+
+func managerArgs() []string {
 	if os.Geteuid() != 0 {
 		return []string{"--user"}
 	}
 	return nil
 }
 
-func (s *SystemdSandbox) unitName(id string) string {
-	return fmt.Sprintf("paas-deploy-%s.service", id)
+// SystemdUnitName validates IDs before passing their derived names to systemctl.
+func SystemdUnitName(id string) (string, error) {
+	if id == "" || len(id) > 200 {
+		return "", errors.New("sandbox ID must contain 1 to 200 letters, digits, underscores, or hyphens")
+	}
+	for _, c := range id {
+		if c != '_' && c != '-' && !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') {
+			return "", fmt.Errorf("invalid sandbox ID %q", id)
+		}
+	}
+	return "paas-deploy-" + id + ".service", nil
 }
 
-// Start launches a transient systemd service unit wrapping Bubblewrap.
-func (s *SystemdSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) (*contracts.SandboxHandle, error) {
-	if err := ctx.Err(); err != nil {
+func systemdRunArgs(spec contracts.SandboxSpec, bwrapPath, runtimeUser string) ([]string, error) {
+	unit, err := SystemdUnitName(spec.ID)
+	if err != nil {
 		return nil, err
 	}
-	if spec.ID == "" {
-		return nil, errors.New("sandbox ID is required")
-	}
-
 	bwrapArgs, err := BuildBwrapArgs(spec)
 	if err != nil {
 		return nil, err
 	}
-
-	unit := s.unitName(spec.ID)
-
-	// Clean up any stale unit state before starting
-	_ = s.execSystemctl("reset-failed", unit)
-
-	args := append([]string{}, s.systemdArgs()...)
-	args = append(args,
-		"--unit="+unit,
-		"-p", "RemainAfterExit=yes",
-		"-p", "StandardOutput=journal",
-		"-p", "StandardError=journal",
-	)
-
-	// Resource limit: MemoryMax & MemorySwapMax
-	memBytes := parseMemoryBytes(spec.MemoryMax)
-	if memBytes > 0 {
-		args = append(args,
-			"-p", fmt.Sprintf("MemoryMax=%d", memBytes),
-			"-p", "MemorySwapMax=0",
-		)
+	memory := spec.MemoryMax
+	if memory == "" {
+		memory = config.DefaultMemory
 	}
+	memBytes, err := config.ParseMemoryBytes(memory)
+	if err != nil {
+		return nil, err
+	}
+	cpu := spec.CPUQuota
+	if cpu == 0 {
+		cpu = config.DefaultCPU
+	}
+	if cpu <= 0 || math.IsNaN(cpu) || math.IsInf(cpu, 0) || math.IsInf(cpu*100, 0) {
+		return nil, errors.New("CPU quota must be finite and positive")
+	}
+	tasks := spec.TasksMax
+	if tasks == 0 {
+		tasks = config.DefaultTasks
+	}
+	if tasks < 1 {
+		return nil, errors.New("tasks limit must be positive")
+	}
+	args := append(managerArgs(), "--no-ask-password", "--unit="+unit, "--service-type=exec",
+		"-p", "RemainAfterExit=yes", "-p", "StandardOutput=journal", "-p", "StandardError=journal",
+		"-p", "NoNewPrivileges=yes", "-p", "KillMode=control-group", "-p", "TimeoutStopSec=2s",
+		"-p", "OOMPolicy=kill", "-p", "MemoryAccounting=yes", "-p", "CPUAccounting=yes", "-p", "TasksAccounting=yes",
+		"-p", fmt.Sprintf("MemoryMax=%d", memBytes), "-p", "MemorySwapMax=0",
+		"-p", "CPUQuota="+strconv.FormatFloat(cpu*100, 'f', -1, 64)+"%", "-p", fmt.Sprintf("TasksMax=%d", tasks))
+	if runtimeUser != "" {
+		args = append(args, "--uid="+runtimeUser)
+	}
+	args = append(args, "--", bwrapPath)
+	// systemd expands $ in service arguments. Escape it without requiring the
+	// --expand-environment switch introduced in systemd 254 (Ubuntu 22.04 uses 249).
+	for _, arg := range bwrapArgs {
+		args = append(args, strings.ReplaceAll(arg, "$", "$$"))
+	}
+	return args, nil
+}
 
-	// Resource limit: CPUQuota
-	if spec.CPUQuota > 0 {
-		percent := int(spec.CPUQuota * 100)
-		if percent > 0 {
-			args = append(args, "-p", fmt.Sprintf("CPUQuota=%d%%", percent))
+func runtimeIdentity(spec contracts.SandboxSpec) (string, error) {
+	if os.Geteuid() != 0 {
+		return "", nil
+	}
+	name := spec.User
+	if name == "" {
+		name = "paas-runtime"
+	}
+	target, err := user.Lookup(name)
+	if err != nil {
+		return "", fmt.Errorf("look up runtime user %q: %w", name, err)
+	}
+	uid, err := strconv.ParseUint(target.Uid, 10, 32)
+	if err != nil || uid == 0 {
+		return "", fmt.Errorf("runtime user %q must have a valid non-root UID", name)
+	}
+	return target.Uid, nil
+}
+
+func (s *SystemdSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) (*contracts.SandboxHandle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	identity, err := runtimeIdentity(spec)
+	if err != nil {
+		return nil, err
+	}
+	args, err := systemdRunArgs(spec, s.bwrapPath, identity)
+	if err != nil {
+		return nil, err
+	}
+	unit, _ := SystemdUnitName(spec.ID) // validated by systemdRunArgs
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Never reset or stop a live unit just because a duplicate Start arrived.
+	previous, err := s.inspectUnit(ctx, spec.ID)
+	if err != nil && !errors.Is(err, ErrSandboxNotFound) {
+		return nil, err
+	}
+	if err == nil {
+		if previous.Running || previous.Transitioning {
+			return nil, fmt.Errorf("sandbox %q is already active", spec.ID)
+		}
+		if err := s.stopUnit(ctx, spec.ID); err != nil {
+			return nil, err
 		}
 	}
-
-	// Resource limit: TasksMax
-	if spec.TasksMax > 0 {
-		args = append(args, "-p", fmt.Sprintf("TasksMax=%d", spec.TasksMax))
+	delete(s.units, spec.ID)
+	startCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if _, err := s.run(startCtx, "systemd-run", args...); err != nil {
+		// A canceled client may already have submitted the service to the manager.
+		// Capture its result before cleanup, retaining OOM evidence for Deploy.
+		return nil, s.cleanupStart(spec.ID, err)
 	}
-
-	// Pass Bubblewrap executable and arguments
-	args = append(args, s.bwrapPath)
-	args = append(args, bwrapArgs...)
-
-	runCmd := exec.Command("systemd-run", args...)
-	if out, err := runCmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("systemd-run failed: %w: %s", err, string(out))
-	}
-
-	s.mu.Lock()
-	s.units[spec.ID] = unit
-	s.mu.Unlock()
-
-	// Wait for the unit to become active or fail
-	timeout := time.After(3 * time.Second)
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
-
 	for {
+		info, err := s.inspectUnit(startCtx, spec.ID)
+		if err != nil {
+			return nil, s.cleanupStart(spec.ID, err)
+		}
+		if info.Running {
+			if err := s.verifyLimits(info, spec); err != nil {
+				return nil, s.cleanupStart(spec.ID, err)
+			}
+			return &contracts.SandboxHandle{ID: spec.ID, PID: info.PID}, nil
+		}
+		if info.ExitCode != nil || info.Result != "" && info.Result != "success" {
+			s.units[spec.ID] = info
+			return nil, s.cleanupStart(spec.ID, fmt.Errorf("systemd unit %s exited during startup: result=%s", unit, info.Result))
+		}
 		select {
-		case <-ctx.Done():
-			_ = s.Stop(context.Background(), spec.ID)
-			return nil, ctx.Err()
-		case <-timeout:
-			info, _ := s.Inspect(context.Background(), spec.ID)
-			_ = s.Stop(context.Background(), spec.ID)
-			return nil, fmt.Errorf("timeout waiting for systemd unit %s to start (info: %+v)", unit, info)
+		case <-startCtx.Done():
+			return nil, s.cleanupStart(spec.ID, fmt.Errorf("wait for systemd unit %s: %w", unit, startCtx.Err()))
 		case <-ticker.C:
-			info, inspectErr := s.Inspect(context.Background(), spec.ID)
-			if inspectErr != nil {
-				continue
-			}
-			if info.Running && info.PID > 0 {
-				return &contracts.SandboxHandle{ID: spec.ID, PID: info.PID}, nil
-			}
-			if !info.Running && (info.ExitCode != nil || info.Result != "" && info.Result != "success") {
-				// Failed early during startup
-				return nil, fmt.Errorf("systemd unit %s failed during startup: result=%s exit=%v", unit, info.Result, info.ExitCode)
-			}
 		}
 	}
 }
 
-// Stop stops the transient systemd service unit.
-func (s *SystemdSandbox) Stop(ctx context.Context, id string) error {
-	unit := s.unitName(id)
-	_ = s.execSystemctl("stop", unit)
-	_ = s.execSystemctl("reset-failed", unit)
+// Caller holds mu. Cleanup uses a fresh bounded context even if Start was canceled.
+func (s *SystemdSandbox) cleanupStart(id string, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	return errors.Join(cause, s.stopUnit(ctx, id))
+}
 
+func (s *SystemdSandbox) Stop(ctx context.Context, id string) error {
 	s.mu.Lock()
-	delete(s.units, id)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	return s.stopUnit(ctx, id)
+}
+
+func (s *SystemdSandbox) stopUnit(ctx context.Context, id string) error {
+	unit, err := SystemdUnitName(id)
+	if err != nil {
+		return err
+	}
+	before, err := s.inspectUnit(ctx, id)
+	if errors.Is(err, ErrSandboxNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := s.run(ctx, "systemctl", append(managerArgs(), "--no-ask-password", "stop", unit)...); err != nil {
+		// Another cleanup may unload the unit between show and stop.
+		if _, inspectErr := s.inspectUnit(ctx, id); !errors.Is(inspectErr, ErrSandboxNotFound) {
+			return errors.Join(err, inspectErr)
+		}
+		before.Running = false
+		before.Transitioning = false
+		s.units[id] = before
+		return nil
+	}
+	after, err := s.inspectUnit(ctx, id)
+	if err != nil && !errors.Is(err, ErrSandboxNotFound) {
+		return err
+	}
+	if err == nil && after.Running {
+		return fmt.Errorf("systemd unit %s is still running after stop", unit)
+	}
+	before.Running = false
+	before.Transitioning = false
+	s.units[id] = before
+	// Successful transient units may already have been unloaded; reset only failed units.
+	if after != nil && after.Result != "" && after.Result != "success" {
+		if _, err := s.run(ctx, "systemctl", append(managerArgs(), "reset-failed", unit)...); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// Inspect queries the current properties of the transient systemd service unit.
+// StopSystemdDeployment reclaims a previous daemon's unit, even when the new
+// daemon uses a different backend or Bubblewrap has since been uninstalled.
+func StopSystemdDeployment(ctx context.Context, id string) error {
+	s := &SystemdSandbox{units: make(map[string]*contracts.SandboxInfo), run: runSystemdCommand}
+	return s.Stop(ctx, id)
+}
+
 func (s *SystemdSandbox) Inspect(ctx context.Context, id string) (*contracts.SandboxInfo, error) {
-	unit := s.unitName(id)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if info := s.units[id]; info != nil {
+		snapshot := *info
+		if info.ExitCode != nil {
+			code := *info.ExitCode
+			snapshot.ExitCode = &code
+		}
+		return &snapshot, nil
+	}
+	return s.inspectUnit(ctx, id)
+}
 
-	args := append([]string{}, s.systemdArgs()...)
-	args = append(args, "show", unit,
-		"-p", "ActiveState",
-		"-p", "SubState",
-		"-p", "MainPID",
-		"-p", "ExecMainStatus",
-		"-p", "Result",
-		"-p", "OOMKilled",
-		"-p", "MemoryCurrent",
-		"-p", "TasksCurrent",
-	)
-
-	cmd := exec.CommandContext(ctx, "systemctl", args...)
-	out, err := cmd.Output()
+func (s *SystemdSandbox) inspectUnit(ctx context.Context, id string) (*contracts.SandboxInfo, error) {
+	unit, err := SystemdUnitName(id)
 	if err != nil {
-		return nil, fmt.Errorf("systemctl show %s: %w", unit, err)
+		return nil, err
 	}
-
-	props := parseSystemdProperties(string(out))
-	activeState := props["ActiveState"]
-	result := props["Result"]
-	oomKilled := props["OOMKilled"] == "yes" || result == "oom-kill"
-
-	running := activeState == "active"
-	mainPID, _ := strconv.Atoi(props["MainPID"])
-
-	info := &contracts.SandboxInfo{
-		ID:          id,
-		PID:         mainPID,
-		Running:     running,
-		OOMKilled:   oomKilled,
-		Result:      result,
-		SystemdUnit: unit,
+	args := append(managerArgs(), "show", unit)
+	for _, property := range []string{"LoadState", "ActiveState", "SubState", "MainPID", "ExecMainCode", "ExecMainStatus", "Result", "MemoryCurrent", "TasksCurrent", "ControlGroup"} {
+		args = append(args, "-p", property)
 	}
+	out, err := s.run(ctx, "systemctl", args...)
+	if parseSystemdProperties(string(out))["LoadState"] == "not-found" {
+		return nil, fmt.Errorf("%w: %q", ErrSandboxNotFound, id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return parseSystemdInfo(id, unit, string(out))
+}
 
-	if statusStr, ok := props["ExecMainStatus"]; ok && statusStr != "" {
-		if code, err := strconv.Atoi(statusStr); err == nil && (!running || code != 0) {
-			info.ExitCode = &code
+func parseSystemdInfo(id, unit, output string) (*contracts.SandboxInfo, error) {
+	props := parseSystemdProperties(output)
+	if props["LoadState"] == "not-found" {
+		return nil, fmt.Errorf("%w: %q", ErrSandboxNotFound, id)
+	}
+	if props["LoadState"] == "" || props["ActiveState"] == "" || props["SubState"] == "" {
+		return nil, errors.New("systemctl returned incomplete unit properties")
+	}
+	pid, err := strconv.Atoi(props["MainPID"])
+	if err != nil || pid < 0 {
+		return nil, fmt.Errorf("invalid systemd MainPID %q", props["MainPID"])
+	}
+	info := &contracts.SandboxInfo{ID: id, PID: pid, SystemdUnit: unit, Result: props["Result"], OOMKilled: props["Result"] == "oom-kill", ControlGroup: props["ControlGroup"]}
+	// RemainAfterExit leaves cleanly exited units active with SubState=exited.
+	info.Transitioning = props["ActiveState"] == "activating" || props["ActiveState"] == "deactivating"
+	info.Running = props["ActiveState"] == "active" && props["SubState"] == "running" && pid > 0
+	if !info.Running && props["ExecMainCode"] != "0" && props["ExecMainCode"] != "" {
+		status, err := strconv.Atoi(props["ExecMainStatus"])
+		if err != nil {
+			return nil, fmt.Errorf("invalid systemd exit status %q", props["ExecMainStatus"])
+		}
+		switch props["ExecMainCode"] {
+		case "1": // CLD_EXITED
+		case "2", "3":
+			status += 128 // CLD_KILLED / CLD_DUMPED
+		default:
+			return nil, fmt.Errorf("invalid systemd exit code %q", props["ExecMainCode"])
+		}
+		info.ExitCode = &status
+	}
+	if value := props["MemoryCurrent"]; value != "" && value != "[not set]" && value != "18446744073709551615" {
+		info.MemoryCurrent, err = strconv.ParseInt(value, 10, 64)
+		if err != nil || info.MemoryCurrent < 0 {
+			return nil, fmt.Errorf("invalid systemd MemoryCurrent %q", value)
 		}
 	}
 
-	if memStr, ok := props["MemoryCurrent"]; ok && memStr != "[not set]" && memStr != "" {
-		if mem, err := strconv.ParseInt(memStr, 10, 64); err == nil {
-			info.MemoryCurrent = mem
+	if value := props["TasksCurrent"]; value != "" && value != "[not set]" && value != "18446744073709551615" {
+		info.TasksCurrent, err = strconv.Atoi(value)
+		if err != nil || info.TasksCurrent < 0 {
+			return nil, fmt.Errorf("invalid systemd TasksCurrent %q", value)
 		}
 	}
-
-	if taskStr, ok := props["TasksCurrent"]; ok && taskStr != "[not set]" && taskStr != "" {
-		if tasks, err := strconv.Atoi(taskStr); err == nil {
-			info.TasksCurrent = tasks
-		}
-	}
-
 	return info, nil
 }
 
-func (s *SystemdSandbox) execSystemctl(action, unit string) error {
-	args := append([]string{}, s.systemdArgs()...)
-	args = append(args, action, unit)
-	cmd := exec.Command("systemctl", args...)
-	return cmd.Run()
-}
-
 func parseSystemdProperties(output string) map[string]string {
-	result := make(map[string]string)
+	props := make(map[string]string)
 	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		key, val, ok := strings.Cut(line, "=")
-		if ok {
-			result[key] = val
+		if key, value, ok := strings.Cut(line, "="); ok {
+			props[key] = value
 		}
 	}
-	return result
+	return props
 }
 
-func parseMemoryBytes(val string) int64 {
-	val = strings.TrimSpace(val)
-	if val == "" {
-		return 128 * 1024 * 1024
+func verifyCgroupLimits(info *contracts.SandboxInfo, spec contracts.SandboxSpec) error {
+	group := info.ControlGroup
+	if group == "" || !filepath.IsAbs(group) || filepath.Clean(group) != group || group == "/" {
+		return fmt.Errorf("invalid runtime cgroup %q", group)
 	}
-
-	units := []struct {
-		suffix string
-		mult   int64
-	}{
-		{"Ki", 1024},
-		{"K", 1024},
-		{"Mi", 1024 * 1024},
-		{"M", 1024 * 1024},
-		{"Gi", 1024 * 1024 * 1024},
-		{"G", 1024 * 1024 * 1024},
-		{"Ti", 1024 * 1024 * 1024 * 1024},
-		{"T", 1024 * 1024 * 1024 * 1024},
-		{"B", 1},
+	root := filepath.Join("/sys/fs/cgroup", group)
+	memory := spec.MemoryMax
+	if memory == "" {
+		memory = config.DefaultMemory
 	}
-
-	for _, u := range units {
-		if strings.HasSuffix(val, u.suffix) {
-			numStr := strings.TrimSuffix(val, u.suffix)
-			if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
-				return num * u.mult
-			}
+	memoryBytes, err := config.ParseMemoryBytes(memory)
+	if err != nil {
+		return err
+	}
+	tasks := spec.TasksMax
+	if tasks == 0 {
+		tasks = config.DefaultTasks
+	}
+	for _, limit := range []struct {
+		file    string
+		maximum int64
+	}{{"memory.max", memoryBytes}, {"memory.swap.max", 0}, {"pids.max", int64(tasks)}} {
+		data, err := os.ReadFile(filepath.Join(root, limit.file))
+		if err != nil {
+			return fmt.Errorf("verify %s enforcement: %w", limit.file, err)
+		}
+		value, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil || value < 0 || value > limit.maximum {
+			return fmt.Errorf("%s limit is not enforced: %q", limit.file, strings.TrimSpace(string(data)))
 		}
 	}
-
-	if num, err := strconv.ParseInt(val, 10, 64); err == nil {
-		return num
+	data, err := os.ReadFile(filepath.Join(root, "cpu.max"))
+	if err != nil {
+		return fmt.Errorf("verify CPU enforcement: %w", err)
 	}
+	fields := strings.Fields(string(data))
+	if len(fields) != 2 || fields[0] == "max" {
+		return fmt.Errorf("CPU quota is not enforced: %q", string(data))
+	}
+	quota, qerr := strconv.ParseFloat(fields[0], 64)
+	period, perr := strconv.ParseFloat(fields[1], 64)
+	cpu := spec.CPUQuota
+	if cpu == 0 {
+		cpu = config.DefaultCPU
+	}
+	// The kernel rounds quotas to microseconds; systemd enforces a 1ms minimum.
+	if qerr != nil || perr != nil || quota <= 0 || period <= 0 || quota/period > cpu+1000/period {
+		return fmt.Errorf("unexpected CPU quota: %q", string(data))
+	}
+	return nil
+}
 
-	return 128 * 1024 * 1024
+func runSystemdCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = time.Second
+	output := &tailBuffer{limit: 64 << 10}
+	cmd.Stdout, cmd.Stderr = output, output
+	err := cmd.Run()
+	out := output.data
+	if err != nil {
+		return out, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), errors.Join(err, ctx.Err()), strings.TrimSpace(string(out)))
+	}
+	return out, nil
 }
