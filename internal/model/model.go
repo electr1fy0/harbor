@@ -48,3 +48,44 @@ type Deployment struct {
 	StartedAt   *time.Time
 	StoppedAt   *time.Time
 }
+
+// EventType represents a granular lifecycle transition.
+type EventType string
+
+const (
+	EventBuildStarted         EventType = "BuildStarted"
+	EventBuildCompleted       EventType = "BuildCompleted"
+	EventBuildFailed          EventType = "BuildFailed"
+	EventSandboxStarting      EventType = "SandboxStarting"
+	EventSandboxStarted       EventType = "SandboxStarted"
+	EventSandboxExited        EventType = "SandboxExited"
+	EventHealthCheckPassed    EventType = "HealthCheckPassed"
+	EventHealthCheckFailed    EventType = "HealthCheckFailed"
+	EventRouteSwitched        EventType = "RouteSwitched"
+	EventGracePeriodStarted   EventType = "GracePeriodStarted"
+	EventOldDeploymentStopped EventType = "OldDeploymentStopped"
+	EventDeploymentSucceeded  EventType = "DeploymentSucceeded"
+	EventDeploymentFailed     EventType = "DeploymentFailed"
+	EventRollbackTriggered    EventType = "RollbackTriggered"
+)
+
+type Event struct {
+	ID           int64     `json:"id"`
+	DeploymentID string    `json:"deployment_id"`
+	AppID        string    `json:"app_id"`
+	Type         EventType `json:"type"`
+	Payload      string    `json:"payload"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type ReleaseView struct {
+	ID          string    `json:"id"`
+	AppID       string    `json:"app_id"`
+	AppName     string    `json:"app_name"`
+	SourceHash  string    `json:"source_hash"`
+	Runtime     string    `json:"runtime"`
+	ArtifactDir string    `json:"artifact_dir"`
+	CreatedAt   time.Time `json:"created_at"`
+	IsActive    bool      `json:"is_active"`
+}
+

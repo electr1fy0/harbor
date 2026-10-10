@@ -22,7 +22,7 @@ func NewPlatformServer(socketPath string, service *deployment.Service, routerAdd
 	ping := server.http.Handler
 	mux := http.NewServeMux()
 	mux.Handle("/ping", ping)
-	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop"} {
+	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop", "releases", "rollback"} {
 		command := command
 		mux.HandleFunc("/"+command, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -57,6 +57,10 @@ func NewPlatformServer(socketPath string, service *deployment.Service, routerAdd
 				output.Deployment, err = service.Stop(r.Context(), input.Name)
 			case "logs":
 				output.Logs, err = service.Logs(input.Name)
+			case "releases":
+				output.Releases, err = service.Releases(input.Name)
+			case "rollback":
+				output.Deployment, err = service.Rollback(r.Context(), input.Name, input.ReleaseID)
 			case "apps":
 				apps, listErr := service.Apps()
 				err = listErr

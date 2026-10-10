@@ -23,9 +23,10 @@ until deploy. In another terminal:
     sudo ./bin/paas ping
     sudo ./bin/paas deploy ./examples/hello-go --name hello
     curl -H 'Host: hello.localhost' http://127.0.0.1:8080/
-    sudo ./bin/paas apps
+    sudo ./bin/paas releases hello
     sudo ./bin/paas inspect hello
     sudo ./bin/paas logs hello
+    sudo ./bin/paas rollback hello
     sudo ./bin/paas stop hello
 
 The control socket is owner-only, so the CLI also uses sudo with a root daemon.
@@ -68,12 +69,13 @@ BUILD_FAILED, START_FAILED, or UNHEALTHY with errors/logs, and get no route.
 Unexpected runtime exits become CRASHED and withdraw the route. Unknown hosts
 return 404. Logs returns the last 1 MiB; rotation/streaming are not implemented.
 
-Stop an active app before deploying it again. Graceful daemon shutdown stops
-its apps. Restart preserves history/releases but does not auto-restart apps.
-On Linux the direct runtime process also dies if the daemon dies abruptly.
-Host processes are not namespace-isolated and share a runtime account.
-Forked workers that deliberately outlive their parent are not guaranteed to
-be reclaimed after a hard daemon crash; full runtime supervision is still pending.
+Deployments support safe, zero-downtime candidate redeployment: new versions
+are built, started, and health-checked on an isolated loopback port before traffic
+is atomically switched. Failed candidate builds or unhealthy startups never disturb
+the active version. Replaced deployments undergo a graceful draining grace period
+before receiving SIGTERM. Rollback (`paas rollback <name>`) instantly reverts to a
+previous release from immutable history without recompilation. Structured lifecycle
+events and release history are audited persistently in SQLite.
 
 ## Local macOS development
 

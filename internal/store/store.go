@@ -19,7 +19,7 @@ import (
 
 var ErrNotFound = errors.New("store: not found")
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
@@ -190,6 +190,21 @@ func (s *Store) LatestDeployment(name string) (*model.Deployment, error) {
 	return d, nil
 }
 
+// ActiveDeployment returns the deployment currently mapped to hostname in routes.
+func (s *Store) ActiveDeployment(name string) (*model.Deployment, error) {
+	hostname := name + ".localhost"
+	d, err := scanDeployment(s.db.QueryRow(deploymentSelect+`
+		JOIN routes AS r ON r.deployment_id = d.id
+		WHERE r.hostname = ?`, hostname))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: active deployment for application %q", ErrNotFound, name)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read active deployment: %w", err)
+	}
+	return d, nil
+}
+
 // Deployment returns the deployment with id.
 func (s *Store) Deployment(id string) (*model.Deployment, error) {
 	d, err := scanDeployment(s.db.QueryRow(deploymentSelect+`WHERE d.id = ?`, id))
@@ -289,6 +304,199 @@ func (s *Store) Finish(d model.Deployment, hostname string) error {
 	}
 	return nil
 }
+
+// Promote atomically switches the route from any previous deployment to candidate d,
+// marking candidate d as RUNNING. It returns the ID of the replaced deployment if one existed.
+func (s *Store) Promote(d model.Deployment, hostname string) (string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", fmt.Errorf("store: begin promote: %w", err)
+	}
+	defer tx.Rollback()
+
+	var previousDeploymentID sql.NullString
+	_ = tx.QueryRow(`SELECT deployment_id FROM routes WHERE hostname = ?`, hostname).Scan(&previousDeploymentID)
+
+	d.State = model.Running
+	if err := updateDeployment(tx, d); err != nil {
+		return "", err
+	}
+	_, err = tx.Exec(`
+		INSERT INTO routes (hostname, deployment_id) VALUES (?, ?)
+		ON CONFLICT(hostname) DO UPDATE SET deployment_id = excluded.deployment_id`, hostname, d.ID)
+	if err != nil {
+		return "", fmt.Errorf("store: promote route: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("store: commit promote: %w", err)
+	}
+	if previousDeploymentID.Valid && previousDeploymentID.String != d.ID {
+		return previousDeploymentID.String, nil
+	}
+	return "", nil
+}
+
+// RecordEvent appends a lifecycle event for a deployment.
+func (s *Store) RecordEvent(deploymentID, appID string, eventType model.EventType, payload string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO events (deployment_id, app_id, type, payload, created_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		deploymentID, appID, string(eventType), payload, encodeTime(time.Now().UTC()))
+	if err != nil {
+		return fmt.Errorf("store: record event: %w", err)
+	}
+	return nil
+}
+
+// Events returns the lifecycle events for a deployment in chronological order.
+func (s *Store) Events(deploymentID string) ([]model.Event, error) {
+	rows, err := s.db.Query(`
+		SELECT id, deployment_id, app_id, type, payload, created_at
+		FROM events WHERE deployment_id = ? ORDER BY id ASC`, deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []model.Event
+	for rows.Next() {
+		var e model.Event
+		var typeStr, createdAt string
+		if err := rows.Scan(&e.ID, &e.DeploymentID, &e.AppID, &typeStr, &e.Payload, &createdAt); err != nil {
+			return nil, fmt.Errorf("store: scan event: %w", err)
+		}
+		e.Type = model.EventType(typeStr)
+		var decodeErr error
+		if e.CreatedAt, decodeErr = decodeTime(createdAt); decodeErr != nil {
+			return nil, fmt.Errorf("store: decode event creation time: %w", decodeErr)
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list events: %w", err)
+	}
+	return events, nil
+}
+
+// ReleasesForApp returns all immutable releases for the application newest first,
+// indicating which release is currently mapped to the active route.
+func (s *Store) ReleasesForApp(appName string) ([]model.ReleaseView, error) {
+	var appID string
+	err := s.db.QueryRow(`SELECT id FROM apps WHERE name = ?`, appName).Scan(&appID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: application %q", ErrNotFound, appName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: check application: %w", err)
+	}
+
+	rows, err := s.db.Query(`
+		SELECT r.id, r.app_id, a.name, r.source_hash, r.runtime, r.artifact_dir, r.created_at,
+		       CASE WHEN routes.deployment_id IS NOT NULL AND d.release_id = r.id THEN 1 ELSE 0 END AS is_active
+		FROM releases AS r
+		JOIN apps AS a ON a.id = r.app_id
+		LEFT JOIN routes ON routes.hostname = a.name || '.localhost'
+		LEFT JOIN deployments AS d ON d.id = routes.deployment_id
+		WHERE a.name = ?
+		ORDER BY r.created_at DESC, r.id DESC`, appName)
+	if err != nil {
+		return nil, fmt.Errorf("store: list releases: %w", err)
+	}
+	defer rows.Close()
+
+	var releases []model.ReleaseView
+	for rows.Next() {
+		var r model.ReleaseView
+		var createdAt string
+		var isActive int
+		if err := rows.Scan(&r.ID, &r.AppID, &r.AppName, &r.SourceHash, &r.Runtime, &r.ArtifactDir, &createdAt, &isActive); err != nil {
+			return nil, fmt.Errorf("store: scan release view: %w", err)
+		}
+		var decodeErr error
+		if r.CreatedAt, decodeErr = decodeTime(createdAt); decodeErr != nil {
+			return nil, fmt.Errorf("store: decode release creation time: %w", decodeErr)
+		}
+		r.IsActive = isActive == 1
+		releases = append(releases, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list releases: %w", err)
+	}
+	return releases, nil
+}
+
+// PreviousRelease returns the most recent successfully deployed release prior to the current active release.
+func (s *Store) PreviousRelease(appName string) (*contracts.Release, error) {
+	var appID string
+	err := s.db.QueryRow(`SELECT id FROM apps WHERE name = ?`, appName).Scan(&appID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: application %q", ErrNotFound, appName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: check application: %w", err)
+	}
+
+	var currentReleaseID string
+	active, err := s.ActiveDeployment(appName)
+	if err == nil && active != nil {
+		currentReleaseID = active.ReleaseID
+	}
+
+	rows, err := s.db.Query(`
+		SELECT DISTINCT d.release_id
+		FROM deployments AS d
+		JOIN apps AS a ON a.id = d.app_id
+		WHERE a.name = ?
+		  AND d.release_id IS NOT NULL
+		  AND d.state IN ('RUNNING', 'STOPPED')
+		  AND (d.error = '' OR d.error IS NULL)
+		ORDER BY d.created_at DESC, d.id DESC`, appName)
+	if err != nil {
+		return nil, fmt.Errorf("store: query previous release: %w", err)
+	}
+	defer rows.Close()
+
+	var targetReleaseID string
+	foundCurrent := (currentReleaseID == "")
+	for rows.Next() {
+		var relID string
+		if err := rows.Scan(&relID); err != nil {
+			return nil, fmt.Errorf("store: scan previous release: %w", err)
+		}
+		if currentReleaseID != "" {
+			if relID != currentReleaseID {
+				targetReleaseID = relID
+				break
+			}
+		} else {
+			if !foundCurrent {
+				foundCurrent = true
+				continue
+			}
+			targetReleaseID = relID
+			break
+		}
+	}
+	_ = rows.Close()
+	if targetReleaseID == "" {
+		return nil, fmt.Errorf("no previous release available for application %q", appName)
+	}
+	return s.Release(targetReleaseID)
+}
+
+// DeploymentForRelease returns the most recent deployment associated with releaseID.
+func (s *Store) DeploymentForRelease(releaseID string) (*model.Deployment, error) {
+	d, err := scanDeployment(s.db.QueryRow(deploymentSelect+`WHERE d.release_id = ? ORDER BY d.created_at DESC, d.id DESC LIMIT 1`, releaseID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: deployment for release %q", ErrNotFound, releaseID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read deployment for release: %w", err)
+	}
+	return d, nil
+}
+
+
 
 const deploymentSelect = `
 	SELECT d.id, d.app_id, a.name, d.release_id, d.port, d.state, d.error,
@@ -453,6 +661,30 @@ func migrate(db *sql.DB) error {
 			}
 		}
 		if _, err := tx.Exec(`PRAGMA user_version = 2`); err != nil {
+			return err
+		}
+		version = 2
+	}
+	if version < 3 {
+		statements := []string{
+			`CREATE TABLE events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+				app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+				type TEXT NOT NULL CHECK (length(type) > 0),
+				payload TEXT NOT NULL DEFAULT '',
+				created_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX events_deployment_idx ON events(deployment_id, id ASC)`,
+			`CREATE INDEX events_app_idx ON events(app_id, id DESC)`,
+			`CREATE INDEX releases_app_created_idx ON releases(app_id, created_at DESC, id DESC)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(statement); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil {
 			return err
 		}
 	}

@@ -92,11 +92,14 @@ func (b *fakeBuilder) Build(ctx context.Context, request contracts.BuildRequest)
 		}
 	}
 
+	artifactDir := filepath.Join(os.TempDir(), fmt.Sprintf("artifact-%d", id))
+	_ = os.MkdirAll(artifactDir, 0755)
+
 	return &contracts.Release{
 		ID:          fmt.Sprintf("release-%d", id),
 		SourceHash:  fmt.Sprintf("source-%d", id),
 		Runtime:     "go",
-		ArtifactDir: filepath.Join(os.TempDir(), fmt.Sprintf("artifact-%d", id)),
+		ArtifactDir: artifactDir,
 		Command:     []string{"fake-server"},
 		CreatedAt:   time.Now().UTC(),
 	}, nil
@@ -352,27 +355,187 @@ func TestDeployBuildAndStartFailures(t *testing.T) {
 	})
 }
 
-func TestDeployRefusesActiveApplicationRedeploy(t *testing.T) {
+func TestDeployAllowsActiveApplicationRedeployAndSwapsRoute(t *testing.T) {
 	h := newServiceHarness(t, testConfig)
 	first, err := h.service.Deploy(context.Background(), h.source, "")
 	if err != nil {
 		t.Fatalf("first Deploy() error = %v", err)
 	}
+	if first.State != model.Running {
+		t.Fatalf("first Deploy() state = %s, want RUNNING", first.State)
+	}
+
 	second, err := h.service.Deploy(context.Background(), h.source, "")
-	if err == nil || !strings.Contains(err.Error(), "active; stop it before deploying again") {
-		t.Fatalf("second Deploy() error = %v, want active application refusal", err)
+	if err != nil {
+		t.Fatalf("second Deploy() error = %v, want successful redeploy", err)
 	}
-	if second != nil {
-		t.Fatalf("second Deploy() = %#v, want nil deployment", second)
+	if second == nil || second.State != model.Running {
+		t.Fatalf("second Deploy() state = %v, want RUNNING", second)
 	}
-	if got := h.builder.count(); got != 1 {
-		t.Fatalf("builder calls = %d, want 1 after active redeploy refusal", got)
+	if second.ID == first.ID {
+		t.Fatalf("second deployment ID = %s, want different from first %s", second.ID, first.ID)
 	}
-	latest, err := h.service.Inspect("demo")
-	if err != nil || latest.ID != first.ID || latest.State != model.Running {
-		t.Fatalf("latest deployment = %#v, %v; want first running deployment", latest, err)
+
+	// Verify route is swapped to second deployment
+	routes, err := h.db.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routes["demo.localhost"] != second.ID {
+		t.Fatalf("route = %q, want second deployment %q", routes["demo.localhost"], second.ID)
+	}
+
+	// Wait for grace period and verify first deployment is retired
+	waitFor(t, "first deployment graceful retirement", func() bool {
+		dep, getErr := h.db.Deployment(first.ID)
+		return getErr == nil && dep.State == model.Stopped
+	})
+}
+
+func TestCandidateFailureLeavesActiveDeploymentUntouched(t *testing.T) {
+	t.Run("candidate build failure", func(t *testing.T) {
+		h := newServiceHarness(t, testConfig)
+		first, err := h.service.Deploy(context.Background(), h.source, "")
+		if err != nil {
+			t.Fatalf("first Deploy() error = %v", err)
+		}
+
+		h.builder.setBehavior("demo", &buildBehavior{err: errors.New("compiler syntax error")})
+		second, err := h.service.Deploy(context.Background(), h.source, "")
+		if err == nil || !strings.Contains(err.Error(), "compiler syntax error") {
+			t.Fatalf("second Deploy() error = %v, want compiler error", err)
+		}
+		if second == nil || second.State != model.BuildFailed {
+			t.Fatalf("second deployment state = %v, want BUILD_FAILED", second)
+		}
+
+		// First deployment must still be RUNNING and route intact!
+		routes, err := h.db.Routes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if routes["demo.localhost"] != first.ID {
+			t.Fatalf("route = %q, want first deployment %q untouched", routes["demo.localhost"], first.ID)
+		}
+		active, err := h.service.Inspect("demo")
+		if err != nil || active.ID != first.ID || active.State != model.Running {
+			t.Fatalf("active deployment = %#v, want first running deployment", active)
+		}
+	})
+
+	t.Run("candidate health check failure", func(t *testing.T) {
+		ready := &atomic.Bool{}
+		ready.Store(true)
+		h := newServiceHarness(t, strings.Replace(testConfig, "start:\n", "health:\n  path: /ready\nstart:\n", 1))
+		h.sandbox.ready = ready
+
+		first, err := h.service.Deploy(context.Background(), h.source, "")
+		if err != nil {
+			t.Fatalf("first Deploy() error = %v", err)
+		}
+
+		// Set ready to false so next candidate fails health check
+		ready.Store(false)
+		second, err := h.service.Deploy(context.Background(), h.source, "")
+		if err == nil || !strings.Contains(err.Error(), "health check failed") {
+			t.Fatalf("second Deploy() error = %v, want health check failure", err)
+		}
+		if second == nil || second.State != model.Unhealthy {
+			t.Fatalf("second deployment state = %v, want UNHEALTHY", second)
+		}
+
+		// First deployment must still be RUNNING and route intact!
+		routes, err := h.db.Routes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if routes["demo.localhost"] != first.ID {
+			t.Fatalf("route = %q, want first deployment %q untouched", routes["demo.localhost"], first.ID)
+		}
+		active, err := h.service.Inspect("demo")
+		if err != nil || active.ID != first.ID || active.State != model.Running {
+			t.Fatalf("active deployment = %#v, want first running deployment", active)
+		}
+	})
+}
+
+func TestRollbackRestoresPreviousReleaseWithoutRebuild(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "")
+	if err != nil {
+		t.Fatalf("first Deploy() error = %v", err)
+	}
+
+	second, err := h.service.Deploy(context.Background(), h.source, "")
+	if err != nil || second.State != model.Running {
+		t.Fatalf("second Deploy() = %#v, %v; want running", second, err)
+	}
+
+	buildCountBefore := h.builder.count()
+
+	// Rollback to previous release
+	rollbackDep, err := h.service.Rollback(context.Background(), "demo", "")
+	if err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+	if rollbackDep.State != model.Running {
+		t.Fatalf("rollback deployment state = %s, want RUNNING", rollbackDep.State)
+	}
+	if rollbackDep.ReleaseID != first.ReleaseID {
+		t.Fatalf("rollback deployment release = %s, want first release %s", rollbackDep.ReleaseID, first.ReleaseID)
+	}
+
+	// Verify no builder invocation occurred!
+	if h.builder.count() != buildCountBefore {
+		t.Fatalf("builder called during rollback: count = %d, want %d", h.builder.count(), buildCountBefore)
+	}
+
+	// Verify route switched to rollback deployment
+	routes, err := h.db.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routes["demo.localhost"] != rollbackDep.ID {
+		t.Fatalf("route = %q, want rollback deployment %q", routes["demo.localhost"], rollbackDep.ID)
 	}
 }
+
+func TestRollbackIgnoresFailedCandidates(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "")
+	if err != nil {
+		t.Fatalf("first Deploy() error = %v", err)
+	}
+
+	second, err := h.service.Deploy(context.Background(), h.source, "")
+	if err != nil || second.State != model.Running {
+		t.Fatalf("second Deploy() = %#v, %v; want running", second, err)
+	}
+
+	// Trigger a failed candidate build
+	h.builder.setBehavior("demo", &buildBehavior{err: errors.New("compilation failed")})
+	third, err := h.service.Deploy(context.Background(), h.source, "")
+	if err == nil {
+		t.Fatalf("third Deploy() unexpectedly succeeded: %#v", third)
+	}
+
+	// Clear builder error
+	h.builder.setBehavior("demo", nil)
+
+	// Rollback must restore first release, skipping the failed candidate
+	rollbackDep, err := h.service.Rollback(context.Background(), "demo", "")
+	if err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+	if rollbackDep.State != model.Running {
+		t.Fatalf("rollback deployment state = %s, want RUNNING", rollbackDep.State)
+	}
+	if rollbackDep.ReleaseID != first.ReleaseID {
+		t.Fatalf("rollback selected release = %s, want first release %s", rollbackDep.ReleaseID, first.ReleaseID)
+	}
+}
+
+
 
 func TestCrashSupervisionContinuesDuringAnotherBuild(t *testing.T) {
 	h := newServiceHarness(t, testConfig)
