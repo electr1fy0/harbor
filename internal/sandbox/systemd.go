@@ -82,7 +82,15 @@ func SystemdUnitName(id string) (string, error) {
 			return "", fmt.Errorf("invalid sandbox ID %q", id)
 		}
 	}
+	if strings.HasPrefix(id, "svc_") || strings.HasPrefix(id, "service_") {
+		return "paas-" + id + ".service", nil
+	}
 	return "paas-deploy-" + id + ".service", nil
+}
+
+func (s *SystemdSandbox) unitName(id string) string {
+	name, _ := SystemdUnitName(id)
+	return name
 }
 
 func systemdRunArgs(spec contracts.SandboxSpec, bwrapPath, runtimeUser string) ([]string, error) {

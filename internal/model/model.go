@@ -71,6 +71,9 @@ const (
 	EventDeploymentSucceeded  EventType = "DeploymentSucceeded"
 	EventDeploymentFailed     EventType = "DeploymentFailed"
 	EventRollbackTriggered    EventType = "RollbackTriggered"
+	EventServiceCreated       EventType = "ServiceCreated"
+	EventServiceStarted       EventType = "ServiceStarted"
+	EventServiceLinked        EventType = "ServiceLinked"
 )
 
 type Event struct {
@@ -91,4 +94,35 @@ type ReleaseView struct {
 	ArtifactDir string    `json:"artifact_dir"`
 	CreatedAt   time.Time `json:"created_at"`
 	IsActive    bool      `json:"is_active"`
+}
+
+type ServiceState string
+
+const (
+	ServiceStarting ServiceState = "STARTING"
+	ServiceReady    ServiceState = "READY"
+	ServiceStopped  ServiceState = "STOPPED"
+	ServiceFailed   ServiceState = "FAILED"
+)
+
+type Service struct {
+	ID        string       `json:"id"`
+	Name      string       `json:"name"`
+	Type      string       `json:"type"`
+	Version   string       `json:"version"`
+	Port      int          `json:"port"`
+	State     ServiceState `json:"state"`
+	VolumeDir string       `json:"volume_dir"`
+	CreatedAt time.Time    `json:"created_at"`
+}
+
+type Binding struct {
+	ID           string    `json:"id"`
+	AppID        string    `json:"app_id"`
+	ServiceID    string    `json:"service_id"`
+	DatabaseName string    `json:"database_name"`
+	Username     string    `json:"username"`
+	Password     string    `json:"password"`
+	EnvKey       string    `json:"env_key"`
+	CreatedAt    time.Time `json:"created_at"`
 }

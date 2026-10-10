@@ -78,14 +78,17 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 	if !config.ValidName(req.AppName) {
 		return nil, fmt.Errorf("invalid application name %q", req.AppName)
 	}
-	if req.Runtime != "go" {
-		return nil, fmt.Errorf("unsupported runtime %q: only go is supported", req.Runtime)
+	if req.Runtime != "go" && req.Runtime != "node" {
+		return nil, fmt.Errorf("unsupported runtime %q: only go and node are supported", req.Runtime)
 	}
 	if strings.TrimSpace(req.BuildCommand) == "" {
 		return nil, fmt.Errorf("build command must not be empty")
 	}
-	if strings.TrimSpace(req.StartCommand) != "/app/server" {
+	if req.Runtime == "go" && strings.TrimSpace(req.StartCommand) != "/app/server" {
 		return nil, fmt.Errorf("unsupported start command %q: expected /app/server", req.StartCommand)
+	}
+	if req.Runtime == "node" && strings.TrimSpace(req.StartCommand) == "" {
+		return nil, fmt.Errorf("start command must not be empty")
 	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -170,20 +173,33 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 	if !outputInfo.IsDir() {
 		return nil, fmt.Errorf("PAAS_OUT must remain a real directory")
 	}
-	serverPath := filepath.Join(outputDir, "server")
-	serverInfo, err := os.Lstat(serverPath)
-	if err != nil {
-		return nil, fmt.Errorf("build output is missing /app/server: %w", err)
-	}
-	if !serverInfo.Mode().IsRegular() || serverInfo.Mode()&0111 == 0 {
-		return nil, fmt.Errorf("build output /app/server must be a regular executable file")
+	if req.Runtime == "node" {
+		entries, _ := os.ReadDir(outputDir)
+		if len(entries) == 0 {
+			// Copy built sourceRoot into outputDir
+			if err := copyDirectory(sourceRoot, outputDir, "", true, io.Discard); err != nil {
+				return nil, fmt.Errorf("copy node build output: %w", err)
+			}
+		}
+	} else {
+		serverPath := filepath.Join(outputDir, "server")
+		serverInfo, err := os.Lstat(serverPath)
+		if err != nil {
+			return nil, fmt.Errorf("build output is missing /app/server: %w", err)
+		}
+		if !serverInfo.Mode().IsRegular() || serverInfo.Mode()&0111 == 0 {
+			return nil, fmt.Errorf("build output /app/server must be a regular executable file")
+		}
 	}
 
-	return b.publish(dataDir, outputDir, req.Runtime, sourceHash)
+	return b.publish(dataDir, outputDir, req.Runtime, req.StartCommand, sourceHash)
 }
 
 func buildEnvironment(outputDir, homeDir, tempDir, cacheDir string) []string {
 	pathValue := "/usr/local/bin:/usr/local/go/bin:/usr/bin:/bin"
+	if home, err := os.UserHomeDir(); err == nil {
+		pathValue = filepath.Join(home, ".local", "bin") + ":" + pathValue
+	}
 	if inheritedPath := os.Getenv("PATH"); inheritedPath != "" {
 		pathValue += ":" + inheritedPath
 	}
@@ -489,7 +505,7 @@ func unprivilegedUserIDs(name string) (int, int, error) {
 	return uid, gid, nil
 }
 
-func (b *GoBuilder) publish(dataDir, outputDir, runtimeName, sourceHash string) (*contracts.Release, error) {
+func (b *GoBuilder) publish(dataDir, outputDir, runtimeName, startCommand, sourceHash string) (*contracts.Release, error) {
 	releasesDir := filepath.Join(dataDir, "releases")
 	if err := os.MkdirAll(releasesDir, 0755); err != nil {
 		return nil, fmt.Errorf("create releases directory: %w", err)
@@ -506,6 +522,9 @@ func (b *GoBuilder) publish(dataDir, outputDir, runtimeName, sourceHash string) 
 	createdAt := time.Now().UTC()
 	artifactDir := filepath.Join(releasesDir, id, "app")
 	command := []string{filepath.Join(artifactDir, "server")}
+	if runtimeName == "node" {
+		command = []string{"/bin/sh", "-c", "exec " + startCommand}
+	}
 
 	stagingDir, err := os.MkdirTemp(releasesDir, ".staging-")
 	if err != nil {
@@ -542,8 +561,10 @@ func (b *GoBuilder) publish(dataDir, outputDir, runtimeName, sourceHash string) 
 	if err := os.WriteFile(filepath.Join(stagingDir, "manifest.json"), manifestBytes, 0600); err != nil {
 		return nil, fmt.Errorf("write release manifest: %w", err)
 	}
-	if err := os.Chmod(filepath.Join(appDir, "server"), 0555); err != nil {
-		return nil, fmt.Errorf("make release executable immutable: %w", err)
+	if runtimeName == "go" {
+		if err := os.Chmod(filepath.Join(appDir, "server"), 0555); err != nil {
+			return nil, fmt.Errorf("make release executable immutable: %w", err)
+		}
 	}
 	if err := freezeRelease(stagingDir); err != nil {
 		return nil, err

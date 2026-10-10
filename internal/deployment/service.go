@@ -94,10 +94,12 @@ func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox,
 			d.Error = "daemon restarted; previous runtime session is not managed"
 			now := time.Now().UTC()
 			d.StoppedAt = &now
+			routes.Delete(d.AppName + ".localhost")
 			if err := db.Finish(d, d.AppName+".localhost"); err != nil {
 				cancel()
 				return nil, err
 			}
+			_ = db.RecordEvent(d.ID, d.AppID, "ReconciledStopped", d.Error)
 		}
 	}
 	go s.monitor()
@@ -298,6 +300,7 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 	if err = s.db.CreateDeployment(d); err != nil {
 		return nil, err
 	}
+	s.recordEvent(d.ID, app.ID, model.EventType(model.Queued), fmt.Sprintf("deployment queued for %s", name))
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	unregister := context.AfterFunc(s.ctx, cancel)
@@ -366,11 +369,24 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 			return s.fail(&d, model.StartFailed, portErr)
 		}
 		d.Port = port
-
+		defaultPath := "/usr/local/bin:/usr/bin:/bin"
+		if home, err := os.UserHomeDir(); err == nil {
+			defaultPath = filepath.Join(home, ".local", "bin") + ":" + defaultPath
+		}
+		deployEnv := []string{"PORT=" + strconv.Itoa(port), "PATH=" + defaultPath, "HOME=/tmp"}
+		if bindings, err := s.db.GetBindingsForApp(app.ID); err == nil {
+			for _, b := range bindings {
+				if svc, err := s.db.GetService(b.ServiceID); err == nil && svc.Port > 0 {
+					dbURL := fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable",
+						b.Username, b.Password, svc.Port, b.DatabaseName)
+					deployEnv = append(deployEnv, b.EnvKey+"="+dbURL)
+				}
+			}
+		}
 		handle, err = s.sandbox.Start(ctx, contracts.SandboxSpec{
 			ID: d.ID, Command: release.Command, Dir: release.ArtifactDir,
-			Env:  []string{"PORT=" + strconv.Itoa(port), "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp"},
-			User: s.opts.RuntimeUser, LogPath: d.LogPath,
+			Env:       deployEnv,
+			User:      s.opts.RuntimeUser, LogPath: d.LogPath,
 			MemoryMax: cfg.Resources.Memory,
 			CPUQuota:  cfg.Resources.CPU,
 			TasksMax:  cfg.Resources.Tasks,
@@ -468,12 +484,17 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 		s.inflight.Add(1)
 		go func() { defer s.inflight.Done(); s.retireDeployment(oldDeploymentID, drained) }()
 	}
+	s.recordEvent(d.ID, app.ID, model.EventType(model.Running), fmt.Sprintf("route published at %s.localhost -> :%d", name, d.Port))
 	return &d, nil
 }
 
 func (s *Service) state(d *model.Deployment, state model.State) error {
 	d.State = state
-	return s.db.UpdateDeployment(*d)
+	if err := s.db.UpdateDeployment(*d); err != nil {
+		return err
+	}
+	s.recordEvent(d.ID, d.AppID, model.EventType(state), fmt.Sprintf("state changed to %s", state))
+	return nil
 }
 
 func (s *Service) fail(d *model.Deployment, state model.State, cause error) (*model.Deployment, error) {
@@ -501,6 +522,7 @@ func (s *Service) fail(d *model.Deployment, state model.State, cause error) (*mo
 	if err := s.db.Finish(*d, d.AppName+".localhost"); err != nil {
 		return d, errors.Join(cause, err)
 	}
+	s.recordEvent(d.ID, d.AppID, model.EventType(state), cause.Error())
 	return d, cause
 }
 
@@ -653,6 +675,7 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 		if err := s.db.Finish(*current, name+".localhost"); err != nil {
 			failures = append(failures, err)
 		}
+		s.recordEvent(current.ID, current.AppID, "Stopped", "deployment stopped")
 		if id == d.ID {
 			d = current
 		}
@@ -780,6 +803,7 @@ func (s *Service) Close() error {
 					now := time.Now().UTC()
 					d.StoppedAt = &now
 					err = s.db.Finish(d, d.AppName+".localhost")
+					_ = s.db.RecordEvent(d.ID, d.AppID, model.EventType(model.Stopped), "daemon shutdown; deployment stopped")
 				}
 				if err != nil {
 					resultMu.Lock()

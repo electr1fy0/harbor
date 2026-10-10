@@ -20,7 +20,7 @@ func TestPlatformRejectsMalformedRequests(t *testing.T) {
 
 func TestPlatformMethodsAndPing(t *testing.T) {
 	server := NewPlatformServer("", nil)
-	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop"} {
+	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop", "add", "link", "services"} {
 		recorder := httptest.NewRecorder()
 		server.http.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/"+command, nil))
 		if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != "POST" {

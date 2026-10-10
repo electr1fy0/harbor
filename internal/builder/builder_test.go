@@ -384,6 +384,40 @@ func TestBuildUserMustNotBeRoot(t *testing.T) {
 	}
 }
 
+func TestNodeBuildPublishesRelease(t *testing.T) {
+	skipRootBuild(t)
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	if err := os.MkdirAll(sourceDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "package.json"), []byte(`{"name":"test-node","version":"1.0.0"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "server.js"), []byte(`console.log("hello node")`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(root, "data")
+	defer removeTree(dataDir)
+	b := New(Options{DataDir: dataDir})
+	release, err := b.Build(context.Background(), contracts.BuildRequest{
+		SourceDir:    sourceDir,
+		AppName:      "test-node",
+		Runtime:      "node",
+		BuildCommand: "echo 'node build step'",
+		StartCommand: "node /app/server.js",
+	})
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+	if release.Runtime != "node" {
+		t.Fatalf("unexpected runtime %q", release.Runtime)
+	}
+	if _, err := os.Stat(filepath.Join(release.ArtifactDir, "server.js")); err != nil {
+		t.Fatalf("server.js not found in artifact dir: %v", err)
+	}
+}
+
 func isZombie(pid int) bool {
 	if runtime.GOOS != "linux" {
 		return false

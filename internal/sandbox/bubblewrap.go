@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"paas/internal/contracts"
@@ -45,19 +46,24 @@ func BuildBwrapArgs(spec contracts.SandboxSpec) ([]string, error) {
 	if len(spec.Command) == 0 || spec.Command[0] == "" {
 		return nil, errors.New("sandbox command is required")
 	}
-	if spec.Dir == "" {
-		return nil, errors.New("sandbox release artifact directory is required")
+	if spec.Dir == "" && spec.RootFS == "" && len(spec.Binds) == 0 {
+		return nil, errors.New("sandbox release artifact directory or rootfs is required")
 	}
-	artifactDir, err := filepath.Abs(spec.Dir)
-	if err != nil {
-		return nil, fmt.Errorf("resolve artifact directory: %w", err)
-	}
-	stat, err := os.Stat(artifactDir)
-	if err != nil {
-		return nil, fmt.Errorf("release artifact directory %q: %w", artifactDir, err)
-	}
-	if !stat.IsDir() {
-		return nil, fmt.Errorf("release artifact path %q is not a directory", artifactDir)
+
+	var artifactDir string
+	if spec.Dir != "" {
+		var err error
+		artifactDir, err = filepath.Abs(spec.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve artifact directory: %w", err)
+		}
+		stat, err := os.Stat(artifactDir)
+		if err != nil {
+			return nil, fmt.Errorf("release artifact directory %q: %w", artifactDir, err)
+		}
+		if !stat.IsDir() {
+			return nil, fmt.Errorf("release artifact path %q is not a directory", artifactDir)
+		}
 	}
 	env, err := makeEnvironment(spec.Env)
 	if err != nil {
@@ -69,28 +75,61 @@ func BuildBwrapArgs(spec contracts.SandboxSpec) ([]string, error) {
 		"--new-session",
 		"--clearenv",
 		"--unshare-user",
+	}
+	if spec.UID > 0 {
+		args = append(args, "--uid", strconv.Itoa(spec.UID))
+	}
+	if spec.GID > 0 {
+		args = append(args, "--gid", strconv.Itoa(spec.GID))
+	}
+	args = append(args,
 		"--unshare-pid",
 		"--unshare-ipc",
 		"--unshare-uts",
 		"--share-net",
 		"--cap-drop", "ALL",
-	}
+	)
 
-	// Mount essential host system root directories read-only.
-
-	for _, dir := range []string{"/bin", "/usr", "/lib", "/lib64"} {
-		if _, err := os.Stat(dir); err == nil {
-			args = append(args, "--ro-bind", dir, dir)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("inspect runtime directory %q: %w", dir, err)
+	if spec.RootFS != "" {
+		if _, err := os.Stat(spec.RootFS); err != nil {
+			return nil, fmt.Errorf("rootfs directory %q: %w", spec.RootFS, err)
+		}
+		args = append(args, "--ro-bind", spec.RootFS, "/")
+	} else {
+		// Mount essential host system root directories read-only.
+		for _, dir := range []string{"/bin", "/usr", "/lib", "/lib64"} {
+			if _, err := os.Stat(dir); err == nil {
+				args = append(args, "--ro-bind", dir, dir)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("inspect runtime directory %q: %w", dir, err)
+			}
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			localDir := filepath.Join(home, ".local")
+			if _, err := os.Stat(localDir); err == nil {
+				args = append(args, "--ro-bind", localDir, localDir)
+			}
 		}
 	}
 
-	// Mount release artifact directory read-only to /app.
+	// Mount additional bind mounts (e.g. persistent service volumes).
+	for _, bind := range spec.Binds {
+		if bind.ReadOnly {
+			args = append(args, "--ro-bind", bind.HostPath, bind.MountPath)
+		} else {
+			args = append(args, "--bind", bind.HostPath, bind.MountPath)
+		}
+	}
+
+	if artifactDir != "" {
+		args = append(args,
+			"--dir", "/app",
+			"--ro-bind", artifactDir, "/app",
+			"--chdir", "/app",
+		)
+	}
+
 	args = append(args,
-		"--dir", "/app",
-		"--ro-bind", artifactDir, "/app",
-		"--chdir", "/app",
 		"--tmpfs", "/tmp",
 		"--proc", "/proc",
 		"--dev", "/dev",
@@ -99,6 +138,12 @@ func BuildBwrapArgs(spec contracts.SandboxSpec) ([]string, error) {
 	// Expose only runtime resolver/certificate data, not host credentials in /etc.
 	for _, path := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/ssl/certs", "/etc/ca-certificates"} {
 		if _, err := os.Stat(path); err == nil {
+			if spec.RootFS != "" {
+				// In a custom rootfs mounted read-only at '/', bwrap can only bind mount onto existing destination files/directories.
+				if _, targetErr := os.Stat(filepath.Join(spec.RootFS, path)); targetErr != nil {
+					continue
+				}
+			}
 			args = append(args, "--ro-bind", path, path)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("inspect runtime path %q: %w", path, err)
@@ -118,7 +163,11 @@ func BuildBwrapArgs(spec contracts.SandboxSpec) ([]string, error) {
 		args = append(args, "--setenv", key, val)
 	}
 	if !hasPath {
-		args = append(args, "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin")
+		defaultPath := "/usr/local/bin:/usr/bin:/bin"
+		if home, err := os.UserHomeDir(); err == nil {
+			defaultPath = filepath.Join(home, ".local", "bin") + ":" + defaultPath
+		}
+		args = append(args, "--setenv", "PATH", defaultPath)
 	}
 	if !hasHome {
 		args = append(args, "--setenv", "HOME", "/tmp")
@@ -127,7 +176,7 @@ func BuildBwrapArgs(spec contracts.SandboxSpec) ([]string, error) {
 	// Translate only the executable path; arguments may contain literal host paths.
 	// A path in a sibling directory must never be rewritten as a release path.
 	command := append([]string(nil), spec.Command...)
-	if filepath.IsAbs(command[0]) {
+	if artifactDir != "" && filepath.IsAbs(command[0]) {
 		rel, err := filepath.Rel(artifactDir, command[0])
 		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			command[0] = filepath.Join("/app", rel)

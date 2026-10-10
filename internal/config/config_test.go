@@ -65,7 +65,7 @@ start:
 	cases := map[string]string{
 		"unknown top-level field": base + "port: 8080\n",
 		"unknown nested field":    strings.Replace(base, "  command: build", "  command: build\n  extra: true", 1),
-		"unsupported runtime":     strings.Replace(base, "runtime: go", "runtime: node", 1),
+		"unsupported runtime":     strings.Replace(base, "runtime: go", "runtime: python", 1),
 		"invalid name":            strings.Replace(base, "name: demo", "name: Demo", 1),
 		"trailing name hyphen":    strings.Replace(base, "name: demo", "name: demo-", 1),
 		"empty build":             strings.Replace(base, "  command: build", "  command: '  '", 1),
@@ -99,6 +99,26 @@ func TestValidName(t *testing.T) {
 		if ValidName(name) {
 			t.Errorf("ValidName(%q) = true", name)
 		}
+	}
+}
+
+func TestLoadNodeConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `name: api-node
+runtime: node
+build:
+  command: npm ci && npm run build
+start:
+  command: node /app/server.js
+health:
+  path: /health
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Runtime != "node" || cfg.Start.Command != "node /app/server.js" {
+		t.Fatalf("unexpected node config: %+v", cfg)
 	}
 }
 
