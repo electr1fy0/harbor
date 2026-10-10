@@ -1,0 +1,8 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Allow Bubblewrap to create user namespaces on Ubuntu with userns restrictions.
+# The binary supplies the namespace and filesystem policy.
+profile harbor-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}

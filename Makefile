@@ -1,4 +1,4 @@
-.PHONY: all build test vet fmt clean spikes
+.PHONY: all build test vet fmt clean spikes integration test-privileged
 
 all: test
 
@@ -20,6 +20,15 @@ fmt:
 spikes:
 	./scripts/spikes/run-all.sh
 
+integration: build
+	go test -count=1 -tags integration -v ./tests
+
+test-privileged: build
+	go test -c -tags integration -o bin/acceptance.test ./tests
+	go test -c -o bin/builder.test ./internal/builder
+	sudo ./bin/builder.test -test.run TestRootBuildResourceProperties -test.v
+	cd tests && sudo ../bin/acceptance.test -test.count=1 -test.v
+
 test: vet build
 	go test ./...
 	./scripts/tests/cli-ping.sh
@@ -27,6 +36,7 @@ test: vet build
 	./scripts/tests/examples.sh
 	./scripts/spikes/router.sh
 	./scripts/spikes/run-all.sh
+	go test -count=1 -tags integration -v ./tests
 
 clean:
 	rm -rf bin
