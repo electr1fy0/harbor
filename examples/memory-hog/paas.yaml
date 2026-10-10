@@ -1,0 +1,12 @@
+name: memory-hog
+runtime: go
+build:
+  command: go build -o "$PAAS_OUT/server" main.go
+start:
+  command: /app/server
+resources:
+  memory: 128Mi
+  cpu: 0.5
+  tasks: 64
+health:
+  path: /health
