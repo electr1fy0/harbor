@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -138,6 +139,66 @@ func TestStorePersistsRecordsAcrossReopen(t *testing.T) {
 	}
 	if len(deployments) != 1 || deployments[0].ID != deployment.ID {
 		t.Fatalf("Deployments() = %#v", deployments)
+	}
+}
+
+func TestUnfinishedDeploymentsExcludesHistoryAndScopesApplication(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now().UTC()
+	var wantAll, wantDemo []string
+	for _, name := range []string{"demo", "other"} {
+		app, err := s.CreateApp(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		states := []model.State{model.Queued, model.Building, model.Built, model.Starting, model.HealthChecking, model.Running,
+			model.BuildFailed, model.StartFailed, model.Unhealthy, model.Crashed, model.OOMKilled, model.Stopped}
+		for i, state := range states {
+			for _, cleaned := range []bool{false, true} {
+				id := fmt.Sprintf("%s-%d-%v", name, i, cleaned)
+				d := model.Deployment{ID: id, AppID: app.ID, AppName: name, State: state, CreatedAt: now, SandboxID: id}
+				if cleaned {
+					d.StoppedAt = &now
+				}
+				if err := s.CreateDeployment(d); err != nil {
+					t.Fatal(err)
+				}
+				if state.Active() || !cleaned {
+					wantAll = append(wantAll, id)
+					if name == "demo" {
+						wantDemo = append(wantDemo, id)
+					}
+				}
+			}
+		}
+		// A failed build never acquired a runtime and needs no cleanup, even
+		// if no stop timestamp was recorded. Bad historical data must not
+		// prevent unrelated admission and supervision from reading live work.
+		d := model.Deployment{ID: name + "-history", AppID: app.ID, State: model.BuildFailed, CreatedAt: now}
+		if err := s.CreateDeployment(d); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec(`UPDATE deployments SET created_at = 'invalid' WHERE id = ?`, d.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, test := range []struct {
+		name string
+		want []string
+	}{{"", wantAll}, {"demo", wantDemo}, {"missing", []string{}}} {
+		got, err := s.UnfinishedDeployments(test.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := make([]string, 0, len(got))
+		for _, d := range got {
+			ids = append(ids, d.ID)
+		}
+		slices.Sort(ids)
+		slices.Sort(test.want)
+		if !reflect.DeepEqual(ids, test.want) {
+			t.Errorf("UnfinishedDeployments(%q) = %v, want %v", test.name, ids, test.want)
+		}
 	}
 }
 

@@ -84,7 +84,8 @@ shows the newest deployment attempt, including failed candidates. Legacy release
 without recorded readiness settings must be redeployed before rollback.
 
 Graceful daemon shutdown stops its apps. Restart preserves history/releases but
-does not auto-restart apps.
+does not auto-restart apps. Stop preserves diagnostics from completed failed
+attempts and cleanup failures.
 Linux defaults to the systemd backend and fails startup if its prerequisites
 are missing. `-sandbox=bubblewrap` provides namespace isolation without resource
 limits; `-sandbox=host` explicitly selects host execution without those controls.

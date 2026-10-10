@@ -415,6 +415,17 @@ type failAfterWrites struct {
 	err           error
 }
 
+func TestFailedDeploymentReportsOutputError(t *testing.T) {
+	for _, command := range []string{"deploy", "rollback"} {
+		var stderr bytes.Buffer
+		response := &daemon.Response{Deployment: &model.Deployment{ID: "dep-test", State: model.StartFailed}, Error: "startup failed"}
+		status := reportDeployment(&failAfterWrites{err: errors.New("output closed")}, &stderr, command, daemon.Request{}, response, nil)
+		if status != 1 || !strings.Contains(stderr.String(), "write deployment result: output closed") || !strings.Contains(stderr.String(), "paas "+command+": startup failed") {
+			t.Fatalf("failure diagnostics: status=%d stderr=%q", status, stderr.String())
+		}
+	}
+}
+
 func (w *failAfterWrites) Write(p []byte) (int, error) {
 	w.writes++
 	if w.writes > w.allow {
