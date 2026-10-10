@@ -1,18 +1,32 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"paas/internal/daemon"
+	"paas/internal/model"
 )
 
 func TestParseArgsSupportsSocketBeforeOrAfterCommand(t *testing.T) {
+	t.Setenv("PAASD_SOCKET", "")
 	for _, test := range []struct {
 		name   string
 		args   []string
 		socket string
 	}{
-		{name: "before", args: []string{"-socket", "/tmp/one.sock", "ping"}, socket: "/tmp/one.sock"},
-		{name: "after", args: []string{"ping", "--socket", "/tmp/two.sock"}, socket: "/tmp/two.sock"},
-		{name: "equals", args: []string{"--socket=/tmp/three.sock", "ping"}, socket: "/tmp/three.sock"},
+		{name: "short before", args: []string{"-socket", "/tmp/one.sock", "ping"}, socket: "/tmp/one.sock"},
+		{name: "long after", args: []string{"ping", "--socket", "/tmp/two.sock"}, socket: "/tmp/two.sock"},
+		{name: "long equals before", args: []string{"--socket=/tmp/three.sock", "ping"}, socket: "/tmp/three.sock"},
+		{name: "short equals after", args: []string{"ping", "-socket=/tmp/four.sock"}, socket: "/tmp/four.sock"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			socket, command, err := parseArgs(test.args)
@@ -38,9 +52,304 @@ func TestParseArgsUsesEnvironmentSocket(t *testing.T) {
 	}
 }
 
-func TestParseArgsRejectsUnknownOption(t *testing.T) {
+func TestParseArgsRejectsUnknownOptionAndExtraArgument(t *testing.T) {
 	t.Setenv("PAASD_SOCKET", "")
-	if _, _, err := parseArgs([]string{"--unknown", "ping"}); err == nil {
-		t.Fatal("parseArgs unexpectedly accepted unknown option")
+	for _, args := range [][]string{{"--unknown", "ping"}, {"ping", "extra"}} {
+		if _, _, err := parseArgs(args); err == nil {
+			t.Errorf("parseArgs(%q) unexpectedly succeeded", args)
+		}
 	}
+}
+
+func TestRunPingSupportsSocketOptionsAroundCommand(t *testing.T) {
+	socket := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/ping" {
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("pong\n"))
+	}))
+
+	for _, args := range [][]string{
+		{"-socket", socket, "ping"},
+		{"ping", "--socket", socket},
+		{"--socket=" + socket, "ping"},
+		{"ping", "-socket=" + socket},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, &stdout, &stderr); code != 0 {
+			t.Errorf("run(%q) code = %d, stderr = %q", args, code, stderr.String())
+		}
+		if stdout.String() != "pong\n" || stderr.Len() != 0 {
+			t.Errorf("run(%q) output = (%q, %q), want (pong newline, empty)", args, stdout.String(), stderr.String())
+		}
+	}
+}
+
+func TestRunUsesEnvironmentSocket(t *testing.T) {
+	socket := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("pong\n"))
+	}))
+	t.Setenv("PAASD_SOCKET", socket)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ping"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run() code = %d, stderr = %q", code, stderr.String())
+	}
+	if stdout.String() != "pong\n" {
+		t.Fatalf("stdout = %q, want pong newline", stdout.String())
+	}
+}
+
+func TestRunCommands(t *testing.T) {
+	sourceDir := t.TempDir()
+	workingDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspectDeployment := &model.Deployment{
+		ID:        "dep-inspect",
+		AppName:   "sample",
+		ReleaseID: "rel-inspect",
+		Port:      43123,
+		State:     model.Running,
+		PID:       321,
+	}
+	tests := []struct {
+		name            string
+		args            func(socket string) []string
+		response        daemon.Response
+		wantCommand     string
+		wantRequest     daemon.Request
+		wantStdout      string
+		wantStdoutExact bool
+	}{
+		{
+			name: "deploy with explicit name",
+			args: func(socket string) []string {
+				return []string{"deploy", sourceDir, "--name", "sample", "--socket=" + socket}
+			},
+			response: daemon.Response{Deployment: &model.Deployment{
+				ID: "dep-deploy", AppName: "sample", ReleaseID: "rel-deploy", Port: 43001, State: model.Running,
+			}, URL: "http://127.0.0.1:43001"},
+			wantCommand:     "deploy",
+			wantRequest:     daemon.Request{Name: "sample", SourceDir: sourceDir},
+			wantStdout:      "State: RUNNING\nRelease: rel-deploy\nPort: 43001\nURL: http://127.0.0.1:43001\n",
+			wantStdoutExact: true,
+		},
+		{
+			name: "deploy keeps source name selection with no override",
+			args: func(socket string) []string {
+				return []string{"-socket", socket, "deploy", "."}
+			},
+			response: daemon.Response{Deployment: &model.Deployment{
+				ID: "dep-config", AppName: "from-config", ReleaseID: "rel-config", Port: 43002, State: model.Running,
+			}},
+			wantCommand: "deploy",
+			wantRequest: daemon.Request{SourceDir: workingDir},
+			wantStdout:  "URL: http://from-config.localhost:8080",
+		},
+		{
+			name: "apps",
+			args: func(socket string) []string { return []string{"apps", "--socket", socket} },
+			response: daemon.Response{Apps: []daemon.AppView{{
+				Application: model.Application{Name: "sample"}, Deployment: inspectDeployment,
+			}}},
+			wantCommand:     "apps",
+			wantStdout:      "NAME STATE RELEASE PORT\nsample RUNNING rel-inspect 43123\n",
+			wantStdoutExact: true,
+		},
+		{
+			name: "inspect",
+			args: func(socket string) []string { return []string{"-socket=" + socket, "inspect", "sample"} },
+			response: daemon.Response{Apps: []daemon.AppView{{
+				Application: model.Application{Name: "sample"}, Deployment: inspectDeployment,
+			}}},
+			wantCommand: "inspect",
+			wantRequest: daemon.Request{Name: "sample"},
+			wantStdout: "Application: sample\nRelease: rel-inspect\nDeployment: dep-inspect\n" +
+				"State: RUNNING\nPID: 321\nPort: 43123\nLast error: -\n",
+			wantStdoutExact: true,
+		},
+		{
+			name:            "logs preserve daemon bytes",
+			args:            func(socket string) []string { return []string{"logs", "sample", "--socket=" + socket} },
+			response:        daemon.Response{Logs: "first line\nsecond line"},
+			wantCommand:     "logs",
+			wantRequest:     daemon.Request{Name: "sample"},
+			wantStdout:      "first line\nsecond line",
+			wantStdoutExact: true,
+		},
+		{
+			name:            "stop",
+			args:            func(socket string) []string { return []string{"stop", "sample", "-socket", socket} },
+			response:        daemon.Response{},
+			wantCommand:     "stop",
+			wantRequest:     daemon.Request{Name: "sample"},
+			wantStdout:      "Stopped sample\n",
+			wantStdoutExact: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("PAASD_SOCKET", "")
+			calls := make(chan capturedRequest, 1)
+			socket := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request daemon.Request
+				decodeErr := json.NewDecoder(r.Body).Decode(&request)
+				calls <- capturedRequest{command: strings.TrimPrefix(r.URL.Path, "/"), request: request, err: decodeErr}
+				if decodeErr != nil {
+					http.Error(w, decodeErr.Error(), http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(test.response)
+			}))
+
+			var stdout, stderr bytes.Buffer
+			if code := run(test.args(socket), &stdout, &stderr); code != 0 {
+				t.Fatalf("run() code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+			if test.wantStdoutExact {
+				if got := stdout.String(); got != test.wantStdout {
+					t.Fatalf("stdout = %q, want %q", got, test.wantStdout)
+				}
+			} else if !strings.Contains(stdout.String(), test.wantStdout) {
+				t.Fatalf("stdout = %q, want it to contain %q", stdout.String(), test.wantStdout)
+			}
+
+			call := <-calls
+			if call.err != nil {
+				t.Fatalf("decode request: %v", call.err)
+			}
+			if call.command != test.wantCommand || call.request != test.wantRequest {
+				t.Fatalf("daemon call = (%q, %#v), want (%q, %#v)", call.command, call.request, test.wantCommand, test.wantRequest)
+			}
+		})
+	}
+}
+
+func TestRunDeployFailureShowsDeploymentAndError(t *testing.T) {
+	sourceDir := t.TempDir()
+	socket := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(daemon.Response{
+			Error: "build failed: missing compiler",
+			Deployment: &model.Deployment{
+				ID: "dep-failed", AppName: "broken", ReleaseID: "", State: model.BuildFailed,
+			},
+		})
+	}))
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"deploy", sourceDir, "--name", "broken", "--socket", socket}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() code = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "State: BUILD_FAILED") || !strings.Contains(stdout.String(), "Deployment: dep-failed") {
+		t.Fatalf("stdout = %q, want failure state and deployment ID", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "build failed: missing compiler") {
+		t.Fatalf("stderr = %q, want build error", stderr.String())
+	}
+}
+
+func TestRunReturnsUsageStatusForInvalidArguments(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "source.txt")
+	if err := os.WriteFile(filePath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PAASD_SOCKET", "")
+	for _, args := range [][]string{
+		{},
+		{"not-a-command"},
+		{"--unknown", "ping"},
+		{"ping", "extra"},
+		{"apps", "--unknown"},
+		{"deploy"},
+		{"deploy", "/path/that/does/not/exist"},
+		{"deploy", filePath},
+		{"deploy", t.TempDir(), "extra"},
+		{"deploy", t.TempDir(), "--name"},
+		{"deploy", t.TempDir(), "--name", "first", "--name", "second"},
+		{"deploy", t.TempDir(), "--unknown"},
+		{"inspect"},
+		{"inspect", "sample", "extra"},
+		{"logs", "--name", "sample"},
+		{"stop"},
+		{"stop", "sample", "extra"},
+		{"ping", "--socket="},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, &stdout, &stderr); code != 2 {
+			t.Errorf("run(%q) code = %d, want 2; stderr = %q", args, code, stderr.String())
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("run(%q) stdout = %q, want empty", args, stdout.String())
+		}
+	}
+}
+
+func TestRunReturnsFailureForDaemonErrors(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		command string
+		body    string
+		status  int
+	}{
+		{name: "operation response", command: "inspect", body: `{"Error":"app not found"}`, status: http.StatusNotFound},
+		{name: "ping transport response", command: "ping", body: "unavailable", status: http.StatusServiceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("PAASD_SOCKET", "")
+			socket := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(test.body))
+			}))
+			args := []string{test.command, "--socket", socket}
+			if test.command == "inspect" {
+				args = []string{"inspect", "missing", "--socket", socket}
+			}
+			var stdout, stderr bytes.Buffer
+			if code := run(args, &stdout, &stderr); code != 1 {
+				t.Fatalf("run() code = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+			}
+			if stderr.Len() == 0 {
+				t.Fatal("stderr is empty, want daemon error")
+			}
+		})
+	}
+}
+
+type capturedRequest struct {
+	command string
+	request daemon.Request
+	err     error
+}
+
+func startFakeDaemon(t *testing.T, handler http.Handler) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "harbor-cli-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "paasd.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: handler}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	})
+	return socket
 }

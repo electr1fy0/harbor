@@ -4,16 +4,18 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 socket=$(mktemp -u "/tmp/paasd.XXXXXX.sock")
 daemon_pid=""
+data_dir=$(mktemp -d /tmp/harbor-ping-data.XXXXXX)
 cleanup() {
 	if [ -n "$daemon_pid" ]; then
 		kill "$daemon_pid" 2>/dev/null || true
 		wait "$daemon_pid" 2>/dev/null || true
 	fi
 	rm -f "$socket" "$root/.paasd-test.log" "$root/.paas-ping.out"
+	rm -r "$data_dir"
 }
 trap cleanup EXIT INT TERM
 
-"$root/bin/paasd" -socket "$socket" >"$root/.paasd-test.log" 2>&1 &
+"$root/bin/paasd" -socket "$socket" -data-dir "$data_dir" -listen 127.0.0.1:0 >"$root/.paasd-test.log" 2>&1 &
 daemon_pid=$!
 
 ready=0
@@ -24,6 +26,7 @@ while [ "$i" -lt 50 ]; do
 		break
 	fi
 	i=$((i + 1))
+	sleep 0.1
 done
 
 if [ "$ready" -ne 1 ]; then

@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"syscall"
+	"time"
 )
 
 // DefaultSocketPath is the target Linux control-plane socket from the build
@@ -42,7 +44,7 @@ func NewServer(socketPath string) *Server {
 
 	return &Server{
 		socketPath: socketPath,
-		http:       &http.Server{Handler: mux},
+		http:       &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second},
 	}
 }
 
@@ -60,6 +62,14 @@ func (s *Server) Listen() (net.Listener, error) {
 		if info.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf("daemon socket path exists and is not a socket: %s", s.socketPath)
 		}
+		conn, dialErr := net.DialTimeout("unix", s.socketPath, 200*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("daemon already listening on %s", s.socketPath)
+		}
+		if !errors.Is(dialErr, os.ErrNotExist) && !errors.Is(dialErr, syscall.ECONNREFUSED) {
+			return nil, fmt.Errorf("cannot verify stale daemon socket: %w", dialErr)
+		}
 		if err := os.Remove(s.socketPath); err != nil {
 			return nil, fmt.Errorf("remove stale daemon socket: %w", err)
 		}
@@ -70,6 +80,10 @@ func (s *Server) Listen() (net.Listener, error) {
 	listener, err := net.Listen("unix", s.socketPath)
 	if err != nil {
 		return nil, fmt.Errorf("listen on daemon socket: %w", err)
+	}
+	if err := os.Chmod(s.socketPath, 0600); err != nil {
+		_ = listener.Close()
+		return nil, err
 	}
 	return listener, nil
 }
