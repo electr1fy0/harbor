@@ -6,8 +6,8 @@ Harbor deploys local Go HTTP applications to a single machine:
 
 The target is Ubuntu/Debian Linux with Go, a C compiler (SQLite), Git, systemd,
 cgroup v2, Bubblewrap, and curl. Linux runtimes use namespace isolation and
-systemd resource limits. Safe replacement/rollback, PostgreSQL, Node, Git URL
-deployment, and public HTTPS are not implemented yet. Apps must be trusted: this is a local
+systemd resource limits. PostgreSQL, Node, Git URL deployment, and public HTTPS
+are not implemented yet. Apps must be trusted: this is a local
 development platform, not multi-tenant hosting.
 
 ## Linux setup and demo
@@ -24,8 +24,11 @@ until deploy. In another terminal:
     sudo ./bin/paas deploy ./examples/hello-go --name hello
     curl -H 'Host: hello.localhost' http://127.0.0.1:8080/
     sudo ./bin/paas apps
+    sudo ./bin/paas releases hello
     sudo ./bin/paas inspect hello
     sudo ./bin/paas logs hello
+    sudo ./bin/paas deploy ./examples/hello-go --name hello
+    sudo ./bin/paas rollback hello
     sudo ./bin/paas stop hello
 
 The control socket is owner-only, so the CLI also uses sudo with a root daemon.
@@ -66,11 +69,22 @@ Deploy is synchronous; inspect can show intermediate states while it runs.
 Success returns a release ID, port, and URL. Failed deployments persist
 BUILD_FAILED, START_FAILED, or UNHEALTHY with errors/logs, and get no route.
 Unexpected runtime exits become CRASHED; memory-limit kills become OOM_KILLED.
-Both withdraw the route. Unknown hosts
-return 404. Logs combines build output with up to 500 journal entries, bounded to 1 MiB; rotation/streaming are not implemented.
+Exits of the active runtime withdraw its route. Unknown hosts
+return 404. The logs command combines build output with up to 500 journal entries, bounded to 1 MiB; rotation/streaming are not implemented.
 
-Stop an active app before deploying it again. Graceful daemon shutdown stops
-its apps. Restart preserves history/releases but does not auto-restart apps.
+Redeployment builds and checks a candidate on a separate loopback port before
+atomically switching traffic. Candidate failures preserve the active version.
+The proxy tracks in-flight requests to the replaced runtime and waits for them
+to finish before stopping it, with a 30-second drain deadline. Longer requests
+and streams may be interrupted at that deadline. Rollback (`paas rollback NAME
+[--release ID]`) starts an immutable release without recompilation and runs its
+saved readiness check before switching traffic. Release history and promotion
+timestamps persist in SQLite; lifecycle event write failures are logged. Logs
+shows the newest deployment attempt, including failed candidates. Legacy releases
+without recorded readiness settings must be redeployed before rollback.
+
+Graceful daemon shutdown stops its apps. Restart preserves history/releases but
+does not auto-restart apps.
 Linux defaults to the systemd backend and fails startup if its prerequisites
 are missing. `-sandbox=bubblewrap` provides namespace isolation without resource
 limits; `-sandbox=host` explicitly selects host execution without those controls.
@@ -162,7 +176,8 @@ tests. Linux-only probes explicitly skip on macOS. `test-privileged` tests the
 root daemon, dedicated build/runtime identities, and denied release writes.
 Acceptance covers source-independent runtime, immutable artifacts, health-gated
 routing, unknown hosts, failures, inspect/logs/stop, crash withdrawal, persisted
-history, and duplicate-daemon protection. A fresh clone reproduces the demo
+history, candidate failure safety, continuous redeploy/rollback traffic, and
+duplicate-daemon protection. A fresh clone reproduces the demo
 using the setup/build commands above.
 
 The examples stay as regression fixtures: healthy Go server, broken build,

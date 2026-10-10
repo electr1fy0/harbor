@@ -2,6 +2,7 @@ package deployment
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -42,10 +43,11 @@ type buildBehavior struct {
 }
 
 type fakeBuilder struct {
-	mu        sync.Mutex
-	behaviors map[string]*buildBehavior
-	requests  []contracts.BuildRequest
-	nextID    int
+	mu           sync.Mutex
+	behaviors    map[string]*buildBehavior
+	requests     []contracts.BuildRequest
+	nextID       int
+	artifactRoot string
 }
 
 func newFakeBuilder() *fakeBuilder {
@@ -92,11 +94,16 @@ func (b *fakeBuilder) Build(ctx context.Context, request contracts.BuildRequest)
 		}
 	}
 
+	artifactDir := filepath.Join(b.artifactRoot, fmt.Sprintf("artifact-%d", id))
+	if err := os.MkdirAll(artifactDir, 0755); err != nil {
+		return nil, err
+	}
+
 	return &contracts.Release{
 		ID:          fmt.Sprintf("release-%d", id),
 		SourceHash:  fmt.Sprintf("source-%d", id),
 		Runtime:     "go",
-		ArtifactDir: filepath.Join(os.TempDir(), fmt.Sprintf("artifact-%d", id)),
+		ArtifactDir: artifactDir,
 		Command:     []string{"fake-server"},
 		CreatedAt:   time.Now().UTC(),
 	}, nil
@@ -126,6 +133,8 @@ type fakeSandbox struct {
 	specs        []contracts.SandboxSpec
 	stopEntered  chan string
 	stopRelease  chan struct{}
+	slowEntered  chan struct{}
+	slowRelease  chan struct{}
 }
 
 func newFakeSandbox() *fakeSandbox {
@@ -164,6 +173,10 @@ func (s *fakeSandbox) Start(_ context.Context, spec contracts.SandboxSpec) (*con
 		return nil, err
 	}
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" && s.slowEntered != nil {
+			close(s.slowEntered)
+			<-s.slowRelease
+		}
 		if r.URL.Path == "/ready" && s.ready != nil && !s.ready.Load() {
 			select {
 			case s.unreadyProbe <- struct{}{}:
@@ -267,6 +280,7 @@ type serviceHarness struct {
 	builder *fakeBuilder
 	sandbox *fakeSandbox
 	source  string
+	dbPath  string
 }
 
 func newServiceHarness(t *testing.T, contents string) *serviceHarness {
@@ -284,6 +298,7 @@ func newServiceHarness(t *testing.T, contents string) *serviceHarness {
 		t.Fatal(err)
 	}
 	builder := newFakeBuilder()
+	builder.artifactRoot = filepath.Join(root, "artifacts")
 	sandbox := newFakeSandbox()
 	routes := router.New()
 	service, err := New(db, builder, sandbox, routes, Options{DataDir: filepath.Join(root, "data"), RuntimeUser: "nobody"})
@@ -296,7 +311,7 @@ func newServiceHarness(t *testing.T, contents string) *serviceHarness {
 		sandbox.close()
 		_ = db.Close()
 	})
-	return &serviceHarness{service: service, db: db, router: routes, builder: builder, sandbox: sandbox, source: source}
+	return &serviceHarness{service: service, db: db, router: routes, builder: builder, sandbox: sandbox, source: source, dbPath: filepath.Join(root, "state.sqlite")}
 }
 
 func TestDeployPublishesRouteOnlyAfterHealthCheck(t *testing.T) {
@@ -370,25 +385,183 @@ func TestDeployBuildAndStartFailures(t *testing.T) {
 	})
 }
 
-func TestDeployRefusesActiveApplicationRedeploy(t *testing.T) {
+func TestDeployAllowsActiveApplicationRedeployAndSwapsRoute(t *testing.T) {
 	h := newServiceHarness(t, testConfig)
 	first, err := h.service.Deploy(context.Background(), h.source, "")
 	if err != nil {
 		t.Fatalf("first Deploy() error = %v", err)
 	}
+	if first.State != model.Running {
+		t.Fatalf("first Deploy() state = %s, want RUNNING", first.State)
+	}
+
 	second, err := h.service.Deploy(context.Background(), h.source, "")
-	if err == nil || !strings.Contains(err.Error(), "active; stop it before deploying again") {
-		t.Fatalf("second Deploy() error = %v, want active application refusal", err)
+	if err != nil {
+		t.Fatalf("second Deploy() error = %v, want successful redeploy", err)
 	}
-	if second != nil {
-		t.Fatalf("second Deploy() = %#v, want nil deployment", second)
+	if second == nil || second.State != model.Running {
+		t.Fatalf("second Deploy() state = %v, want RUNNING", second)
 	}
-	if got := h.builder.count(); got != 1 {
-		t.Fatalf("builder calls = %d, want 1 after active redeploy refusal", got)
+	if second.ID == first.ID {
+		t.Fatalf("second deployment ID = %s, want different from first %s", second.ID, first.ID)
 	}
-	latest, err := h.service.Inspect("demo")
-	if err != nil || latest.ID != first.ID || latest.State != model.Running {
-		t.Fatalf("latest deployment = %#v, %v; want first running deployment", latest, err)
+
+	// Verify route is swapped to second deployment
+	routes, err := h.db.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routes["demo.localhost"] != second.ID {
+		t.Fatalf("route = %q, want second deployment %q", routes["demo.localhost"], second.ID)
+	}
+
+	// Wait for grace period and verify first deployment is retired
+	waitFor(t, "first deployment graceful retirement", func() bool {
+		dep, getErr := h.db.Deployment(first.ID)
+		return getErr == nil && dep.State == model.Stopped
+	})
+}
+
+func TestCandidateFailureLeavesActiveDeploymentUntouched(t *testing.T) {
+	t.Run("candidate build failure", func(t *testing.T) {
+		h := newServiceHarness(t, testConfig)
+		first, err := h.service.Deploy(context.Background(), h.source, "")
+		if err != nil {
+			t.Fatalf("first Deploy() error = %v", err)
+		}
+
+		h.builder.setBehavior("demo", &buildBehavior{err: errors.New("compiler syntax error")})
+		second, err := h.service.Deploy(context.Background(), h.source, "")
+		if err == nil || !strings.Contains(err.Error(), "compiler syntax error") {
+			t.Fatalf("second Deploy() error = %v, want compiler error", err)
+		}
+		if second == nil || second.State != model.BuildFailed {
+			t.Fatalf("second deployment state = %v, want BUILD_FAILED", second)
+		}
+
+		// First deployment must still be RUNNING and route intact!
+		routes, err := h.db.Routes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if routes["demo.localhost"] != first.ID {
+			t.Fatalf("route = %q, want first deployment %q untouched", routes["demo.localhost"], first.ID)
+		}
+		active, err := h.service.Inspect("demo")
+		if err != nil || active.ID != first.ID || active.State != model.Running {
+			t.Fatalf("active deployment = %#v, want first running deployment", active)
+		}
+	})
+
+	t.Run("candidate health check failure", func(t *testing.T) {
+		ready := &atomic.Bool{}
+		ready.Store(true)
+		h := newServiceHarness(t, strings.Replace(testConfig, "start:\n", "health:\n  path: /ready\nstart:\n", 1))
+		h.sandbox.ready = ready
+
+		first, err := h.service.Deploy(context.Background(), h.source, "")
+		if err != nil {
+			t.Fatalf("first Deploy() error = %v", err)
+		}
+
+		// Set ready to false so next candidate fails health check
+		ready.Store(false)
+		second, err := h.service.Deploy(context.Background(), h.source, "")
+		if err == nil || !strings.Contains(err.Error(), "health check failed") {
+			t.Fatalf("second Deploy() error = %v, want health check failure", err)
+		}
+		if second == nil || second.State != model.Unhealthy {
+			t.Fatalf("second deployment state = %v, want UNHEALTHY", second)
+		}
+
+		// First deployment must still be RUNNING and route intact!
+		routes, err := h.db.Routes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if routes["demo.localhost"] != first.ID {
+			t.Fatalf("route = %q, want first deployment %q untouched", routes["demo.localhost"], first.ID)
+		}
+		active, err := h.service.Inspect("demo")
+		if err != nil || active.ID != first.ID || active.State != model.Running {
+			t.Fatalf("active deployment = %#v, want first running deployment", active)
+		}
+	})
+}
+
+func TestRollbackRestoresPreviousReleaseWithoutRebuild(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "")
+	if err != nil {
+		t.Fatalf("first Deploy() error = %v", err)
+	}
+
+	second, err := h.service.Deploy(context.Background(), h.source, "")
+	if err != nil || second.State != model.Running {
+		t.Fatalf("second Deploy() = %#v, %v; want running", second, err)
+	}
+
+	buildCountBefore := h.builder.count()
+
+	// Rollback to previous release
+	rollbackDep, err := h.service.Rollback(context.Background(), "demo", "")
+	if err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+	if rollbackDep.State != model.Running {
+		t.Fatalf("rollback deployment state = %s, want RUNNING", rollbackDep.State)
+	}
+	if rollbackDep.ReleaseID != first.ReleaseID {
+		t.Fatalf("rollback deployment release = %s, want first release %s", rollbackDep.ReleaseID, first.ReleaseID)
+	}
+
+	// Verify no builder invocation occurred!
+	if h.builder.count() != buildCountBefore {
+		t.Fatalf("builder called during rollback: count = %d, want %d", h.builder.count(), buildCountBefore)
+	}
+
+	// Verify route switched to rollback deployment
+	routes, err := h.db.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routes["demo.localhost"] != rollbackDep.ID {
+		t.Fatalf("route = %q, want rollback deployment %q", routes["demo.localhost"], rollbackDep.ID)
+	}
+}
+
+func TestRollbackIgnoresFailedCandidates(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "")
+	if err != nil {
+		t.Fatalf("first Deploy() error = %v", err)
+	}
+
+	second, err := h.service.Deploy(context.Background(), h.source, "")
+	if err != nil || second.State != model.Running {
+		t.Fatalf("second Deploy() = %#v, %v; want running", second, err)
+	}
+
+	// Trigger a failed candidate build
+	h.builder.setBehavior("demo", &buildBehavior{err: errors.New("compilation failed")})
+	third, err := h.service.Deploy(context.Background(), h.source, "")
+	if err == nil {
+		t.Fatalf("third Deploy() unexpectedly succeeded: %#v", third)
+	}
+
+	// Clear builder error
+	h.builder.setBehavior("demo", nil)
+
+	// Rollback must restore first release, skipping the failed candidate
+	rollbackDep, err := h.service.Rollback(context.Background(), "demo", "")
+	if err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+	if rollbackDep.State != model.Running {
+		t.Fatalf("rollback deployment state = %s, want RUNNING", rollbackDep.State)
+	}
+	if rollbackDep.ReleaseID != first.ReleaseID {
+		t.Fatalf("rollback selected release = %s, want first release %s", rollbackDep.ReleaseID, first.ReleaseID)
 	}
 }
 
@@ -899,5 +1072,305 @@ func TestSystemdLogsIncludeBuildOutputAndSurfaceJournalErrors(t *testing.T) {
 	}
 	if _, err := h.service.Logs("logs"); err == nil || !strings.Contains(err.Error(), "journal-unavailable") {
 		t.Fatalf("journal failure silently swallowed: %v", err)
+	}
+}
+
+func TestRollbackCannotUseAnotherApplicationsRelease(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	foreign, err := h.service.Deploy(context.Background(), h.source, "foreign")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"demo", "foreign-copy"} {
+		if d, err := h.service.Rollback(context.Background(), name, foreign.ReleaseID); !errors.Is(err, store.ErrNotFound) || d != nil {
+			t.Fatalf("cross-app rollback accepted: %+v %v", d, err)
+		}
+	}
+	apps, err := h.db.Apps()
+	if err != nil || len(apps) != 1 {
+		t.Fatalf("rollback created an app: %+v %v", apps, err)
+	}
+	active, err := h.service.Inspect("foreign")
+	if err != nil || active.ID != foreign.ID {
+		t.Fatalf("foreign app disturbed: %+v %v", active, err)
+	}
+}
+
+func TestRollbackUsesSavedReadinessAndResources(t *testing.T) {
+	cfg := testConfig + "health:\n  path: /ready\nresources:\n  memory: 64Mi\n  cpu: 0.25\n  tasks: 16\n"
+	h := newServiceHarness(t, cfg)
+	ready := &atomic.Bool{}
+	ready.Store(true)
+	h.sandbox.ready = ready
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready.Store(false)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	failed, err := h.service.Rollback(ctx, "demo", first.ReleaseID)
+	if err == nil || failed == nil || failed.State == model.Running {
+		t.Fatalf("unready rollback promoted: %+v %v", failed, err)
+	}
+	h.sandbox.mu.Lock()
+	spec := h.sandbox.specs[len(h.sandbox.specs)-1]
+	h.sandbox.mu.Unlock()
+	if spec.MemoryMax != "64Mi" || spec.CPUQuota != .25 || spec.TasksMax != 16 || failed.HealthPath != "/ready" || failed.SandboxType != "host" || failed.SystemdUnit != "" {
+		t.Fatalf("rollback lost settings: %+v %+v", failed, spec)
+	}
+	active, err := h.service.Inspect("demo")
+	if err != nil || active.ID != second.ID {
+		t.Fatalf("rollback failure replaced live app: %+v %v", active, err)
+	}
+}
+
+func TestFailedPromotionPreservesBothRoutes(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := sql.Open("sqlite3", h.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec(`CREATE TRIGGER reject_promotion BEFORE INSERT ON routes
+		BEGIN SELECT RAISE(ABORT, 'disk write failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err == nil || candidate == nil || candidate.PromotedAt != nil || candidate.State != model.StartFailed {
+		t.Fatalf("bad promotion result: %+v %v", candidate, err)
+	}
+	active, err := h.db.ActiveDeployment("demo")
+	if err != nil || active.ID != first.ID {
+		t.Fatalf("durable route lost: %+v %v", active, err)
+	}
+	response := routerRequest(h.router, "demo.localhost", "/")
+	if response.Code != http.StatusOK {
+		t.Fatalf("live proxy route lost: %d", response.Code)
+	}
+	info, err := h.sandbox.Inspect(context.Background(), candidate.ID)
+	if err != nil || info.Running {
+		t.Fatalf("failed candidate still running: %+v %v", info, err)
+	}
+}
+
+func TestRedeployDrainsInFlightRequestBeforeStoppingRuntime(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	h.sandbox.slowEntered = make(chan struct{})
+	h.sandbox.slowRelease = make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRequest := func() { releaseOnce.Do(func() { close(h.sandbox.slowRelease) }) }
+	t.Cleanup(releaseRequest)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { requestDone <- routerRequest(h.router, "demo.localhost", "/slow") }()
+	waitSignal(t, h.sandbox.slowEntered, "in-flight old request")
+	second, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Prove a real request survives the previous fixed 1.5-second cutoff.
+	time.Sleep(1700 * time.Millisecond)
+	info, err := h.sandbox.Inspect(context.Background(), first.ID)
+	if err != nil || !info.Running {
+		t.Fatalf("old runtime killed before request drained: %+v %v", info, err)
+	}
+	active, err := h.service.Inspect("demo")
+	if err != nil || active.ID != second.ID {
+		t.Fatalf("candidate not routed: %+v %v", active, err)
+	}
+	releaseRequest()
+	select {
+	case response := <-requestDone:
+		if response.Code != http.StatusOK {
+			t.Fatalf("old request interrupted: %d", response.Code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("request did not complete")
+	}
+	waitFor(t, "old runtime stopped after draining", func() bool {
+		d, err := h.db.Deployment(first.ID)
+		return err == nil && d.State == model.Stopped && d.StoppedAt != nil
+	})
+}
+
+func TestStopCancelsCandidateAndStopsActiveRuntime(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	behavior := &buildBehavior{entered: make(chan struct{}), cancelSeen: make(chan struct{}), release: make(chan struct{})}
+	h.builder.setBehavior("demo", behavior)
+	candidateResult := make(chan deployResult, 1)
+	go func() {
+		d, err := h.service.Deploy(context.Background(), h.source, "demo")
+		candidateResult <- deployResult{deployment: d, err: err}
+	}()
+	waitSignal(t, behavior.entered, "candidate build")
+	stopped, err := h.service.Stop(context.Background(), "demo")
+	if err != nil || stopped.ID != first.ID || stopped.State != model.Stopped {
+		t.Fatalf("stop active: %+v %v", stopped, err)
+	}
+	candidate := awaitDeploy(t, candidateResult)
+	if !errors.Is(candidate.err, context.Canceled) {
+		t.Fatalf("candidate was not canceled: %+v", candidate)
+	}
+	d, err := h.db.Deployment(candidate.deployment.ID)
+	if err != nil || d.State != model.Stopped {
+		t.Fatalf("candidate not stopped: %+v %v", d, err)
+	}
+	assertNoRoute(t, h, "demo.localhost")
+}
+
+func TestWaitingCandidateHonorsCancellationAndReleasesAppLock(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	behavior := &buildBehavior{entered: make(chan struct{}), release: make(chan struct{})}
+	h.builder.setBehavior("demo", behavior)
+	firstResult := make(chan deployResult, 1)
+	go func() {
+		d, err := h.service.Deploy(context.Background(), h.source, "demo")
+		firstResult <- deployResult{deployment: d, err: err}
+	}()
+	waitSignal(t, behavior.entered, "first build")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := h.service.Deploy(ctx, h.source, "demo"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiting caller ignored cancellation: %v", err)
+	}
+	close(behavior.release)
+	first := awaitDeploy(t, firstResult)
+	if first.err != nil {
+		t.Fatal(first.err)
+	}
+	h.service.appLocksMu.Lock()
+	count := len(h.service.appLocks)
+	h.service.appLocksMu.Unlock()
+	if count != 0 {
+		t.Fatalf("unused app locks retained: %d", count)
+	}
+}
+
+func TestFailedRetirementRetainsCleanupOwnership(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.sandbox.mu.Lock()
+	h.sandbox.stopErr = errors.New("retirement denied")
+	h.sandbox.mu.Unlock()
+	second, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "retirement failure recorded", func() bool {
+		d, err := h.db.Deployment(first.ID)
+		return err == nil && needsCleanup(*d) && strings.Contains(d.Error, "retirement denied")
+	})
+	if _, err := h.service.Deploy(context.Background(), h.source, "demo"); err == nil {
+		t.Fatal("admitted candidate before failed retirement reclaimed")
+	}
+	active, err := h.service.Inspect("demo")
+	if err != nil || active.ID != second.ID {
+		t.Fatalf("retirement removed current route: %+v %v", active, err)
+	}
+	h.sandbox.mu.Lock()
+	h.sandbox.stopErr = nil
+	h.sandbox.mu.Unlock()
+	waitFor(t, "retirement cleanup retry", func() bool { d, err := h.db.Deployment(first.ID); return err == nil && d.StoppedAt != nil })
+}
+
+func TestLegacyRollbackRefusesUnknownReadiness(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.ReadinessKnown = false
+	if err := h.db.UpdateDeployment(*first); err != nil {
+		t.Fatal(err)
+	}
+	before := h.builder.count()
+	if _, err := h.service.Rollback(context.Background(), "demo", first.ReleaseID); err == nil || !strings.Contains(err.Error(), "no saved readiness") {
+		t.Fatalf("legacy readiness guessed: %v", err)
+	}
+	if h.builder.count() != before {
+		t.Fatal("rollback rebuilt legacy source")
+	}
+}
+
+func TestFailedCandidateLogsRemainAccessible(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.builder.setBehavior("demo", &buildBehavior{err: errors.New("compiler failed")})
+	candidate, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err == nil {
+		t.Fatal("candidate unexpectedly succeeded")
+	}
+	if err := os.WriteFile(candidate.LogPath, []byte("candidate compiler diagnostic"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := h.service.Logs("demo")
+	if err != nil || !strings.Contains(logs, "candidate compiler diagnostic") {
+		t.Fatalf("candidate logs hidden: %q %v", logs, err)
+	}
+	active, err := h.service.Inspect("demo")
+	if err != nil || active.ID != first.ID {
+		t.Fatalf("inspection lost active app: %+v %v", active, err)
+	}
+}
+
+func TestMonitorReclaimsCandidateAfterFailedTerminalWrite(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := sql.Open("sqlite3", h.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec(`CREATE TRIGGER reject_terminal_state BEFORE UPDATE ON deployments
+		WHEN NEW.state IN ('START_FAILED', 'UNHEALTHY')
+		BEGIN SELECT RAISE(ABORT, 'terminal write failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	ready := &atomic.Bool{}
+	h.sandbox.ready = ready
+	if err := os.WriteFile(filepath.Join(h.source, "paas.yaml"), []byte(testConfig+"health:\n  path: /ready\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	candidate, err := h.service.Deploy(ctx, h.source, "demo")
+	if err == nil || !strings.Contains(err.Error(), "terminal write failed") {
+		t.Fatalf("terminal failure hidden: %+v %v", candidate, err)
+	}
+	if _, err := conn.Exec(`DROP TRIGGER reject_terminal_state`); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "interrupted candidate cleanup", func() bool {
+		d, err := h.db.Deployment(candidate.ID)
+		return err == nil && d.State == model.StartFailed && d.StoppedAt != nil
+	})
+	active, err := h.service.Inspect("demo")
+	if err != nil || active.ID != first.ID {
+		t.Fatalf("cleanup removed live route: %+v %v", active, err)
 	}
 }

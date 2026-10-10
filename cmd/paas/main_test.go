@@ -189,6 +189,43 @@ func TestRunCommands(t *testing.T) {
 			wantStdout:      "Stopped sample\n",
 			wantStdoutExact: true,
 		},
+		{
+			name: "releases",
+			args: func(socket string) []string { return []string{"releases", "sample", "--socket=" + socket} },
+			response: daemon.Response{Releases: []model.ReleaseView{
+				{ID: "rel_1", SourceHash: "sha256hash123", CreatedAt: time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC), IsActive: true},
+			}},
+			wantCommand:     "releases",
+			wantRequest:     daemon.Request{Name: "sample"},
+			wantStdout:      "RELEASE SOURCE_HASH CREATED ACTIVE\nrel_1 sha256hash12 2026-10-10T12:00:00Z yes\n",
+			wantStdoutExact: true,
+		},
+		{
+			name: "rollback with release flag",
+			args: func(socket string) []string {
+				return []string{"rollback", "sample", "--release", "rel_old", "--socket=" + socket}
+			},
+			response: daemon.Response{Deployment: &model.Deployment{
+				ID: "dep-rb", AppName: "sample", ReleaseID: "rel_old", Port: 43003, State: model.Running,
+			}, URL: "http://127.0.0.1:43003"},
+			wantCommand:     "rollback",
+			wantRequest:     daemon.Request{Name: "sample", ReleaseID: "rel_old"},
+			wantStdout:      "State: RUNNING\nRelease: rel_old\nPort: 43003\nURL: http://127.0.0.1:43003\n",
+			wantStdoutExact: true,
+		},
+		{
+			name: "rollback without release flag",
+			args: func(socket string) []string {
+				return []string{"rollback", "sample", "--socket=" + socket}
+			},
+			response: daemon.Response{Deployment: &model.Deployment{
+				ID: "dep-rb2", AppName: "sample", ReleaseID: "rel_prev", Port: 43004, State: model.Running,
+			}, URL: "http://127.0.0.1:43004"},
+			wantCommand:     "rollback",
+			wantRequest:     daemon.Request{Name: "sample"},
+			wantStdout:      "State: RUNNING\nRelease: rel_prev\nPort: 43004\nURL: http://127.0.0.1:43004\n",
+			wantStdoutExact: true,
+		},
 	}
 
 	for _, test := range tests {
@@ -230,6 +267,24 @@ func TestRunCommands(t *testing.T) {
 				t.Fatalf("daemon call = (%q, %#v), want (%q, %#v)", call.command, call.request, test.wantCommand, test.wantRequest)
 			}
 		})
+	}
+}
+
+func TestRunRollbackFailureShowsError(t *testing.T) {
+	socket := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(daemon.Response{
+			Error: "no previous release available for rollback",
+		})
+	}))
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"rollback", "sample", "--socket", socket}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() code = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "paas rollback: no previous release available for rollback") {
+		t.Fatalf("stderr = %q, want 'paas rollback:' prefix", stderr.String())
 	}
 }
 
@@ -401,6 +456,19 @@ func TestInspectionPropagatesEveryOutputError(t *testing.T) {
 		writer := &failAfterWrites{allow: allow, err: expected}
 		if err := printInspection(writer, "demo", &daemon.Response{Deployment: d}); !errors.Is(err, expected) {
 			t.Fatalf("after %d writes, error=%v", allow, err)
+		}
+	}
+}
+
+func TestRollbackRejectsEmptyAndRepeatedReleaseFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"demo", "--release="}, {"demo", "-release="},
+		{"demo", "--release=--bad"},
+		{"demo", "--release", "first", "--release=second"},
+		{"demo", "-release=first", "--release", "second"},
+	} {
+		if _, err := parseCommandRequest("rollback", args); err == nil {
+			t.Errorf("accepted malformed rollback args %v", args)
 		}
 	}
 }

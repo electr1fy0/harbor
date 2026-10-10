@@ -32,22 +32,27 @@ type Options struct {
 }
 
 type Service struct {
-	mu       sync.Mutex
-	inflight sync.WaitGroup
-	pending  map[string]pendingDeploy
-	db       *store.Store
-	builder  contracts.Builder
-	sandbox  contracts.Sandbox
-	router   *router.HostRouter
-	opts     Options
-	ctx      context.Context
-	cancel   context.CancelFunc
-	done     chan struct{}
+	mu         sync.Mutex
+	appLocksMu sync.Mutex
+	appLocks   map[string]*appLock
+	stopping   map[string]int
+	retiring   map[string]bool
+	inflight   sync.WaitGroup
+	pending    map[string]pendingDeploy
+	db         *store.Store
+	builder    contracts.Builder
+	sandbox    contracts.Sandbox
+	router     *router.HostRouter
+	opts       Options
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
 }
 
 type pendingDeploy struct {
-	cancel context.CancelFunc
-	done   chan struct{}
+	appName string
+	cancel  context.CancelFunc
+	done    chan struct{}
 }
 
 func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox, routes *router.HostRouter, opts Options) (*Service, error) {
@@ -55,7 +60,12 @@ func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox,
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Service{db: db, builder: b, sandbox: runtimeSandbox, router: routes, opts: opts, ctx: ctx, cancel: cancel, done: make(chan struct{}), pending: make(map[string]pendingDeploy)}
+	s := &Service{
+		db: db, builder: b, sandbox: runtimeSandbox, router: routes, opts: opts,
+		ctx: ctx, cancel: cancel, done: make(chan struct{}),
+		pending: make(map[string]pendingDeploy), appLocks: make(map[string]*appLock),
+		stopping: make(map[string]int), retiring: make(map[string]bool),
+	}
 	// Host processes are owned by this daemon session. Preserve history, but
 	// never present a previous session's unverifiable PID as a live process.
 	all, err := db.Deployments()
@@ -94,6 +104,94 @@ func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox,
 	return s, nil
 }
 
+type appLock struct {
+	token chan struct{}
+	refs  int
+}
+
+// App operations serialize, but canceled callers and shutdown never wait for a
+// long build to release a mutex. Reference counting bounds the lock registry.
+func (s *Service) lockApp(ctx context.Context, name string) (func(), error) {
+	s.appLocksMu.Lock()
+	gate := s.appLocks[name]
+	if gate == nil {
+		gate = &appLock{token: make(chan struct{}, 1)}
+		gate.token <- struct{}{}
+		s.appLocks[name] = gate
+	}
+	gate.refs++
+	s.appLocksMu.Unlock()
+	releaseRef := func() {
+		s.appLocksMu.Lock()
+		defer s.appLocksMu.Unlock()
+		gate.refs--
+		if gate.refs == 0 {
+			delete(s.appLocks, name)
+		}
+	}
+	select {
+	case <-ctx.Done():
+		releaseRef()
+		return nil, ctx.Err()
+	case <-s.ctx.Done():
+		releaseRef()
+		return nil, errors.New("daemon shutting down")
+	case <-gate.token:
+		return func() { gate.token <- struct{}{}; releaseRef() }, nil
+	}
+}
+
+func (s *Service) recordEvent(deploymentID, appID string, eventType model.EventType, payload string) {
+	if err := s.db.RecordEvent(deploymentID, appID, eventType, payload); err != nil {
+		log.Printf("record lifecycle event %s for deployment %s: %v", eventType, deploymentID, err)
+	}
+}
+
+const drainTimeout = 30 * time.Second
+
+func (s *Service) retireDeployment(oldID string, drained <-chan struct{}) {
+	defer func() { s.mu.Lock(); delete(s.retiring, oldID); s.mu.Unlock() }()
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+	select {
+	case <-s.ctx.Done():
+		return
+	case <-drained:
+	case <-timer.C:
+		log.Printf("drain deadline reached for deployment %s", oldID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Stop/monitor may have already finished this runtime while it drained.
+	d, err := s.db.Deployment(oldID)
+	if err != nil {
+		log.Printf("read retiring deployment %s: %v", oldID, err)
+		return
+	}
+	if !d.State.Active() {
+		return
+	}
+	if err := s.finishRetirement(d); err != nil {
+		log.Printf("retire deployment %s: %v", oldID, err)
+	}
+}
+
+// finishRetirement runs under mu and keeps cleanup ownership on every failure.
+func (s *Service) finishRetirement(d *model.Deployment) error {
+	if err := s.stopRuntime(d.ID); err != nil {
+		_, finishErr := s.fail(d, model.Stopped, fmt.Errorf("retire runtime: %w", err))
+		return finishErr
+	}
+	d.State = model.Stopped
+	now := time.Now().UTC()
+	d.StoppedAt = &now
+	if err := s.db.Finish(*d, d.AppName+".localhost"); err != nil {
+		return err
+	}
+	s.recordEvent(d.ID, d.AppID, model.EventOldDeploymentStopped, "")
+	return nil
+}
+
 func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.Deployment, error) {
 	cfg, err := config.Load(sourceDir)
 	if err != nil {
@@ -102,28 +200,101 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 	if name == "" {
 		name = cfg.Name
 	}
+	return s.deploy(ctx, sourceDir, name, cfg, nil)
+}
+
+func (s *Service) Rollback(ctx context.Context, name, targetReleaseID string) (*model.Deployment, error) {
+	return s.deploy(ctx, "", name, nil, &targetReleaseID)
+}
+
+// deploy is the single candidate lifecycle for both builds and rollback.
+func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *config.Config, rollbackID *string) (*model.Deployment, error) {
 	if !config.ValidName(name) {
 		return nil, fmt.Errorf("invalid application name %q", name)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ctx.Err() != nil {
-		return nil, fmt.Errorf("daemon shutting down")
-	}
-	// Until replacement is implemented, an active app must be stopped first.
-	existing, err := s.db.LatestDeployment(name)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-	if err == nil && (existing.State.Active() || needsCleanup(*existing)) {
-		return nil, fmt.Errorf("application %s is active; stop it before deploying again", name)
-	}
-	app, err := s.db.CreateApp(name)
+	unlockApp, err := s.lockApp(ctx, name)
 	if err != nil {
 		return nil, err
 	}
-	d := model.Deployment{ID: newID("dep"), AppID: app.ID, AppName: name, State: model.Queued, CreatedAt: time.Now().UTC()}
+	defer unlockApp()
+
+	s.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			s.mu.Unlock()
+		}
+	}()
+	if s.ctx.Err() != nil {
+		return nil, fmt.Errorf("daemon shutting down")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.stopping[name] > 0 {
+		return nil, fmt.Errorf("application %s is stopping", name)
+	}
+	all, err := s.db.Deployments()
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range all {
+		_, pending := s.pending[d.ID]
+		if d.AppName == name && (needsCleanup(d) || d.State.Active() && d.State != model.Running && !pending) {
+			return nil, fmt.Errorf("application %s still has runtime cleanup pending", name)
+		}
+	}
+	var release *contracts.Release
+	var app *model.Application
+	if rollbackID == nil {
+		app, err = s.db.CreateApp(name)
+	} else {
+		if *rollbackID == "" {
+			release, err = s.db.PreviousRelease(name)
+		} else {
+			release, err = s.db.ReleaseForApp(name, *rollbackID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		prior, priorErr := s.db.DeploymentForRelease(release.ID)
+		if priorErr != nil {
+			return nil, priorErr
+		}
+		if !prior.ReadinessKnown {
+			return nil, fmt.Errorf("release %s has no saved readiness configuration; deploy its source before rolling back", release.ID)
+		}
+		info, statErr := os.Stat(release.ArtifactDir)
+		if statErr != nil {
+			return nil, fmt.Errorf("inspect rollback artifact: %w", statErr)
+		}
+		if !info.IsDir() {
+			return nil, errors.New("rollback artifact is not a directory")
+		}
+		app = &model.Application{ID: prior.AppID, Name: name}
+		cfg = &config.Config{Resources: config.Resources{Memory: prior.MemoryLimit, CPU: prior.CPUQuota, Tasks: prior.TasksLimit}, Health: config.Health{Path: prior.HealthPath}}
+		// Pre-resource-schema releases did not persist requests.
+		if cfg.Resources.Memory == "" {
+			cfg.Resources.Memory = config.DefaultMemory
+		}
+		if cfg.Resources.CPU <= 0 {
+			cfg.Resources.CPU = config.DefaultCPU
+		}
+		if cfg.Resources.Tasks <= 0 {
+			cfg.Resources.Tasks = config.DefaultTasks
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	id, err := newID("dep")
+	if err != nil {
+		return nil, fmt.Errorf("generate deployment id: %w", err)
+	}
+	d := model.Deployment{ID: id, AppID: app.ID, AppName: name, State: model.Queued, CreatedAt: time.Now().UTC()}
 	d.LogPath = filepath.Join(s.opts.DataDir, "logs", d.ID+".log")
+	d.ReadinessKnown = true
+	d.MemoryLimit, d.CPUQuota, d.TasksLimit, d.HealthPath = cfg.Resources.Memory, cfg.Resources.CPU, cfg.Resources.Tasks, cfg.Health.Path
 	if err = s.db.CreateDeployment(d); err != nil {
 		return nil, err
 	}
@@ -132,36 +303,47 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 	unregister := context.AfterFunc(s.ctx, cancel)
 	defer unregister()
 	s.inflight.Add(1)
-	pending := pendingDeploy{cancel: cancel, done: make(chan struct{})}
+	pending := pendingDeploy{appName: name, cancel: cancel, done: make(chan struct{})}
 	s.pending[d.ID] = pending
 	defer func() {
 		delete(s.pending, d.ID)
 		close(pending.done)
 		s.inflight.Done()
 	}()
-	if err = s.state(&d, model.Building); err != nil {
-		return &d, err
-	}
-	// Builds can take minutes. Do not block crash supervision or stop requests
-	// for other applications while the builder runs.
-	s.mu.Unlock()
-	release, err := s.builder.Build(ctx, contracts.BuildRequest{
-		SourceDir: sourceDir, AppName: name, Runtime: cfg.Runtime,
-		BuildCommand: cfg.Build.Command, StartCommand: cfg.Start.Command, LogPath: d.LogPath,
-	})
-	s.mu.Lock()
-	if err == nil && ctx.Err() != nil {
-		err = ctx.Err()
-	}
-	if err != nil {
-		return s.fail(&d, model.BuildFailed, err)
-	}
-	if err = s.db.SaveRelease(app.ID, release); err != nil {
-		return s.fail(&d, model.BuildFailed, err)
+	if rollbackID == nil {
+		if err = s.state(&d, model.Building); err != nil {
+			return s.fail(&d, model.BuildFailed, err)
+		}
+		s.recordEvent(d.ID, app.ID, model.EventBuildStarted, "")
+		// Long builds must not block supervision or other app operations.
+		s.mu.Unlock()
+		locked = false
+		release, err = s.builder.Build(ctx, contracts.BuildRequest{
+			SourceDir: sourceDir, AppName: name, Runtime: cfg.Runtime,
+			BuildCommand: cfg.Build.Command, StartCommand: cfg.Start.Command, LogPath: d.LogPath,
+		})
+		s.mu.Lock()
+		locked = true
+		if err == nil {
+			err = ctx.Err()
+		}
+		if err == nil && release == nil {
+			err = errors.New("builder returned no release")
+		}
+		if err == nil {
+			err = s.db.SaveRelease(app.ID, release)
+		}
+		if err != nil {
+			s.recordEvent(d.ID, app.ID, model.EventBuildFailed, err.Error())
+			return s.fail(&d, model.BuildFailed, err)
+		}
+		s.recordEvent(d.ID, app.ID, model.EventBuildCompleted, fmt.Sprintf("release=%s hash=%s", release.ID, release.SourceHash))
+	} else {
+		s.recordEvent(d.ID, app.ID, model.EventRollbackTriggered, fmt.Sprintf("target_release=%s", release.ID))
 	}
 	d.ReleaseID = release.ID
 	if err = s.state(&d, model.Built); err != nil {
-		return &d, err
+		return s.fail(&d, model.StartFailed, err)
 	}
 	d.SandboxType = s.sandbox.Kind()
 	d.SandboxID = d.ID
@@ -171,12 +353,10 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 			return s.fail(&d, model.StartFailed, err)
 		}
 	}
-	d.MemoryLimit = cfg.Resources.Memory
-	d.CPUQuota = cfg.Resources.CPU
-	d.TasksLimit = cfg.Resources.Tasks
 	if err = s.state(&d, model.Starting); err != nil {
-		return &d, err
+		return s.fail(&d, model.StartFailed, err)
 	}
+	s.recordEvent(d.ID, app.ID, model.EventSandboxStarting, "")
 	// PORT-only apps cannot inherit a reserved listener. Retry a bounded number
 	// of starts if a process fails during the loopback port handoff.
 	var handle *contracts.SandboxHandle
@@ -205,18 +385,25 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 			}
 			return s.fail(&d, model.StartFailed, errors.Join(err, inspectErr))
 		}
+		if handle == nil {
+			return s.fail(&d, model.StartFailed, errors.New("sandbox returned no process handle"))
+		}
 		d.PID = handle.PID
 		now := time.Now().UTC()
 		d.StartedAt = &now
+		s.recordEvent(d.ID, app.ID, model.EventSandboxStarted, fmt.Sprintf("pid=%d port=%d", d.PID, d.Port))
 		if err = s.state(&d, model.HealthChecking); err != nil {
-			return &d, errors.Join(err, s.stopRuntime(d.ID))
+			return s.fail(&d, model.StartFailed, err)
 		}
 		s.mu.Unlock()
+		locked = false
 		err = health.Check(ctx, port, cfg.Health.Path)
 		s.mu.Lock()
+		locked = true
 		if err == nil {
 			break
 		}
+		s.recordEvent(d.ID, app.ID, model.EventHealthCheckFailed, err.Error())
 		info, inspectErr := s.inspectRuntime(d.ID)
 		stopErr := s.stopRuntime(d.ID)
 		if stopErr != nil {
@@ -228,7 +415,7 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 		if inspectErr == nil && info != nil && !info.Running && attempt < 2 && ctx.Err() == nil {
 			d.State = model.Starting
 			if updateErr := s.db.UpdateDeployment(d); updateErr != nil {
-				return &d, updateErr
+				return s.fail(&d, model.StartFailed, updateErr)
 			}
 			continue
 		}
@@ -237,20 +424,49 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 		}
 		return s.fail(&d, model.Unhealthy, err)
 	}
-	info, err := s.sandbox.Inspect(ctx, d.ID)
+	if err := ctx.Err(); err != nil {
+		return s.fail(&d, model.StartFailed, err)
+	}
+	info, err := s.inspectRuntime(d.ID)
 	if err != nil || info == nil || !info.Running {
 		if isOOM(info) {
 			return s.fail(&d, model.OOMKilled, errors.New("memory limit exceeded (OOM killed)"))
 		}
 		return s.fail(&d, model.StartFailed, errors.Join(errors.New("process exited before route publication"), err))
 	}
+	s.recordEvent(d.ID, app.ID, model.EventHealthCheckPassed, "")
 	d.State = model.Running
 	d.Error = ""
-	if err = s.db.Publish(d, name+".localhost"); err != nil {
+	now := time.Now().UTC()
+	d.PromotedAt = &now
+	var oldDeploymentID string
+	drained, err := s.router.SwitchRoute(name+".localhost", "http://127.0.0.1:"+strconv.Itoa(d.Port), func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.ctx.Err() != nil {
+			return errors.New("daemon shutting down")
+		}
+		var err error
+		oldDeploymentID, err = s.db.Promote(d, name+".localhost")
+		return err
+	})
+	if err != nil {
+		d.PromotedAt = nil
 		return s.fail(&d, model.StartFailed, err)
 	}
-	if err = s.router.SetRoute(name+".localhost", "http://127.0.0.1:"+strconv.Itoa(d.Port)); err != nil {
-		return s.fail(&d, model.StartFailed, err)
+	s.recordEvent(d.ID, app.ID, model.EventRouteSwitched, fmt.Sprintf("upstream=http://127.0.0.1:%d", d.Port))
+	s.recordEvent(d.ID, app.ID, model.EventDeploymentSucceeded, "")
+	if oldDeploymentID != "" {
+		old, err := s.db.Deployment(oldDeploymentID)
+		if err != nil {
+			log.Printf("read replaced deployment %s: %v", oldDeploymentID, err)
+		} else {
+			s.recordEvent(old.ID, old.AppID, model.EventGracePeriodStarted, fmt.Sprintf("drain_timeout=%s", drainTimeout))
+		}
+		s.retiring[oldDeploymentID] = true
+		s.inflight.Add(1)
+		go func() { defer s.inflight.Done(); s.retireDeployment(oldDeploymentID, drained) }()
 	}
 	return &d, nil
 }
@@ -274,17 +490,38 @@ func (s *Service) fail(d *model.Deployment, state model.State, cause error) (*mo
 		now := time.Now().UTC()
 		d.StoppedAt = &now
 	}
-	s.router.Delete(d.AppName + ".localhost")
+	s.recordEvent(d.ID, d.AppID, model.EventDeploymentFailed, cause.Error())
+	active, readErr := s.db.ActiveDeployment(d.AppName)
+	if readErr != nil && !errors.Is(readErr, store.ErrNotFound) {
+		return d, errors.Join(cause, readErr, s.db.UpdateDeployment(*d))
+	}
+	if active != nil && active.ID == d.ID {
+		s.router.Delete(d.AppName + ".localhost")
+	}
 	if err := s.db.Finish(*d, d.AppName+".localhost"); err != nil {
 		return d, errors.Join(cause, err)
 	}
 	return d, cause
 }
 
-func (s *Service) Inspect(name string) (*model.Deployment, error) { return s.db.LatestDeployment(name) }
-func (s *Service) Apps() ([]model.Application, error)             { return s.db.Apps() }
+func (s *Service) Inspect(name string) (*model.Deployment, error) {
+	if active, err := s.db.ActiveDeployment(name); err == nil {
+		return active, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	return s.db.LatestDeployment(name)
+}
+
+func (s *Service) Releases(name string) ([]model.ReleaseView, error) {
+	return s.db.ReleasesForApp(name)
+}
+
+func (s *Service) Apps() ([]model.Application, error) { return s.db.Apps() }
 func (s *Service) Logs(name string) (string, error) {
-	d, err := s.Inspect(name)
+	// A failed candidate's diagnostics must remain accessible while inspection
+	// and traffic continue to identify the active deployment.
+	d, err := s.db.LatestDeployment(name)
 	if err != nil {
 		return "", err
 	}
@@ -339,50 +576,88 @@ func logTail(path string) (string, error) {
 
 func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	d, err := s.Inspect(name)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-	if pending, ok := s.pending[d.ID]; ok {
-		pending.cancel()
+	all, err := s.db.Deployments()
+	if err != nil {
 		s.mu.Unlock()
-		select {
-		case <-pending.done:
-		case <-ctx.Done():
-			s.mu.Lock()
-			return d, ctx.Err()
-		}
-		s.mu.Lock()
-		// Finish the deployment this stop actually canceled, not a newer
-		// deployment admitted while we were waiting.
-		d, err = s.db.Deployment(d.ID)
-		if err != nil {
-			return nil, err
-		}
-		if needsCleanup(*d) {
-			if err := s.stopRuntime(d.SandboxID); err != nil {
-				return d, err
-			}
-		}
-		d.State = model.Stopped
-		d.Error = ""
-		now := time.Now().UTC()
-		d.StoppedAt = &now
-		return d, s.db.Finish(*d, name+".localhost")
-	}
-	if !d.State.Active() && !needsCleanup(*d) {
-		return d, nil
-	}
-	s.router.Delete(name + ".localhost")
-	if err = s.sandbox.Stop(ctx, d.ID); err != nil {
 		return d, err
 	}
-	d.State = model.Stopped
-	d.Error = ""
-	now := time.Now().UTC()
-	d.StoppedAt = &now
-	return d, s.db.Finish(*d, name+".localhost")
+	// Freeze admission while canceling and awaiting every candidate. Capture IDs
+	// now so a stop never mutates a deployment admitted after this operation.
+	s.stopping[name]++
+	defer func() {
+		s.mu.Lock()
+		s.stopping[name]--
+		if s.stopping[name] == 0 {
+			delete(s.stopping, name)
+		}
+		s.mu.Unlock()
+	}()
+	targets := map[string]bool{d.ID: true}
+	var pendingDone []<-chan struct{}
+	for _, other := range all {
+		if other.AppName == name && (other.State.Active() || needsCleanup(other)) {
+			targets[other.ID] = true
+		}
+	}
+	for id, pending := range s.pending {
+		if pending.appName == name {
+			targets[id] = true
+			pending.cancel()
+			pendingDone = append(pendingDone, pending.done)
+		}
+	}
+	s.mu.Unlock()
+	for _, done := range pendingDone {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return d, ctx.Err()
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var failures []error
+	for id := range targets {
+		current, err := s.db.Deployment(id)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if current.SandboxID != "" && (current.State.Active() || needsCleanup(*current)) {
+			if err := ctx.Err(); err != nil {
+				failures = append(failures, err)
+				continue
+			}
+			if err := s.stopRuntime(current.SandboxID); err != nil {
+				failures = append(failures, fmt.Errorf("stop deployment %s: %w", id, err))
+				continue
+			}
+		}
+		active, err := s.db.ActiveDeployment(name)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			failures = append(failures, err)
+			continue
+		}
+		if active != nil && active.ID == id {
+			s.router.Delete(name + ".localhost")
+		}
+		current.State = model.Stopped
+		current.Error = ""
+		now := time.Now().UTC()
+		current.StoppedAt = &now
+		if err := s.db.Finish(*current, name+".localhost"); err != nil {
+			failures = append(failures, err)
+		}
+		if id == d.ID {
+			d = current
+		}
+	}
+	return d, errors.Join(failures...)
 }
 
 func (s *Service) monitor() {
@@ -394,12 +669,18 @@ func (s *Service) monitor() {
 		case <-s.ctx.Done():
 			return
 		case <-tick.C:
-			// A build holds mu; it checks runtime exit itself before publication.
+			// Skip a busy lifecycle transition; builds/readiness release mu.
 			if !s.mu.TryLock() {
 				continue
 			}
 			all, err := s.db.Deployments()
 			if err == nil {
+				activeRoutes, routeErr := s.db.Routes()
+				if routeErr != nil {
+					log.Printf("read routes for supervision: %v", routeErr)
+					s.mu.Unlock()
+					continue
+				}
 				for _, d := range all {
 					if needsCleanup(d) {
 						if err := s.stopRuntime(d.SandboxID); err != nil {
@@ -408,15 +689,29 @@ func (s *Service) monitor() {
 						}
 						now := time.Now().UTC()
 						d.StoppedAt = &now
+						if activeRoutes[d.AppName+".localhost"] == d.ID {
+							s.router.Delete(d.AppName + ".localhost")
+						}
 						if err := s.db.Finish(d, d.AppName+".localhost"); err != nil {
 							log.Printf("record runtime cleanup %s: %v", d.ID, err)
 						}
 						continue
 					}
 					if d.State != model.Running {
+						if _, pending := s.pending[d.ID]; d.State.Active() && !pending {
+							if _, err := s.fail(&d, model.StartFailed, errors.New("deployment interrupted before promotion")); err != nil {
+								log.Printf("finish interrupted deployment %s: %v", d.ID, err)
+							}
+						}
 						continue
 					}
-					info, err := s.sandbox.Inspect(s.ctx, d.ID)
+					if activeRoutes[d.AppName+".localhost"] != d.ID && !s.retiring[d.ID] {
+						if err := s.finishRetirement(&d); err != nil {
+							log.Printf("retry retirement %s: %v", d.ID, err)
+						}
+						continue
+					}
+					info, err := s.inspectRuntime(d.ID)
 					if s.ctx.Err() != nil {
 						break
 					}
@@ -425,6 +720,14 @@ func (s *Service) monitor() {
 						continue
 					}
 					if err != nil || info == nil || !info.Running {
+						exitCode, result := "unknown", ""
+						if info != nil {
+							result = info.Result
+							if info.ExitCode != nil {
+								exitCode = strconv.Itoa(*info.ExitCode)
+							}
+						}
+						s.recordEvent(d.ID, d.AppID, model.EventSandboxExited, fmt.Sprintf("exit_code=%s result=%s error=%v", exitCode, result, err))
 						if isOOM(info) {
 							if _, err := s.fail(&d, model.OOMKilled, errors.New("memory limit exceeded (OOM killed)")); err != nil {
 								log.Printf("finish runtime %s: %v", d.ID, err)
@@ -440,6 +743,8 @@ func (s *Service) monitor() {
 						}
 					}
 				}
+			} else {
+				log.Printf("list deployments for supervision: %v", err)
 			}
 			s.mu.Unlock()
 		}
@@ -489,7 +794,7 @@ func (s *Service) Close() error {
 }
 
 // A terminal deployment without a stop timestamp still owns a runtime whose
-// cleanup failed. Keep supervising it and block replacement until reclaimed.
+// cleanup failed. Keep supervising it and block new candidates until reclaimed.
 func needsCleanup(d model.Deployment) bool {
 	return !d.State.Active() && d.SandboxID != "" && d.StoppedAt == nil
 }
@@ -523,10 +828,10 @@ func allocatePort() (int, error) {
 	return port, listener.Close()
 }
 
-func newID(prefix string) string {
+func newID(prefix string) (string, error) {
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
-		panic(err)
+		return "", err
 	}
-	return prefix + "_" + hex.EncodeToString(value[:])
+	return prefix + "_" + hex.EncodeToString(value[:]), nil
 }
