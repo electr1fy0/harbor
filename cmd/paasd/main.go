@@ -20,7 +20,9 @@ import (
 	"paas/internal/daemon"
 	"paas/internal/deployment"
 	"paas/internal/router"
+	"paas/internal/runtime"
 	"paas/internal/sandbox"
+	"paas/internal/service"
 	"paas/internal/store"
 )
 
@@ -105,18 +107,20 @@ func main() {
 		log.Fatalf("initialize %s sandbox: %v", *sandboxType, err)
 	}
 	log.Printf("runtime sandbox=%s", sb.Kind())
-	service, err := deployment.New(db, builder.New(builder.Options{DataDir: dataDir, BuildUser: *buildUser, Timeout: *buildTimeout}), sb, hostRouter, deployment.Options{DataDir: dataDir, RuntimeUser: *runtimeUser})
+	deploySvc, err := deployment.New(db, builder.New(builder.Options{DataDir: dataDir, BuildUser: *buildUser, Timeout: *buildTimeout}), sb, hostRouter, deployment.Options{DataDir: dataDir, RuntimeUser: *runtimeUser})
 	if err != nil {
 		log.Fatal(err)
 	}
+	runtimeMgr := runtime.NewManager(dataDir)
+	svcManager := service.NewManager(db, runtimeMgr, sb, dataDir)
 	routerListener, err := net.Listen("tcp", *listen)
 	if err != nil {
-		_ = service.Close()
+		_ = deploySvc.Close()
 		log.Fatal(err)
 	}
 	routerServer := &http.Server{Handler: hostRouter, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 
-	server = daemon.NewPlatformServer(*socket, service, routerListener.Addr().String())
+	server = daemon.NewPlatformServerWithServices(*socket, deploySvc, svcManager, routerListener.Addr().String())
 
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(listener) }()
@@ -138,7 +142,7 @@ func main() {
 	case sig := <-signals:
 		log.Printf("received %s; shutting down", sig)
 	}
-	if err := service.Close(); err != nil {
+	if err := deploySvc.Close(); err != nil {
 		log.Printf("stop runtimes: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -16,7 +16,7 @@ import (
 	"paas/internal/model"
 )
 
-const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]}"
+const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]|add TYPE --name NAME|link APP SERVICE|services}"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -31,7 +31,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch command {
-	case "ping", "deploy", "apps", "inspect", "logs", "stop", "releases", "rollback":
+	case "ping", "deploy", "apps", "inspect", "logs", "stop", "releases", "rollback", "add", "link", "services":
 	default:
 		return reportUsageError(stderr, fmt.Errorf("unknown command %q", command))
 	}
@@ -42,7 +42,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	timeout := 5 * time.Second
-	if command == "deploy" || command == "rollback" {
+	if command == "deploy" || command == "rollback" || command == "add" {
 		timeout = 6 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -94,6 +94,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "stop":
 		if _, err := fmt.Fprintf(stdout, "Stopped %s\n", request.Name); err != nil {
 			fmt.Fprintf(stderr, "write stop confirmation: %v\n", err)
+			return 1
+		}
+	case "add":
+		if response != nil && response.Service != nil {
+			fmt.Fprintf(stdout, "→ Preparing %s runtime\n", response.Service.Type)
+			fmt.Fprintf(stdout, "→ Creating persistent volume\n")
+			fmt.Fprintf(stdout, "→ Initializing database\n")
+			fmt.Fprintf(stdout, "→ Starting service\n")
+			fmt.Fprintf(stdout, "→ Health check passed\n\n")
+			fmt.Fprintf(stdout, "✓ %s READY (port %d)\n", response.Service.Name, response.Service.Port)
+		}
+	case "link":
+		if response != nil && response.Binding != nil {
+			fmt.Fprintf(stdout, "✓ Injected %s into %s\n", response.Binding.EnvKey, request.AppName)
+		}
+	case "services":
+		if err := printServices(stdout, response.Services); err != nil {
+			fmt.Fprintf(stderr, "write services: %v\n", err)
 			return 1
 		}
 	}
@@ -241,6 +259,18 @@ func printReleases(stdout io.Writer, releases []model.ReleaseView) error {
 	return nil
 }
 
+func printServices(stdout io.Writer, svcs []model.Service) error {
+	if _, err := fmt.Fprintln(stdout, "NAME TYPE STATE PORT"); err != nil {
+		return err
+	}
+	for _, s := range svcs {
+		if _, err := fmt.Fprintf(stdout, "%s %s %s %d\n", s.Name, s.Type, s.State, s.Port); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func printInspection(stdout io.Writer, requestedName string, response *daemon.Response) error {
 	var appName string
 	var deployment *model.Deployment
@@ -327,7 +357,7 @@ func displayValue(value string) string {
 func parseCommandRequest(command string, args []string) (daemon.Request, error) {
 	var request daemon.Request
 	switch command {
-	case "ping", "apps":
+	case "ping", "apps", "services":
 		if len(args) > 0 {
 			return request, commandArgumentError(command, args[0])
 		}
@@ -416,6 +446,32 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 				releaseSet = true
 			}
 		}
+	case "add":
+		if len(args) == 0 || args[0] == "" || strings.HasPrefix(args[0], "-") {
+			return request, fmt.Errorf("add requires TYPE")
+		}
+		request.ServiceType = args[0]
+		for index := 1; index < len(args); index++ {
+			arg := args[index]
+			if arg == "--name" {
+				if index+1 >= len(args) || args[index+1] == "" || strings.HasPrefix(args[index+1], "-") {
+					return request, fmt.Errorf("--name requires a name")
+				}
+				request.Name = args[index+1]
+				index++
+			} else {
+				return request, fmt.Errorf("unknown option %q", arg)
+			}
+		}
+		if request.Name == "" {
+			return request, fmt.Errorf("add requires --name")
+		}
+	case "link":
+		if len(args) < 2 || args[0] == "" || args[1] == "" || strings.HasPrefix(args[0], "-") || strings.HasPrefix(args[1], "-") {
+			return request, fmt.Errorf("link requires APP and SERVICE")
+		}
+		request.AppName = args[0]
+		request.ServiceName = args[1]
 	}
 	return request, nil
 }

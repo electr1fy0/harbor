@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,10 +9,21 @@ import (
 	"net/http"
 
 	"paas/internal/deployment"
+	"paas/internal/model"
 	"paas/internal/store"
 )
 
+type ServiceManager interface {
+	AddService(ctx context.Context, serviceType, name string) (*model.Service, error)
+	Link(ctx context.Context, appName, serviceName string) (*model.Binding, error)
+	List(ctx context.Context) ([]model.Service, error)
+}
+
 func NewPlatformServer(socketPath string, service *deployment.Service, routerAddress ...string) *Server {
+	return NewPlatformServerWithServices(socketPath, service, nil, routerAddress...)
+}
+
+func NewPlatformServerWithServices(socketPath string, service *deployment.Service, services ServiceManager, routerAddress ...string) *Server {
 	port := "8080"
 	if len(routerAddress) > 0 {
 		if _, p, err := net.SplitHostPort(routerAddress[0]); err == nil {
@@ -22,7 +34,7 @@ func NewPlatformServer(socketPath string, service *deployment.Service, routerAdd
 	ping := server.http.Handler
 	mux := http.NewServeMux()
 	mux.Handle("/ping", ping)
-	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop", "releases", "rollback"} {
+	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop", "releases", "rollback", "add", "link", "services"} {
 		command := command
 		mux.HandleFunc("/"+command, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -50,28 +62,60 @@ func NewPlatformServer(socketPath string, service *deployment.Service, routerAdd
 			var err error
 			switch command {
 			case "deploy":
-				output.Deployment, err = service.Deploy(r.Context(), input.SourceDir, input.Name)
+				if service != nil {
+					output.Deployment, err = service.Deploy(r.Context(), input.SourceDir, input.Name)
+				}
 			case "inspect":
-				output.Deployment, err = service.Inspect(input.Name)
+				if service != nil {
+					output.Deployment, err = service.Inspect(input.Name)
+				}
 			case "stop":
-				output.Deployment, err = service.Stop(r.Context(), input.Name)
+				if service != nil {
+					output.Deployment, err = service.Stop(r.Context(), input.Name)
+				}
 			case "logs":
-				output.Logs, err = service.Logs(input.Name)
+				if service != nil {
+					output.Logs, err = service.Logs(input.Name)
+				}
 			case "releases":
-				output.Releases, err = service.Releases(input.Name)
+				if service != nil {
+					output.Releases, err = service.Releases(input.Name)
+				}
 			case "rollback":
-				output.Deployment, err = service.Rollback(r.Context(), input.Name, input.ReleaseID)
+				if service != nil {
+					output.Deployment, err = service.Rollback(r.Context(), input.Name, input.ReleaseID)
+				}
 			case "apps":
-				apps, listErr := service.Apps()
-				err = listErr
-				output.Apps = make([]AppView, 0, len(apps))
-				for _, app := range apps {
-					d, getErr := service.Inspect(app.Name)
-					if getErr != nil && !errors.Is(getErr, store.ErrNotFound) {
-						err = getErr
-						break
+				if service != nil {
+					apps, listErr := service.Apps()
+					err = listErr
+					output.Apps = make([]AppView, 0, len(apps))
+					for _, app := range apps {
+						d, getErr := service.Inspect(app.Name)
+						if getErr != nil && !errors.Is(getErr, store.ErrNotFound) {
+							err = getErr
+							break
+						}
+						output.Apps = append(output.Apps, AppView{Application: app, Deployment: d})
 					}
-					output.Apps = append(output.Apps, AppView{Application: app, Deployment: d})
+				}
+			case "add":
+				if services != nil {
+					output.Service, err = services.AddService(r.Context(), input.ServiceType, input.Name)
+				} else {
+					err = errors.New("services not supported by this daemon")
+				}
+			case "link":
+				if services != nil {
+					output.Binding, err = services.Link(r.Context(), input.AppName, input.ServiceName)
+				} else {
+					err = errors.New("services not supported by this daemon")
+				}
+			case "services":
+				if services != nil {
+					output.Services, err = services.List(r.Context())
+				} else {
+					err = errors.New("services not supported by this daemon")
 				}
 			}
 			if err != nil {

@@ -10,6 +10,7 @@ build:
 	go build -o bin/hello-go ./examples/hello-go
 	go build -o bin/unhealthy ./examples/unhealthy
 	go build -o bin/memory-hog ./examples/memory-hog
+	(cd examples/postgres-app && go build -o ../../bin/postgres-app .)
 
 vet:
 	go vet ./...

@@ -307,6 +307,114 @@ func TestPublishAndFinishKeepRouteAndDeploymentAtomic(t *testing.T) {
 	}
 }
 
+func TestStoreServicesAndBindings(t *testing.T) {
+	s := openTestStore(t)
+	app, err := s.CreateApp("testapp")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc := model.Service{
+		ID:        "svc_test_db",
+		Name:      "db",
+		Type:      "postgres",
+		Version:   "16",
+		Port:      5432,
+		State:     model.ServiceStarting,
+		VolumeDir: "/data/svc/db",
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.CreateService(svc); err != nil {
+		t.Fatalf("create service: %v", err)
+	}
+
+	gotSvc, err := s.GetService("svc_test_db")
+	if err != nil {
+		t.Fatalf("get service by id: %v", err)
+	}
+	if gotSvc.Name != "db" || gotSvc.Port != 5432 {
+		t.Fatalf("unexpected service: %+v", gotSvc)
+	}
+
+	gotSvcName, err := s.GetService("db")
+	if err != nil {
+		t.Fatalf("get service by name: %v", err)
+	}
+	if gotSvcName.ID != "svc_test_db" {
+		t.Fatalf("unexpected service by name: %+v", gotSvcName)
+	}
+
+	if err := s.UpdateServiceState("svc_test_db", model.ServiceReady); err != nil {
+		t.Fatalf("update service state: %v", err)
+	}
+	gotSvc, _ = s.GetService("svc_test_db")
+	if gotSvc.State != model.ServiceReady {
+		t.Fatalf("expected state %s, got %s", model.ServiceReady, gotSvc.State)
+	}
+
+	svcs, err := s.ListServices()
+	if err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	if len(svcs) != 1 {
+		t.Fatalf("expected 1 service, got %d", len(svcs))
+	}
+
+	b := model.Binding{
+		ID:           "bind_1",
+		AppID:        app.ID,
+		ServiceID:    svc.ID,
+		DatabaseName: "testdb",
+		Username:     "testuser",
+		Password:     "secret",
+		EnvKey:       "DATABASE_URL",
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := s.CreateBinding(b); err != nil {
+		t.Fatalf("create binding: %v", err)
+	}
+
+	bindings, err := s.GetBindingsForApp(app.ID)
+	if err != nil {
+		t.Fatalf("get bindings: %v", err)
+	}
+	if len(bindings) != 1 || bindings[0].DatabaseName != "testdb" {
+		t.Fatalf("unexpected bindings: %+v", bindings)
+	}
+}
+
+func TestStoreEvents(t *testing.T) {
+	s := openTestStore(t)
+	app, err := s.CreateApp("testapp_events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := saveTestRelease(t, s, app.ID, "rel_evt", time.Now().UTC())
+	dep := testDeployment(app, release.ID, "dep_123", time.Now().UTC())
+	if err := s.CreateDeployment(dep); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RecordEvent("dep_123", app.ID, model.EventSandboxStarting, "starting sandbox"); err != nil {
+		t.Fatalf("record event 1: %v", err)
+	}
+
+	if err := s.RecordEvent("dep_123", app.ID, model.EventRouteSwitched, "route published"); err != nil {
+		t.Fatalf("record event 2: %v", err)
+	}
+
+	events, err := s.Events("dep_123")
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Type != model.EventSandboxStarting || events[1].Type != model.EventRouteSwitched {
+		t.Fatalf("unexpected events ordering: %+v", events)
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "paas.sqlite"))

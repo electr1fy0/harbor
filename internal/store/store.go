@@ -19,7 +19,7 @@ import (
 
 var ErrNotFound = errors.New("store: not found")
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
@@ -693,6 +693,39 @@ func migrate(db *sql.DB) error {
 				return err
 			}
 		}
+		version = 4
+	}
+	if version < 5 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS services (
+				id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+				name TEXT NOT NULL UNIQUE CHECK (length(trim(name)) > 0),
+				type TEXT NOT NULL,
+				version TEXT NOT NULL,
+				port INTEGER NOT NULL CHECK (port >= 0 AND port <= 65535),
+				state TEXT NOT NULL,
+				volume_dir TEXT NOT NULL,
+				created_at TEXT NOT NULL
+			)`,
+			`CREATE TABLE IF NOT EXISTS bindings (
+				id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+				app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+				service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+				database_name TEXT NOT NULL,
+				username TEXT NOT NULL,
+				password TEXT NOT NULL,
+				env_key TEXT NOT NULL DEFAULT 'DATABASE_URL',
+				created_at TEXT NOT NULL,
+				UNIQUE(app_id, service_id)
+			)`,
+			`PRAGMA user_version = 5`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(statement); err != nil {
+				return err
+			}
+		}
+		version = 5
 	}
 	return tx.Commit()
 }
@@ -769,4 +802,127 @@ func nullableHealthPath(d model.Deployment) any {
 		return nil
 	}
 	return d.HealthPath
+}
+
+// CreateService creates a managed service record.
+func (s *Store) CreateService(svc model.Service) error {
+	if strings.TrimSpace(svc.ID) == "" {
+		return errors.New("store: service id is empty")
+	}
+	if strings.TrimSpace(svc.Name) == "" {
+		return errors.New("store: service name is empty")
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO services (id, name, type, version, port, state, volume_dir, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		svc.ID, svc.Name, svc.Type, svc.Version, svc.Port, string(svc.State), svc.VolumeDir, encodeTime(svc.CreatedAt))
+	if err != nil {
+		return fmt.Errorf("store: create service: %w", err)
+	}
+	return nil
+}
+
+// GetService retrieves a service by name or id.
+func (s *Store) GetService(nameOrID string) (*model.Service, error) {
+	row := s.db.QueryRow(`
+		SELECT id, name, type, version, port, state, volume_dir, created_at
+		FROM services WHERE id = ? OR name = ?`, nameOrID, nameOrID)
+	var svc model.Service
+	var stateStr, timeStr string
+	if err := row.Scan(&svc.ID, &svc.Name, &svc.Type, &svc.Version, &svc.Port, &stateStr, &svc.VolumeDir, &timeStr); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("store: get service: %w", err)
+	}
+	svc.State = model.ServiceState(stateStr)
+	createdAt, err := decodeTime(timeStr)
+	if err != nil {
+		return nil, err
+	}
+	svc.CreatedAt = createdAt
+	return &svc, nil
+}
+
+// ListServices lists all services.
+func (s *Store) ListServices() ([]model.Service, error) {
+	rows, err := s.db.Query(`
+		SELECT id, name, type, version, port, state, volume_dir, created_at
+		FROM services ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list services: %w", err)
+	}
+	defer rows.Close()
+	var list []model.Service
+	for rows.Next() {
+		var svc model.Service
+		var stateStr, timeStr string
+		if err := rows.Scan(&svc.ID, &svc.Name, &svc.Type, &svc.Version, &svc.Port, &stateStr, &svc.VolumeDir, &timeStr); err != nil {
+			return nil, fmt.Errorf("store: scan service: %w", err)
+		}
+		svc.State = model.ServiceState(stateStr)
+		createdAt, err := decodeTime(timeStr)
+		if err != nil {
+			return nil, err
+		}
+		svc.CreatedAt = createdAt
+		list = append(list, svc)
+	}
+	return list, rows.Err()
+}
+
+// UpdateServiceState updates a service's state.
+func (s *Store) UpdateServiceState(id string, state model.ServiceState) error {
+	res, err := s.db.Exec(`UPDATE services SET state = ? WHERE id = ?`, string(state), id)
+	if err != nil {
+		return fmt.Errorf("store: update service state: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CreateBinding records an application-to-service link.
+func (s *Store) CreateBinding(b model.Binding) error {
+	_, err := s.db.Exec(`
+		INSERT INTO bindings (id, app_id, service_id, database_name, username, password, env_key, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(app_id, service_id) DO UPDATE SET
+			database_name = excluded.database_name,
+			username = excluded.username,
+			password = excluded.password,
+			env_key = excluded.env_key`,
+		b.ID, b.AppID, b.ServiceID, b.DatabaseName, b.Username, b.Password, b.EnvKey, encodeTime(b.CreatedAt))
+	if err != nil {
+		return fmt.Errorf("store: create binding: %w", err)
+	}
+	return nil
+}
+
+// GetBindingsForApp returns all service bindings for an application.
+func (s *Store) GetBindingsForApp(appID string) ([]model.Binding, error) {
+	rows, err := s.db.Query(`
+		SELECT id, app_id, service_id, database_name, username, password, env_key, created_at
+		FROM bindings WHERE app_id = ? ORDER BY created_at ASC`, appID)
+	if err != nil {
+		return nil, fmt.Errorf("store: get bindings: %w", err)
+	}
+	defer rows.Close()
+	var list []model.Binding
+	for rows.Next() {
+		var b model.Binding
+		var timeStr string
+		if err := rows.Scan(&b.ID, &b.AppID, &b.ServiceID, &b.DatabaseName, &b.Username, &b.Password, &b.EnvKey, &timeStr); err != nil {
+			return nil, fmt.Errorf("store: scan binding: %w", err)
+		}
+		createdAt, err := decodeTime(timeStr)
+		if err != nil {
+			return nil, err
+		}
+		b.CreatedAt = createdAt
+		list = append(list, b)
+	}
+	return list, rows.Err()
 }

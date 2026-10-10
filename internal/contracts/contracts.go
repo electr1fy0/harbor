@@ -42,6 +42,13 @@ type Sandbox interface {
 	Inspect(context.Context, string) (*SandboxInfo, error)
 }
 
+// BindMount specifies a host-to-sandbox directory mount.
+type BindMount struct {
+	HostPath  string
+	MountPath string
+	ReadOnly  bool
+}
+
 // SandboxSpec describes the process that should be started.
 type SandboxSpec struct {
 	ID        string
@@ -53,6 +60,10 @@ type SandboxSpec struct {
 	MemoryMax string
 	CPUQuota  float64
 	TasksMax  int
+	RootFS    string
+	Binds     []BindMount
+	UID       int
+	GID       int
 }
 
 // SandboxHandle is returned after a process has been started.
@@ -82,22 +93,28 @@ type Router interface {
 	Delete(host string)
 }
 
-// ServiceProvider is reserved for later managed services, but is frozen now
-// so higher-level code does not depend on a concrete PostgreSQL implementation.
+// ServiceProvider manages stateful platform services.
 type ServiceProvider interface {
 	Create(context.Context, ServiceRequest) (*Service, error)
-	Start(context.Context, Service) error
-	ConnectionInfo(context.Context, Service) (map[string]string, error)
+	Start(context.Context, *Service) error
+	Stop(context.Context, string) error
+	ConnectionInfo(context.Context, *Service) (map[string]string, error)
 }
 
-// ServiceRequest describes a future managed service request.
+// ServiceRequest describes a managed service creation request.
 type ServiceRequest struct {
-	AppName string
 	Name    string
+	Type    string
+	Version string
 }
 
 // Service is the provider-neutral service identity.
 type Service struct {
-	ID   string
-	Name string
+	ID        string
+	Name      string
+	Type      string
+	Version   string
+	Port      int
+	State     string
+	VolumeDir string
 }

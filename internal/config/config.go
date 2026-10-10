@@ -118,8 +118,8 @@ func Load(sourceDir string) (*Config, error) {
 	if !ValidName(cfg.Name) {
 		return nil, fmt.Errorf("invalid application name %q", cfg.Name)
 	}
-	if cfg.Runtime != "go" {
-		return nil, fmt.Errorf("unsupported runtime %q: only go is supported", cfg.Runtime)
+	if cfg.Runtime != "go" && cfg.Runtime != "node" {
+		return nil, fmt.Errorf("unsupported runtime %q: only go and node are supported", cfg.Runtime)
 	}
 	if strings.TrimSpace(cfg.Build.Command) == "" {
 		return nil, fmt.Errorf("build.command must not be empty")
