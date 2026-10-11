@@ -209,6 +209,27 @@ func (s *Service) Rollback(ctx context.Context, name, targetReleaseID string) (*
 	return s.deploy(ctx, "", name, nil, &targetReleaseID)
 }
 
+// Recover restarts applications whose durable desired state is running. It
+// selects the latest promoted immutable release and leaves each failure in
+// deployment history without preventing other applications from recovering.
+func (s *Service) Recover(ctx context.Context) error {
+	apps, err := s.db.ApplicationsToRecover()
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, app := range apps {
+		last, err := s.db.LatestPromotedDeployment(app.Name)
+		if err == nil {
+			_, err = s.deploy(ctx, "", app.Name, nil, &last.ReleaseID)
+		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("recover application %s: %w", app.Name, s.redactError(app.Name, err)))
+		}
+	}
+	return errors.Join(failures...)
+}
+
 // deploy is the single candidate lifecycle for both builds and rollback.
 func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *config.Config, rollbackID *string) (*model.Deployment, error) {
 	if !config.ValidName(name) {
@@ -288,6 +309,19 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 	}
 	if err != nil {
 		return nil, err
+	}
+	appSettings, settingsErr := s.db.AppSettings(name)
+	if settingsErr != nil {
+		return nil, settingsErr
+	}
+	if appSettings.MemoryLimit != "" {
+		cfg.Resources.Memory = appSettings.MemoryLimit
+	}
+	if appSettings.CPUQuota > 0 {
+		cfg.Resources.CPU = appSettings.CPUQuota
+	}
+	if appSettings.TasksLimit > 0 {
+		cfg.Resources.Tasks = appSettings.TasksLimit
 	}
 	id, err := newID("dep")
 	if err != nil {
@@ -374,14 +408,25 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 			defaultPath = filepath.Join(home, ".local", "bin") + ":" + defaultPath
 		}
 		deployEnv := []string{"PORT=" + strconv.Itoa(port), "PATH=" + defaultPath, "HOME=/tmp"}
-		if bindings, err := s.db.GetBindingsForApp(app.ID); err == nil {
-			for _, b := range bindings {
-				if svc, err := s.db.GetService(b.ServiceID); err == nil && svc.Port > 0 {
-					dbURL := fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable",
-						b.Username, b.Password, svc.Port, b.DatabaseName)
-					deployEnv = append(deployEnv, b.EnvKey+"="+dbURL)
-				}
+		bindings, bindingErr := s.db.GetBindingsForApp(app.ID)
+		if bindingErr != nil {
+			return s.fail(&d, model.StartFailed, bindingErr)
+		}
+		for _, b := range bindings {
+			svc, serviceErr := s.db.GetService(b.ServiceID)
+			if serviceErr != nil || svc.State != model.ServiceReady || svc.Port < 1 {
+				return s.fail(&d, model.StartFailed, errors.New("a bound managed service is not ready"))
 			}
+			dbURL := fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable",
+				b.Username, b.Password, svc.Port, b.DatabaseName)
+			deployEnv = append(deployEnv, b.EnvKey+"="+dbURL)
+		}
+		customEnvironment, envErr := s.runtimeEnvironment(app.ID)
+		if envErr != nil {
+			return s.fail(&d, model.StartFailed, envErr)
+		}
+		for _, key := range sortedKeys(customEnvironment) {
+			deployEnv = append(deployEnv, key+"="+customEnvironment[key])
 		}
 
 		// Startup can wait on a runtime manager. Stop must be able to cancel
@@ -463,7 +508,12 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 	now := time.Now().UTC()
 	d.PromotedAt = &now
 	var oldDeploymentID string
-	drained, err := s.router.SwitchRoute(name+".localhost", "http://127.0.0.1:"+strconv.Itoa(d.Port), func() error {
+	settings, err := s.db.AppSettings(name)
+	if err != nil {
+		return s.fail(&d, model.StartFailed, err)
+	}
+	routeHosts := append([]string{name + ".localhost"}, settings.Domains...)
+	drained, err := s.router.SwitchRoutes(routeHosts, "http://127.0.0.1:"+strconv.Itoa(d.Port), func() error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -511,6 +561,7 @@ func (s *Service) fail(d *model.Deployment, state model.State, cause error) (*mo
 		stopErr = s.stopRuntime(d.SandboxID)
 		cause = errors.Join(cause, stopErr)
 	}
+	cause = s.redactError(d.AppName, cause)
 	d.State = state
 	d.Error = cause.Error()
 	d.StoppedAt = nil
@@ -519,14 +570,15 @@ func (s *Service) fail(d *model.Deployment, state model.State, cause error) (*mo
 		d.StoppedAt = &now
 	}
 	s.recordEvent(d.ID, d.AppID, model.EventDeploymentFailed, cause.Error())
-	active, readErr := s.db.ActiveDeployment(d.AppName)
-	if readErr != nil && !errors.Is(readErr, store.ErrNotFound) {
-		return d, errors.Join(cause, readErr, s.db.UpdateDeployment(*d))
+	hosts, routeErr := s.db.RouteHostsForDeployment(d.ID)
+	if routeErr != nil {
+		return d, errors.Join(cause, routeErr, s.db.UpdateDeployment(*d))
 	}
-	if active != nil && active.ID == d.ID {
-		s.router.Delete(d.AppName + ".localhost")
-	}
-	if err := s.db.Finish(*d, d.AppName+".localhost"); err != nil {
+	if len(hosts) > 0 {
+		if err := s.router.RemoveRoutes(hosts, func() error { return s.db.Finish(*d, d.AppName+".localhost") }); err != nil {
+			return d, errors.Join(cause, err)
+		}
+	} else if err := s.db.Finish(*d, d.AppName+".localhost"); err != nil {
 		return d, errors.Join(cause, err)
 	}
 	s.recordEvent(d.ID, d.AppID, model.EventType(state), cause.Error())
@@ -559,7 +611,7 @@ func (s *Service) Logs(name string) (string, error) {
 		return "", err
 	}
 	if d.SystemdUnit == "" || d.SandboxType != "systemd" {
-		return buildLogs, nil
+		return s.redactText(name, buildLogs)
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
@@ -567,7 +619,10 @@ func (s *Service) Logs(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	logs := buildLogs + runtimeLogs
+	logs, err := s.redactText(name, buildLogs+runtimeLogs)
+	if err != nil {
+		return "", err
+	}
 	if len(logs) > 1<<20 {
 		logs = logs[len(logs)-(1<<20):]
 	}
@@ -616,6 +671,10 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
+	}
+	if err := s.db.SetDesiredRunning(d.AppID, false); err != nil {
+		s.mu.Unlock()
+		return d, err
 	}
 	all, err := s.db.UnfinishedDeployments(name)
 	if err != nil {
@@ -679,19 +738,22 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 				continue
 			}
 		}
-		active, err := s.db.ActiveDeployment(name)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			failures = append(failures, err)
-			continue
-		}
-		if active != nil && active.ID == id {
-			s.router.Delete(name + ".localhost")
-		}
 		current.State = model.Stopped
 		now := time.Now().UTC()
 		current.StoppedAt = &now
-		if err := s.db.Finish(*current, name+".localhost"); err != nil {
+		hosts, routeErr := s.db.RouteHostsForDeployment(id)
+		if routeErr != nil {
+			failures = append(failures, routeErr)
+			continue
+		}
+		if len(hosts) > 0 {
+			if err := s.router.RemoveRoutes(hosts, func() error { return s.db.Finish(*current, name+".localhost") }); err != nil {
+				failures = append(failures, err)
+				continue
+			}
+		} else if err := s.db.Finish(*current, name+".localhost"); err != nil {
 			failures = append(failures, err)
+			continue
 		}
 		s.recordEvent(current.ID, current.AppID, "Stopped", "deployment stopped")
 		if id == d.ID {
@@ -730,10 +792,16 @@ func (s *Service) monitor() {
 						}
 						now := time.Now().UTC()
 						d.StoppedAt = &now
-						if activeRoutes[d.AppName+".localhost"] == d.ID {
-							s.router.Delete(d.AppName + ".localhost")
+						hosts, routeErr := s.db.RouteHostsForDeployment(d.ID)
+						if routeErr != nil {
+							log.Printf("read routes for deployment %s: %v", d.ID, routeErr)
+							continue
 						}
-						if err := s.db.Finish(d, d.AppName+".localhost"); err != nil {
+						if len(hosts) > 0 {
+							if err := s.router.RemoveRoutes(hosts, func() error { return s.db.Finish(d, d.AppName+".localhost") }); err != nil {
+								log.Printf("record runtime cleanup %s: %v", d.ID, s.redactError(d.AppName, err))
+							}
+						} else if err := s.db.Finish(d, d.AppName+".localhost"); err != nil {
 							log.Printf("record runtime cleanup %s: %v", d.ID, err)
 						}
 						continue
@@ -811,7 +879,6 @@ func (s *Service) Close() error {
 	var stopped sync.WaitGroup
 	for _, d := range all {
 		if d.State.Active() || needsCleanup(d) {
-			s.router.Delete(d.AppName + ".localhost")
 			stopped.Add(1)
 			go func(d model.Deployment) {
 				defer stopped.Done()
@@ -820,7 +887,12 @@ func (s *Service) Close() error {
 					d.State = model.Stopped
 					now := time.Now().UTC()
 					d.StoppedAt = &now
-					err = s.db.Finish(d, d.AppName+".localhost")
+					hosts, routesErr := s.db.RouteHostsForDeployment(d.ID)
+					if routesErr != nil {
+						err = routesErr
+					} else {
+						err = s.router.RemoveRoutes(hosts, func() error { return s.db.Finish(d, d.AppName+".localhost") })
+					}
 					_ = s.db.RecordEvent(d.ID, d.AppID, model.EventType(model.Stopped), "daemon shutdown; deployment stopped")
 				}
 				if err != nil {

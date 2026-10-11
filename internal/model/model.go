@@ -29,6 +29,30 @@ type Application struct {
 	CreatedAt time.Time
 }
 
+// AppSettings is the private persisted configuration for an application.
+// Environment is encrypted before it is stored and is never exposed by API
+// responses. Empty resource values mean that the application has no override.
+type AppSettings struct {
+	AppID                     string
+	AppName                   string
+	DesiredRunning            bool
+	MemoryLimit               string
+	CPUQuota                  float64
+	TasksLimit                int
+	EncryptedEnvironment      []byte
+	EncryptedRedactionHistory []byte
+	Domains                   []string
+}
+
+// Settings is the safe, user-facing application configuration view.
+type Settings struct {
+	Domains         []string `json:"domains"`
+	EnvironmentKeys []string `json:"environmentKeys"`
+	MemoryLimit     string   `json:"memoryLimit"`
+	CPUQuota        float64  `json:"cpuQuota"`
+	TasksLimit      int      `json:"tasksLimit"`
+}
+
 type Deployment struct {
 	ID             string
 	AppID          string
@@ -122,7 +146,7 @@ type Binding struct {
 	ServiceID    string    `json:"service_id"`
 	DatabaseName string    `json:"database_name"`
 	Username     string    `json:"username"`
-	Password     string    `json:"password"`
+	Password     string    `json:"-"`
 	EnvKey       string    `json:"env_key"`
 	CreatedAt    time.Time `json:"created_at"`
 }

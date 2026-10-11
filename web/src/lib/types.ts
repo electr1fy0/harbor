@@ -84,6 +84,16 @@ export interface AppDetails {
   releases: ReleaseView[]
   logs: string
   url: string
+  settings: AppSettings
+}
+
+/** Safe project settings metadata. Secret values are never returned. */
+export interface AppSettings {
+  domains: string[]
+  environmentKeys: string[]
+  memoryLimit: string
+  cpuQuota: number
+  tasksLimit: number
 }
 
 export interface DeploymentResult {

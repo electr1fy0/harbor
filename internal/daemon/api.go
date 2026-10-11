@@ -4,15 +4,21 @@ import "paas/internal/model"
 
 // Request describes a local control-plane operation.
 type Request struct {
-	Name        string `json:"Name,omitempty"`
-	SourceDir   string `json:"SourceDir,omitempty"`
-	RepoURL     string `json:"RepoURL,omitempty"`
-	Ref         string `json:"Ref,omitempty"`
-	RootDir     string `json:"RootDir,omitempty"`
-	ReleaseID   string `json:"ReleaseID,omitempty"`
-	ServiceType string `json:"ServiceType,omitempty"`
-	AppName     string `json:"AppName,omitempty"`
-	ServiceName string `json:"ServiceName,omitempty"`
+	Name              string            `json:"Name,omitempty"`
+	SourceDir         string            `json:"SourceDir,omitempty"`
+	RepoURL           string            `json:"RepoURL,omitempty"`
+	Ref               string            `json:"Ref,omitempty"`
+	RootDir           string            `json:"RootDir,omitempty"`
+	ReleaseID         string            `json:"ReleaseID,omitempty"`
+	ServiceType       string            `json:"ServiceType,omitempty"`
+	AppName           string            `json:"AppName,omitempty"`
+	ServiceName       string            `json:"ServiceName,omitempty"`
+	Environment       map[string]string `json:"Environment,omitempty"`
+	RemoveEnvironment []string          `json:"RemoveEnvironment,omitempty"`
+	Domains           *[]string         `json:"Domains,omitempty"`
+	MemoryLimit       *string           `json:"MemoryLimit,omitempty"`
+	CPUQuota          *float64          `json:"CPUQuota,omitempty"`
+	TasksLimit        *int              `json:"TasksLimit,omitempty"`
 }
 
 type AppView struct {
@@ -30,4 +36,5 @@ type Response struct {
 	Service    *model.Service      `json:"Service,omitempty"`
 	Services   []model.Service     `json:"Services,omitempty"`
 	Binding    *model.Binding      `json:"Binding,omitempty"`
+	Settings   *model.Settings     `json:"settings,omitempty"`
 }

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -16,33 +17,40 @@ import (
 	"paas/internal/model"
 )
 
-const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]|add TYPE --name NAME|link APP SERVICE|services}"
+const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]|settings NAME|configure NAME [--env-stdin] [--remove-env KEY] [--domain HOST|--clear-domains] [--memory LIMIT] [--cpu N] [--tasks N]|add TYPE --name NAME|link APP SERVICE|services}"
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(runWithInput(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 // run executes the CLI and returns the process status code. It does not exit,
 // so callers can exercise the command behavior directly.
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithInput(args, os.Stdin, stdout, stderr)
+}
+
+func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	socket, command, commandArgs, err := parseInvocation(args)
 	if err != nil {
 		return reportUsageError(stderr, err)
 	}
 
 	switch command {
-	case "ping", "deploy", "apps", "inspect", "logs", "stop", "releases", "rollback", "add", "link", "services":
+	case "ping", "deploy", "apps", "inspect", "logs", "stop", "releases", "rollback", "add", "link", "services", "settings", "configure":
 	default:
 		return reportUsageError(stderr, fmt.Errorf("unknown command %q", command))
 	}
 
 	request, err := parseCommandRequest(command, commandArgs)
+	if err == nil && command == "configure" && hasArg(commandArgs, "--env-stdin") {
+		request.Environment, err = readEnvironment(stdin)
+	}
 	if err != nil {
 		return reportUsageError(stderr, err)
 	}
 
 	timeout := 5 * time.Second
-	if command == "deploy" || command == "rollback" || command == "add" {
+	if command == "deploy" || command == "rollback" || command == "add" || command == "configure" {
 		timeout = 6 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -113,6 +121,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err := printServices(stdout, response.Services); err != nil {
 			fmt.Fprintf(stderr, "write services: %v\n", err)
 			return 1
+		}
+	case "settings", "configure":
+		if response != nil && response.Settings != nil {
+			if err := printSettings(stdout, response.Settings); err != nil {
+				fmt.Fprintf(stderr, "write %s: %v\n", command, err)
+				return 1
+			}
 		}
 	}
 	return 0
@@ -273,6 +288,25 @@ func printServices(stdout io.Writer, svcs []model.Service) error {
 	return nil
 }
 
+func printSettings(stdout io.Writer, settings *model.Settings) error {
+	if settings == nil {
+		return fmt.Errorf("daemon returned no settings")
+	}
+	if _, err := fmt.Fprintf(stdout, "Domains: %s\nEnvironment keys: %s\nMemory limit: %s\nCPU quota: %s\nTasks limit: %d\n",
+		listValue(settings.Domains), listValue(settings.EnvironmentKeys), settings.MemoryLimit,
+		strconv.FormatFloat(settings.CPUQuota, 'f', -1, 64), settings.TasksLimit); err != nil {
+		return err
+	}
+	return nil
+}
+
+func listValue(values []string) string {
+	if len(values) == 0 {
+		return "-"
+	}
+	return strings.Join(values, ", ")
+}
+
 func printInspection(stdout io.Writer, requestedName string, response *daemon.Response) error {
 	var appName string
 	var deployment *model.Deployment
@@ -402,7 +436,7 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 			return request, fmt.Errorf("deploy source %q is not a directory", absoluteSource)
 		}
 		request.SourceDir = absoluteSource
-	case "inspect", "logs", "stop", "releases":
+	case "inspect", "logs", "stop", "releases", "settings":
 		if len(args) == 0 || args[0] == "" {
 			return request, fmt.Errorf("%s requires NAME", command)
 		}
@@ -413,6 +447,77 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 			return request, commandArgumentError(command, args[1])
 		}
 		request.Name = args[0]
+	case "configure":
+		if len(args) == 0 || args[0] == "" || strings.HasPrefix(args[0], "-") {
+			return request, fmt.Errorf("configure requires NAME")
+		}
+		request.Name = args[0]
+		domainSeen := false
+		clearDomains := false
+		var domains []string
+		for i := 1; i < len(args); i++ {
+			arg := args[i]
+			switch arg {
+			case "--env-stdin":
+				if request.Environment != nil {
+					return request, fmt.Errorf("--env-stdin may only be specified once")
+				}
+				request.Environment = make(map[string]string)
+			case "--remove-env":
+				if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
+					return request, fmt.Errorf("--remove-env requires a key")
+				}
+				request.RemoveEnvironment = append(request.RemoveEnvironment, args[i+1])
+				i++
+			case "--domain":
+				if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
+					return request, fmt.Errorf("--domain requires a hostname")
+				}
+				domainSeen = true
+				domains = append(domains, args[i+1])
+				i++
+			case "--clear-domains":
+				clearDomains = true
+			case "--memory":
+				if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
+					return request, fmt.Errorf("--memory requires a limit")
+				}
+				value := args[i+1]
+				request.MemoryLimit = &value
+				i++
+			case "--cpu":
+				if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
+					return request, fmt.Errorf("--cpu requires a number")
+				}
+				value, err := strconv.ParseFloat(args[i+1], 64)
+				if err != nil {
+					return request, fmt.Errorf("invalid --cpu number")
+				}
+				request.CPUQuota = &value
+				i++
+			case "--tasks":
+				if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
+					return request, fmt.Errorf("--tasks requires a number")
+				}
+				value, err := strconv.Atoi(args[i+1])
+				if err != nil {
+					return request, fmt.Errorf("invalid --tasks number")
+				}
+				request.TasksLimit = &value
+				i++
+			default:
+				return request, commandArgumentError(command, arg)
+			}
+		}
+		if domainSeen && clearDomains {
+			return request, fmt.Errorf("--domain and --clear-domains cannot be combined")
+		}
+		if domainSeen {
+			request.Domains = &domains
+		} else if clearDomains {
+			empty := []string{}
+			request.Domains = &empty
+		}
 	case "rollback":
 		if len(args) == 0 || args[0] == "" || strings.HasPrefix(args[0], "-") {
 			return request, fmt.Errorf("rollback requires NAME")
@@ -476,6 +581,39 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 		request.ServiceName = args[1]
 	}
 	return request, nil
+}
+
+func hasArg(args []string, value string) bool {
+	for _, arg := range args {
+		if arg == value {
+			return true
+		}
+	}
+	return false
+}
+
+func readEnvironment(input io.Reader) (map[string]string, error) {
+	values := make(map[string]string)
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("environment input must contain KEY=VALUE lines")
+		}
+		if _, exists := values[key]; exists {
+			return nil, fmt.Errorf("environment input repeats key %q", key)
+		}
+		values[key] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read environment input: %w", err)
+	}
+	return values, nil
 }
 
 func commandArgumentError(command, argument string) error {

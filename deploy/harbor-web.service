@@ -1,0 +1,29 @@
+[Unit]
+Description=Harbor authenticated web dashboard
+After=network-online.target paasd.service
+Wants=network-online.target
+Requires=paasd.service
+
+[Service]
+Type=simple
+User=paas-web
+Group=paas-admins
+WorkingDirectory=/opt/harbor/web
+EnvironmentFile=/etc/harbor/harbor.env
+Environment=PAASD_SOCKET=/run/paas/paasd.sock
+Environment=HOST=127.0.0.1
+Environment=PORT=3000
+StateDirectory=harbor-web
+StateDirectoryMode=0700
+ExecStart=/usr/bin/bun run start
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/harbor-web
+
+[Install]
+WantedBy=multi-user.target

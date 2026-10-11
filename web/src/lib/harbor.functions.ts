@@ -1,6 +1,8 @@
 import { createServerFn } from "@tanstack/react-start"
 import {
+  configureAppInputSchema,
   deployAppInputSchema,
+  getAppSettingsInputSchema,
   getAppInputSchema,
   getGitHubRepoInputSchema,
   listGitHubReposInputSchema,
@@ -22,6 +24,20 @@ export const getApp = createServerFn({ method: "GET" })
   .handler(async ({ data }) => {
     const { getAppData } = await import("./harbor.server")
     return getAppData(data.name)
+  })
+
+export const getAppSettings = createServerFn({ method: "GET" })
+  .validator((input: unknown) => parseInput(getAppSettingsInputSchema, input))
+  .handler(async ({ data }) => {
+    const { getAppSettingsData } = await import("./harbor.server")
+    return getAppSettingsData(data.name)
+  })
+
+export const configureApp = createServerFn({ method: "POST" })
+  .validator((input: unknown) => parseInput(configureAppInputSchema, input))
+  .handler(async ({ data }) => {
+    const { configureAppData } = await import("./harbor.server")
+    return configureAppData(data)
   })
 
 export const deployApp = createServerFn({ method: "POST" })

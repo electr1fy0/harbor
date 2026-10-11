@@ -4,6 +4,20 @@ const appName = z
   .string()
   .regex(/^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/, "Invalid request data.")
 
+const environmentKey = z
+  .string()
+  .regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/, "Invalid request data.")
+
+const domainName = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .max(253)
+  .regex(
+    /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/,
+    "Invalid request data."
+  )
+
 const githubOwner = z
   .string()
   .trim()
@@ -83,6 +97,36 @@ export const listGitHubReposInputSchema = z
 export const getGitHubRepoInputSchema = z
   .object({ repoURL: githubRepoUrl })
   .strict()
+export const getAppSettingsInputSchema = z.object({ name: appName }).strict()
+export const configureAppInputSchema = z
+  .object({
+    name: appName,
+    environment: z.record(environmentKey, z.string().max(65_536)).optional(),
+    removeEnvironment: z.array(environmentKey).max(100).optional(),
+    domains: z.array(domainName).max(50).optional(),
+    memoryLimit: z
+      .string()
+      .trim()
+      .regex(/^[1-9][0-9]*(?:Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E|B)?$/)
+      .optional(),
+    cpuQuota: z.number().finite().positive().max(256).optional(),
+    tasksLimit: z.number().int().positive().max(65_536).optional(),
+  })
+  .strict()
+  .refine(
+    (input) =>
+      input.environment !== undefined ||
+      input.removeEnvironment !== undefined ||
+      input.domains !== undefined ||
+      input.memoryLimit !== undefined ||
+      input.cpuQuota !== undefined ||
+      input.tasksLimit !== undefined,
+    "Invalid request data."
+  )
+  .refine(
+    (input) => !input.domains || new Set(input.domains).size === input.domains.length,
+    "Invalid request data."
+  )
 
 export type GetAppInput = z.infer<typeof getAppInputSchema>
 export type DeployAppInput = z.infer<typeof deployAppInputSchema>
@@ -90,6 +134,8 @@ export type StopAppInput = z.infer<typeof stopAppInputSchema>
 export type RollbackAppInput = z.infer<typeof rollbackAppInputSchema>
 export type ListGitHubReposInput = z.infer<typeof listGitHubReposInputSchema>
 export type GetGitHubRepoInput = z.infer<typeof getGitHubRepoInputSchema>
+export type GetAppSettingsInput = z.infer<typeof getAppSettingsInputSchema>
+export type ConfigureAppInput = z.infer<typeof configureAppInputSchema>
 
 /**
  * Normalize validation failures so Zod's diagnostic object never crosses the

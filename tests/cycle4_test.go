@@ -417,6 +417,12 @@ func TestCycle4PostgresManagedServiceAndPersistence(t *testing.T) {
 	if !strings.Contains(appsOut, "pgapp") {
 		t.Fatalf("expected pgapp in apps list after restart: %s", appsOut)
 	}
+	// Managed PostgreSQL must be restored before its dependent application.
+	// The recovered release continues from the same persistent database volume.
+	status, body, err = query("pgapp.localhost", "/counter")
+	if err != nil || status != 200 || strings.TrimSpace(body) != "5" {
+		t.Fatalf("counter after daemon restart: status=%d body=%q err=%v", status, body, err)
+	}
 
 	// Clean up: stop pgapp and services
 	_, _ = cli("stop", "pgapp")

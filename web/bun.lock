@@ -38,6 +38,7 @@
         "eslint": "^10",
         "prettier": "^3.9.9",
         "prettier-plugin-tailwindcss": "^0.8.1",
+        "seroval": "1.6.9",
         "typescript": "^6.0.2",
         "vite": "^8",
         "vitest": "^5.0.3",

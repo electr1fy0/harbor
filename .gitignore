@@ -6,6 +6,7 @@
 # Markdown notes and planning documents
 *.md
 !/web/README.md
+!/deploy/README.md
 
 # Go tooling
 *.test

@@ -55,9 +55,16 @@ func (r *HostRouter) SetRoute(host string, upstream string) error {
 // closes when every request assigned to the old route has finished.
 // commit must not call back into the router.
 func (r *HostRouter) SwitchRoute(host, upstream string, commit func() error) (<-chan struct{}, error) {
-	host = normalizeHost(host)
-	if host == "" {
-		return nil, fmt.Errorf("host must not be empty")
+	return r.SwitchRoutes([]string{host}, upstream, commit)
+}
+
+// SwitchRoutes atomically replaces a group of hostname mappings with one
+// upstream. The returned channel closes after requests using any old mapping
+// finish, which lets callers drain every alias before retiring a deployment.
+func (r *HostRouter) SwitchRoutes(hosts []string, upstream string, commit func() error) (<-chan struct{}, error) {
+	hosts, err := normalizedHosts(hosts)
+	if err != nil {
+		return nil, err
 	}
 	target, err := url.Parse(upstream)
 	if err != nil {
@@ -72,7 +79,7 @@ func (r *HostRouter) SwitchRoute(host, upstream string, commit func() error) (<-
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		log.Printf("proxy %s to %s: %v", host, target.Redacted(), err)
+		log.Printf("proxy hosts %v to %s: %v", hosts, target.Redacted(), err)
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 	}
 
@@ -87,15 +94,103 @@ func (r *HostRouter) SwitchRoute(host, upstream string, commit func() error) (<-
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	old := r.routes[host]
-	r.routes[host] = &route{proxy: proxy, drained: make(chan struct{})}
-	if old == nil {
+	var draining []<-chan struct{}
+	for _, host := range hosts {
+		old := r.routes[host]
+		r.routes[host] = &route{proxy: proxy, drained: make(chan struct{})}
+		if old != nil {
+			r.retire(old)
+			draining = append(draining, old.drained)
+		}
+	}
+	if len(draining) == 0 {
 		done := make(chan struct{})
 		close(done)
 		return done, nil
 	}
-	r.retire(old)
-	return old.drained, nil
+	drained := make(chan struct{})
+	go func() {
+		for _, done := range draining {
+			<-done
+		}
+		close(drained)
+	}()
+	return drained, nil
+}
+
+// UpdateRoutes commits a durable route update and then atomically applies the
+// desired mappings in memory. remove may overlap hosts; the new mappings win.
+func (r *HostRouter) UpdateRoutes(hosts, remove []string, upstream string, commit func() error) error {
+	setHosts, err := normalizedHosts(hosts)
+	if err != nil {
+		return err
+	}
+	removeHosts, err := normalizedHosts(remove)
+	if err != nil {
+		return err
+	}
+	var proxy *httputil.ReverseProxy
+	if len(setHosts) > 0 {
+		target, err := url.Parse(upstream)
+		if err != nil {
+			return fmt.Errorf("parse upstream: %w", err)
+		}
+		if target.Scheme != "http" && target.Scheme != "https" {
+			return fmt.Errorf("upstream scheme must be http or https")
+		}
+		if target.Host == "" {
+			return fmt.Errorf("upstream host must not be empty")
+		}
+		proxy = httputil.NewSingleHostReverseProxy(target)
+		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+			log.Printf("proxy to %s: %v", target.Redacted(), err)
+			http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		}
+	}
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
+	if commit != nil {
+		if err := commit(); err != nil {
+			return err
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, host := range removeHosts {
+		if old := r.routes[host]; old != nil {
+			r.retire(old)
+			delete(r.routes, host)
+		}
+	}
+	for _, host := range setHosts {
+		old := r.routes[host]
+		r.routes[host] = &route{proxy: proxy, drained: make(chan struct{})}
+		if old != nil {
+			r.retire(old)
+		}
+	}
+	return nil
+}
+
+// RemoveRoutes removes a group of hostname mappings after commit succeeds.
+func (r *HostRouter) RemoveRoutes(hosts []string, commit func() error) error {
+	return r.UpdateRoutes(nil, hosts, "", commit)
+}
+
+func normalizedHosts(hosts []string) ([]string, error) {
+	normalized := make([]string, 0, len(hosts))
+	seen := make(map[string]bool, len(hosts))
+	for _, host := range hosts {
+		host = normalizeHost(host)
+		if host == "" {
+			return nil, fmt.Errorf("host must not be empty")
+		}
+		if !seen[host] {
+			seen[host] = true
+			normalized = append(normalized, host)
+		}
+	}
+	return normalized, nil
 }
 
 // Delete removes a route if it exists.

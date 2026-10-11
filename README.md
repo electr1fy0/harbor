@@ -7,9 +7,9 @@ Harbor deploys HTTP applications to a single machine:
 The target is Ubuntu/Debian Linux with Go, a C compiler (SQLite), Git, systemd,
 cgroup v2, Bubblewrap, and curl. Linux runtimes use namespace isolation and
 systemd resource limits. Go and Node runtimes, managed PostgreSQL services, and
-GitHub HTTPS source deployments are supported. Public HTTPS is not implemented.
-Apps must be trusted: this is a local
-development platform, not multi-tenant hosting.
+GitHub HTTPS source deployments are supported. Caddy provides public HTTPS for
+configured custom domains and an authenticated dashboard. Apps and operators
+must be trusted; applications share the host network and runtime account.
 
 ## Web dashboard
 
@@ -47,10 +47,20 @@ For a local production build:
     bun run build
     PAASD_SOCKET=/tmp/paasd.sock bun run start
 
-Both development and production startup bind to loopback. The dashboard is a
-local administrator interface with access to the control plane; authentication
-for remote hosting is not implemented. See [web/README.md](web/README.md) for
-frontend checks and configuration.
+Both development and production startup bind to loopback. Public mode requires
+an exact HTTPS dashboard origin, an admin password hash, and a session signing
+secret; partial configuration locks access. See [deploy/README.md](deploy/README.md)
+for the unprivileged dashboard service and Caddy setup, and
+[web/README.md](web/README.md) for frontend checks and configuration.
+
+Project settings support globally unique custom domains, write-only runtime
+environment values, and resource limits. Domain changes update routing
+immediately. Environment and resource changes apply on the next deployment,
+rollback, or daemon recovery. Values and their redaction history are encrypted
+with a daemon-owned `environment.key` (mode `0600`); keep that key with secure
+backups of the data directory. Settings responses contain environment key names
+only, and application diagnostics redact configured values, including previous
+values after rotation or removal.
 
 ## Linux setup and demo
 
@@ -73,7 +83,9 @@ until deploy. In another terminal:
     sudo ./bin/paas rollback hello
     sudo ./bin/paas stop hello
 
-The control socket is owner-only, so the CLI also uses sudo with a root daemon.
+The control socket is owner-only by default, so the CLI also uses sudo with a
+root daemon. `-socket-group GROUP` grants a validated existing group access with
+mode `0660`; use a dedicated group containing trusted administrators only.
 Builds run as `paas-build` in disposable workspaces with a timeout and systemd
 build limits (512 MiB, 128 tasks, one CPU, no swap). Apps run as `paas-runtime`.
 The default build timeout is five minutes, configurable with `-build-timeout`;
@@ -125,9 +137,11 @@ timestamps persist in SQLite; lifecycle event write failures are logged. Logs
 shows the newest deployment attempt, including failed candidates. Legacy releases
 without recorded readiness settings must be redeployed before rollback.
 
-Graceful daemon shutdown stops its apps. Restart preserves history/releases but
-does not auto-restart apps. Stop preserves diagnostics from completed failed
-attempts and cleanup failures.
+Graceful daemon shutdown stops its apps, then managed databases. Startup restores
+managed databases before recovering desired-running apps from their last
+promoted immutable releases. Failed service recovery leaves dependent apps with
+diagnostics while independent apps recover. Explicitly stopped apps stay stopped.
+Stop preserves diagnostics from completed failed attempts and cleanup failures.
 Linux defaults to the systemd backend and fails startup if its prerequisites
 are missing. `-sandbox=bubblewrap` provides namespace isolation without resource
 limits; `-sandbox=host` explicitly selects host execution without those controls.

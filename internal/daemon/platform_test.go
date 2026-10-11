@@ -2,12 +2,19 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"paas/internal/deployment"
+	"paas/internal/router"
+	"paas/internal/store"
 )
 
 func TestPlatformRejectsMalformedRequests(t *testing.T) {
@@ -17,6 +24,70 @@ func TestPlatformRejectsMalformedRequests(t *testing.T) {
 		server.http.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/deploy", strings.NewReader(body)))
 		if recorder.Code != http.StatusBadRequest {
 			t.Fatalf("request %q status=%d", body[:min(len(body), 40)], recorder.Code)
+		}
+	}
+}
+
+func TestSettingsAndConfigureMetadataAPI(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	routes := router.New()
+	appService, err := deployment.New(db, nil, nil, routes, deployment.Options{DataDir: filepath.Join(root, "data")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer appService.Close()
+	server := NewPlatformServer("", appService)
+	defer func() { _ = server.Shutdown(context.Background()) }()
+
+	configure := httptest.NewRecorder()
+	server.http.Handler.ServeHTTP(configure, httptest.NewRequest(http.MethodPost, "/configure", strings.NewReader(
+		`{"Name":"private","Environment":{"TOKEN":"api-secret"},"Domains":["App.Example.com"],"MemoryLimit":"192Mi","CPUQuota":0.5,"TasksLimit":24}`)))
+	if configure.Code != http.StatusOK {
+		t.Fatalf("configure status=%d body=%s", configure.Code, configure.Body.String())
+	}
+	body := configure.Body.String()
+	if strings.Contains(body, "api-secret") {
+		t.Fatalf("configure response leaked an environment value: %s", body)
+	}
+	for _, required := range []string{`"settings"`, `"domains":["app.example.com"]`, `"environmentKeys":["TOKEN"]`, `"memoryLimit":"192Mi"`, `"cpuQuota":0.5`, `"tasksLimit":24`} {
+		if !strings.Contains(body, required) {
+			t.Errorf("configure response missing %s: %s", required, body)
+		}
+	}
+	if strings.Contains(body, `"Settings"`) || strings.Contains(body, `"Environment"`) {
+		t.Fatalf("configure response did not use the public metadata contract: %s", body)
+	}
+
+	settings := httptest.NewRecorder()
+	server.http.Handler.ServeHTTP(settings, httptest.NewRequest(http.MethodPost, "/settings", strings.NewReader(`{"Name":"private"}`)))
+	if settings.Code != http.StatusOK || strings.Contains(settings.Body.String(), "api-secret") || !strings.Contains(settings.Body.String(), `"environmentKeys":["TOKEN"]`) {
+		t.Fatalf("settings status=%d body=%s", settings.Code, settings.Body.String())
+	}
+
+	duplicate := httptest.NewRecorder()
+	server.http.Handler.ServeHTTP(duplicate, httptest.NewRequest(http.MethodPost, "/configure", strings.NewReader(
+		`{"Name":"other","Domains":["app.example.com"]}`,
+	)))
+	if duplicate.Code != http.StatusConflict {
+		t.Fatalf("duplicate domain status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "data", "environment.key")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSettingsAndConfigureRoutesRequirePOST(t *testing.T) {
+	server := NewPlatformServer("", nil)
+	for _, route := range []string{"settings", "configure"} {
+		recorder := httptest.NewRecorder()
+		server.http.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/"+route, nil))
+		if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != "POST" {
+			t.Fatalf("GET /%s status=%d allow=%q", route, recorder.Code, recorder.Header().Get("Allow"))
 		}
 	}
 }

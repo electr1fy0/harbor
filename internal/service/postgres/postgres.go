@@ -3,8 +3,11 @@ package postgres
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -15,6 +18,7 @@ import (
 
 	"paas/internal/contracts"
 	"paas/internal/runtime"
+	"paas/internal/sandbox"
 )
 
 var _ contracts.ServiceProvider = (*Provider)(nil)
@@ -90,6 +94,22 @@ func (p *Provider) Create(ctx context.Context, req contracts.ServiceRequest) (*c
 func (p *Provider) Start(ctx context.Context, svc *contracts.Service) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if existing, inspectErr := p.sandbox.Inspect(ctx, svc.ID); inspectErr == nil && existing != nil && existing.Running {
+		if existing.ID != svc.ID {
+			return errors.New("refusing to adopt a postgres sandbox with a mismatched identity")
+		}
+		if readinessErr := waitReady(ctx, svc.Port); readinessErr == nil {
+			svc.State = "READY"
+			return nil
+		} else if cleanupErr := p.stopUnreadySandbox(svc.ID); cleanupErr != nil {
+			return errors.Join(readinessErr, cleanupErr)
+		}
+	} else if inspectErr != nil && !errors.Is(inspectErr, sandbox.ErrSandboxNotFound) {
+		return fmt.Errorf("inspect postgres sandbox: %w", inspectErr)
+	}
 
 	rootfs, err := p.runtime.EnsurePostgresRootFS(ctx)
 	if err != nil {
@@ -120,31 +140,129 @@ func (p *Provider) Start(ctx context.Context, svc *contracts.Service) error {
 		return fmt.Errorf("start postgres sandbox: %w", err)
 	}
 
-	// Poll readiness
-	deadline := time.Now().Add(15 * time.Second)
-	ready := false
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", svc.Port), 250*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			ready = true
-			break
+	if err := waitReady(ctx, svc.Port); err != nil {
+		if cleanupErr := p.stopUnreadySandbox(svc.ID); cleanupErr != nil {
+			return errors.Join(err, cleanupErr)
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	if !ready {
-		_ = p.sandbox.Stop(ctx, svc.ID)
-		return fmt.Errorf("postgres service failed to become ready on port %d", svc.Port)
+		return err
 	}
 
 	svc.State = "READY"
 	return nil
 }
 
+func (p *Provider) stopUnreadySandbox(id string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	if err := p.sandbox.Stop(cleanupCtx, id); err != nil && !errors.Is(err, sandbox.ErrSandboxNotFound) {
+		return fmt.Errorf("stop unready postgres sandbox: %w", err)
+	}
+	return nil
+}
+
+func waitReady(ctx context.Context, port int) error {
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := probePostgres(ctx, port); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("postgres service failed to become ready on port %d", port)
+		case <-tick.C:
+		}
+	}
+}
+
+// probePostgres performs a PostgreSQL v3 startup exchange and succeeds only
+// after the server reports AuthenticationOk and ReadyForQuery. A listening
+// TCP socket is not enough to prove that a restored managed database is ready.
+func probePostgres(ctx context.Context, port int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stopCancel()
+	deadline := time.Now().Add(time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+
+	const user, database = "postgres", "postgres"
+	packet := make([]byte, 4)
+	packet = binary.BigEndian.AppendUint32(packet, 196608) // protocol 3.0
+	packet = append(packet, "user"...)
+	packet = append(packet, 0)
+	packet = append(packet, user...)
+	packet = append(packet, 0)
+	packet = append(packet, "database"...)
+	packet = append(packet, 0)
+	packet = append(packet, database...)
+	packet = append(packet, 0, 0)
+	binary.BigEndian.PutUint32(packet[:4], uint32(len(packet)))
+	if _, err := conn.Write(packet); err != nil {
+		return err
+	}
+
+	authenticated := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var header [5]byte
+		if _, err := io.ReadFull(conn, header[:]); err != nil {
+			return err
+		}
+		length := binary.BigEndian.Uint32(header[1:])
+		if length < 4 || length > 1<<20 {
+			return errors.New("invalid postgres readiness response")
+		}
+		body := make([]byte, int(length)-4)
+		if _, err := io.ReadFull(conn, body); err != nil {
+			return err
+		}
+		switch header[0] {
+		case 'R': // Authentication request
+			if len(body) != 4 {
+				return errors.New("postgres requested unsupported authentication")
+			}
+			if binary.BigEndian.Uint32(body) == 0 {
+				authenticated = true
+			}
+		case 'E':
+			return errors.New("postgres rejected readiness probe")
+		case 'Z': // ReadyForQuery
+			if authenticated && len(body) == 1 {
+				return nil
+			}
+			return errors.New("postgres did not complete readiness authentication")
+		}
+	}
+}
+
 // Stop stops the running PostgreSQL service.
 func (p *Provider) Stop(ctx context.Context, id string) error {
-	return p.sandbox.Stop(ctx, id)
+	err := p.sandbox.Stop(ctx, id)
+	if errors.Is(err, sandbox.ErrSandboxNotFound) {
+		return nil
+	}
+	return err
 }
 
 // ConnectionInfo returns loopback connection parameters for the service.

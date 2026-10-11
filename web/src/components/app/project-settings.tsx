@@ -1,0 +1,297 @@
+import { useState, type FormEvent } from "react"
+import { useMutation } from "@tanstack/react-query"
+import { IconCirclePlus, IconKey, IconTrash, IconWorld } from "@tabler/icons-react"
+import { Button } from "@/components/ui/button"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { configureApp } from "@/lib/harbor.functions"
+import type { AppSettings } from "@/lib/types"
+import type { ConfigureAppInput } from "@/lib/validation"
+
+interface ProjectSettingsProps {
+  name: string
+  settings: AppSettings
+  onSaved: (settings: AppSettings) => void | Promise<void>
+}
+
+export function ProjectSettings({
+  name,
+  settings,
+  onSaved,
+}: ProjectSettingsProps) {
+  const [current, setCurrent] = useState(settings)
+  const [domainDraft, setDomainDraft] = useState("")
+  const [environmentKey, setEnvironmentKey] = useState("")
+  const [environmentValue, setEnvironmentValue] = useState("")
+  const [memoryLimit, setMemoryLimit] = useState(settings.memoryLimit)
+  const [cpuQuota, setCpuQuota] = useState(String(settings.cpuQuota || ""))
+  const [tasksLimit, setTasksLimit] = useState(String(settings.tasksLimit || ""))
+  const [message, setMessage] = useState("")
+
+  const updateMutation = useMutation({
+    mutationFn: (input: Omit<ConfigureAppInput, "name">) =>
+      configureApp({ data: { name, ...input } }),
+    onSuccess: async (updated) => {
+      setCurrent(updated)
+      setMemoryLimit(updated.memoryLimit)
+      setCpuQuota(String(updated.cpuQuota || ""))
+      setTasksLimit(String(updated.tasksLimit || ""))
+      setMessage("")
+      await onSaved(updated)
+    },
+    onError: (error) => setMessage(error.message || "Could not update settings."),
+  })
+
+  const pending = updateMutation.isPending
+
+  function addDomain(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const domain = domainDraft.trim().toLowerCase()
+    if (
+      !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(
+        domain
+      )
+    ) {
+      setMessage("Enter a domain name without a scheme or path.")
+      return
+    }
+    if (current.domains.includes(domain)) {
+      setMessage("That domain is already configured.")
+      return
+    }
+    setDomainDraft("")
+    updateMutation.mutate({ domains: [...current.domains, domain] })
+  }
+
+  function saveEnvironment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const key = environmentKey.trim()
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) {
+      setMessage("Use a valid environment variable name.")
+      return
+    }
+    if (!environmentValue) {
+      setMessage("Enter a value to add or replace this secret.")
+      return
+    }
+    updateMutation.mutate({ environment: { [key]: environmentValue } })
+    setEnvironmentKey("")
+    setEnvironmentValue("")
+  }
+
+  function saveResources(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const cpu = Number(cpuQuota)
+    const tasks = Number(tasksLimit)
+    if (!memoryLimit.trim() || !Number.isFinite(cpu) || cpu <= 0 || !Number.isInteger(tasks) || tasks <= 0) {
+      setMessage("Enter a memory limit, positive CPU quota, and positive task limit.")
+      return
+    }
+    updateMutation.mutate({
+      memoryLimit: memoryLimit.trim(),
+      cpuQuota: cpu,
+      tasksLimit: tasks,
+    })
+  }
+
+  return (
+    <div className="grid gap-4">
+      <Card className="border-border/80 bg-white">
+        <CardHeader className="flex-row items-start gap-3 border-b border-border/60 pb-4">
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[#f5f6f4] text-muted-foreground">
+            <IconWorld size={18} />
+          </span>
+          <div>
+            <CardTitle className="text-sm">Custom domains</CardTitle>
+            <CardDescription className="mt-1 leading-5">
+              Add the hostnames that should route to this application. Caddy
+              requests HTTPS certificates only for domains Harbor has allowed.
+            </CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4 pt-4">
+          {current.domains.length > 0 ? (
+            <ul className="space-y-2" aria-label="Configured domains">
+              {current.domains.map((domain) => (
+                <li
+                  key={domain}
+                  className="flex items-center justify-between gap-3 rounded-lg border border-border/70 px-3 py-2"
+                >
+                  <code className="truncate text-xs">{domain}</code>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled={pending}
+                    onClick={() =>
+                      updateMutation.mutate({
+                        domains: current.domains.filter(
+                          (configured) => configured !== domain
+                        ),
+                      })
+                    }
+                    aria-label={`Remove ${domain}`}
+                  >
+                    <IconTrash size={15} />
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              No custom domains are configured.
+            </p>
+          )}
+          <form className="flex flex-col gap-2 sm:flex-row" onSubmit={addDomain}>
+            <Input
+              aria-label="Domain name"
+              placeholder="app.example.com"
+              value={domainDraft}
+              onChange={(event) => setDomainDraft(event.target.value)}
+              disabled={pending}
+            />
+            <Button type="submit" variant="outline" disabled={pending}>
+              <IconCirclePlus data-icon="inline-start" /> Add domain
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+
+      <Card className="border-border/80 bg-white">
+        <CardHeader className="flex-row items-start gap-3 border-b border-border/60 pb-4">
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[#f5f6f4] text-muted-foreground">
+            <IconKey size={18} />
+          </span>
+          <div>
+            <CardTitle className="text-sm">Runtime environment secrets</CardTitle>
+            <CardDescription className="mt-1 leading-5">
+              Harbor stores values server-side and shows key names only. Updates
+              take effect on the next deployment.
+            </CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4 pt-4">
+          {current.environmentKeys.length > 0 ? (
+            <ul className="space-y-2" aria-label="Environment variable keys">
+              {current.environmentKeys.map((key) => (
+                <li
+                  key={key}
+                  className="flex items-center justify-between gap-3 rounded-lg border border-border/70 px-3 py-2"
+                >
+                  <code className="truncate text-xs">{key}</code>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled={pending}
+                    onClick={() =>
+                      updateMutation.mutate({ removeEnvironment: [key] })
+                    }
+                    aria-label={`Remove ${key}`}
+                  >
+                    <IconTrash size={15} />
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              No environment secrets are configured.
+            </p>
+          )}
+          <form className="grid gap-3 sm:grid-cols-[minmax(120px,0.7fr)_minmax(180px,1fr)_auto] sm:items-end" onSubmit={saveEnvironment}>
+            <div className="space-y-2">
+              <Label htmlFor="environment-key">Key</Label>
+              <Input
+                id="environment-key"
+                autoComplete="off"
+                placeholder="API_TOKEN"
+                value={environmentKey}
+                onChange={(event) => setEnvironmentKey(event.target.value)}
+                disabled={pending}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="environment-value">Value</Label>
+              <Input
+                id="environment-value"
+                type="password"
+                autoComplete="new-password"
+                placeholder="Enter secret value"
+                value={environmentValue}
+                onChange={(event) => setEnvironmentValue(event.target.value)}
+                disabled={pending}
+              />
+            </div>
+            <Button type="submit" variant="outline" disabled={pending}>
+              Save secret
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+
+      <Card className="border-border/80 bg-white">
+        <CardHeader className="border-b border-border/60 pb-4">
+          <CardTitle className="text-sm">Runtime resource limits</CardTitle>
+          <CardDescription className="mt-1 leading-5">
+            These limits are used by the next deployment.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="pt-4">
+          <form className="grid gap-3 sm:grid-cols-4 sm:items-end" onSubmit={saveResources}>
+            <div className="space-y-2">
+              <Label htmlFor="memory-limit">Memory</Label>
+              <Input
+                id="memory-limit"
+                placeholder="128Mi"
+                value={memoryLimit}
+                onChange={(event) => setMemoryLimit(event.target.value)}
+                disabled={pending}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="cpu-quota">CPU quota (vCPU)</Label>
+              <Input
+                id="cpu-quota"
+                type="number"
+                min="0.01"
+                step="0.01"
+                value={cpuQuota}
+                onChange={(event) => setCpuQuota(event.target.value)}
+                disabled={pending}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="tasks-limit">Task limit</Label>
+              <Input
+                id="tasks-limit"
+                type="number"
+                min="1"
+                step="1"
+                value={tasksLimit}
+                onChange={(event) => setTasksLimit(event.target.value)}
+                disabled={pending}
+              />
+            </div>
+            <Button type="submit" disabled={pending}>
+              {pending ? "Saving…" : "Save limits"}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+
+      {message ? (
+        <p role="alert" className="rounded-lg border border-[#edc8c5] bg-[#fcf0ef] px-3 py-2.5 text-sm text-[#a4463f]">
+          {message}
+        </p>
+      ) : null}
+    </div>
+  )
+}

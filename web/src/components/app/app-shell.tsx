@@ -5,9 +5,13 @@ import {
   IconSettings,
   IconShip,
 } from "@tabler/icons-react"
-import { Link, useRouterState } from "@tanstack/react-router"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { Link, useRouter, useRouterState } from "@tanstack/react-router"
 import type { ReactNode } from "react"
-import { buttonVariants } from "@/components/ui/button"
+import { toast } from "sonner"
+import { Button, buttonVariants } from "@/components/ui/button"
+import { logout } from "@/lib/auth.functions"
+import { authQueryOptions } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 
 const navigation = [
@@ -39,9 +43,26 @@ const navigation = [
 ] as const
 
 export function AppShell({ children }: { children: ReactNode }) {
+  const router = useRouter()
+  const queryClient = useQueryClient()
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
   })
+  const auth = useQuery(authQueryOptions())
+  const logoutMutation = useMutation({
+    mutationFn: () => logout(),
+    onSuccess: async () => {
+      await queryClient.clear()
+      await router.navigate({ to: "/login" })
+    },
+    onError: (error) => toast.error(error.message || "Could not sign out."),
+  })
+
+  if (pathname === "/login") {
+    return (
+      <div className="min-h-svh bg-[#f8f9f8] text-foreground">{children}</div>
+    )
+  }
 
   return (
     <div className="min-h-svh bg-[#f8f9f8] text-foreground">
@@ -83,9 +104,21 @@ export function AppShell({ children }: { children: ReactNode }) {
         <header className="sticky top-0 z-20 border-b border-border/70 bg-white/90 px-4 py-3 backdrop-blur md:hidden">
           <div className="flex items-center justify-between gap-3">
             <Brand compact />
-            <Link to="/new" className={buttonVariants({ size: "sm" })}>
-              Import project
-            </Link>
+            <div className="flex items-center gap-2">
+              {auth.data?.mode === "public" ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => logoutMutation.mutate()}
+                  disabled={logoutMutation.isPending}
+                >
+                  {logoutMutation.isPending ? "Signing out…" : "Sign out"}
+                </Button>
+              ) : null}
+              <Link to="/new" className={buttonVariants({ size: "sm" })}>
+                Import project
+              </Link>
+            </div>
           </div>
           <nav
             aria-label="Main navigation"
@@ -114,8 +147,19 @@ export function AppShell({ children }: { children: ReactNode }) {
           </nav>
         </header>
 
-        <header className="hidden h-14 items-center justify-end border-b border-border/70 bg-white/80 px-8 md:flex">
-          <span className="text-[11px] text-muted-foreground">Local</span>
+        <header className="hidden h-14 items-center justify-end gap-3 border-b border-border/70 bg-white/80 px-8 md:flex">
+          {auth.data?.mode === "public" ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => logoutMutation.mutate()}
+              disabled={logoutMutation.isPending}
+            >
+              {logoutMutation.isPending ? "Signing out…" : "Sign out"}
+            </Button>
+          ) : (
+            <span className="text-[11px] text-muted-foreground">Local</span>
+          )}
         </header>
 
         <main className="mx-auto min-h-[calc(100svh-57px)] w-full max-w-[1440px] px-4 py-7 sm:px-6 lg:px-9 lg:py-9">

@@ -40,6 +40,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { formatDate, shortHash } from "@/components/app/format"
 import { PageError, PageLoading } from "@/components/app/page-state"
 import { StatusBadge } from "@/components/app/status-badge"
+import { ProjectSettings } from "@/components/app/project-settings"
 import { appQueryOptions, overviewQueryOptions } from "@/lib/queries"
 import { rollbackApp, stopApp } from "@/lib/harbor.functions"
 import type { ReleaseView } from "@/lib/types"
@@ -319,6 +320,9 @@ function ProjectDetailPage() {
                 <IconTerminal2 size={14} />
                 Logs
               </TabsTrigger>
+              <TabsTrigger value="settings" className="flex-none px-2.5">
+                Settings
+              </TabsTrigger>
             </TabsList>
             <span className="pb-2 text-[11px] text-muted-foreground">
               {releases.length} {releases.length === 1 ? "release" : "releases"}
@@ -353,6 +357,13 @@ function ProjectDetailPage() {
                 </CardContent>
               </Card>
             )}
+          </TabsContent>
+          <TabsContent value="settings">
+            <ProjectSettings
+              name={name}
+              settings={details.data.settings}
+              onSaved={async () => refresh()}
+            />
           </TabsContent>
         </Tabs>
       </section>

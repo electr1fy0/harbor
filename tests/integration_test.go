@@ -304,7 +304,15 @@ func TestDeploymentLifecycle(t *testing.T) {
 	if got := call("inspect", "hello", "", true).Deployment.State; got != model.Stopped {
 		t.Fatalf("stop state=%s", got)
 	}
-	// Persistence is observable after a clean daemon restart.
+	// A desired-running app recovers its immutable artifact after a graceful
+	// daemon restart, even when its original source tree has been removed.
+	recoverySource := source("hello-go", "recovery-source")
+	recovery := call("deploy", "recovery", recoverySource, true).Deployment
+	if err := os.RemoveAll(recoverySource); err != nil {
+		t.Fatal(err)
+	}
+	// Persistence and explicit stop intent are observable after a clean daemon
+	// restart: recovery starts again, while hello remains stopped.
 	stop()
 	start()
 	address = ready()
@@ -313,6 +321,13 @@ func TestDeploymentLifecycle(t *testing.T) {
 		t.Fatalf("state lost on restart: %+v", persisted)
 	}
 	route(address, "hello.localhost", 404)
+	recovered := call("inspect", "recovery", "", true).Deployment
+	if recovered.State != model.Running || recovered.ReleaseID != recovery.ReleaseID || recovered.ID == recovery.ID || recovered.PID == recovery.PID {
+		t.Fatalf("immutable release was not recovered into a new runtime: before=%+v after=%+v", recovery, recovered)
+	}
+	if body := route(address, "recovery.localhost", 200); !strings.Contains(body, "hello from harbor") {
+		t.Fatalf("recovered route did not serve immutable artifact: %s", body)
+	}
 	// Real process death must withdraw its route and become CRASHED.
 	crash := call("deploy", "crash", source("hello-go", "crash-source"), true).Deployment
 	if err := syscall.Kill(crash.PID, syscall.SIGKILL); err != nil {
@@ -329,10 +344,15 @@ func TestDeploymentLifecycle(t *testing.T) {
 		t.Fatal("crash not recorded")
 	}
 	route(address, "crash.localhost", 404)
-	// A hard daemon death kills the direct Linux runtime. Restart must not
-	// advertise the old session as RUNNING or restore its route.
+	// A hard daemon death kills the direct Linux runtime. Desired-running apps
+	// are restarted from their immutable release, while explicit stops remain
+	// stopped across subsequent restarts.
 	if runtime.GOOS == "linux" {
-		orphan := call("deploy", "orphan", source("hello-go", "orphan-source"), true).Deployment
+		orphanSource := source("hello-go", "orphan-source")
+		orphan := call("deploy", "orphan", orphanSource, true).Deployment
+		if err := os.RemoveAll(orphanSource); err != nil {
+			t.Fatal(err)
+		}
 		_ = command.Process.Kill()
 		<-exited
 		command = nil
@@ -345,10 +365,14 @@ func TestDeploymentLifecycle(t *testing.T) {
 		}
 		start()
 		address = ready()
-		if call("inspect", "orphan", "", true).Deployment.State != model.Stopped {
-			t.Fatal("restart retained unverifiable runtime state")
+		recoveredOrphan := call("inspect", "orphan", "", true).Deployment
+		if recoveredOrphan.State != model.Running || recoveredOrphan.ReleaseID != orphan.ReleaseID || recoveredOrphan.ID == orphan.ID {
+			t.Fatalf("restart failed to recover orphaned app from immutable release: %+v", recoveredOrphan)
 		}
-		route(address, "orphan.localhost", 404)
+		route(address, "orphan.localhost", 200)
+		if call("inspect", "hello", "", true).Deployment.State != model.Stopped {
+			t.Fatal("explicitly stopped app was restarted after daemon crash")
+		}
 	}
 	// Use a short timeout with a real child process to prove build cancellation
 	// cleans up the process group/systemd unit, not just the HTTP request.

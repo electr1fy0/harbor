@@ -5,7 +5,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"syscall"
 	"testing"
 )
 
@@ -53,6 +57,53 @@ func TestServerDoesNotOverwriteRegularFile(t *testing.T) {
 	}
 	if string(body) != "keep me" {
 		t.Fatalf("regular file changed to %q", body)
+	}
+}
+
+func TestSocketGroupAccessIsExplicitAndValidated(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets are unavailable on Windows")
+	}
+	if _, err := NewServerWithSocketGroup(filepath.Join(t.TempDir(), "bad.sock"), "paas-group-that-does-not-exist"); err == nil {
+		t.Fatal("unknown socket group was accepted")
+	}
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := user.LookupGroupId(current.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shortDir, err := os.MkdirTemp("/tmp", "pg-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(shortDir)
+	socketPath := filepath.Join(shortDir, "g.sock")
+	server, err := NewServerWithSocketGroup(socketPath, group.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := server.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	info, err := os.Stat(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0660 {
+		t.Fatalf("group socket permissions = %04o, want 0660", info.Mode().Perm())
+	}
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	wantGID, err := strconv.Atoi(current.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || int(sys.Gid) != wantGID {
+		t.Fatalf("socket group id = %#v, want %s", info.Sys(), current.Gid)
 	}
 }
 

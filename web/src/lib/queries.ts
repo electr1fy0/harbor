@@ -1,5 +1,15 @@
 import { queryOptions } from "@tanstack/react-query"
+import { getAuthStatus } from "./auth.functions"
 import { getApp, getOverview, listGitHubRepos } from "./harbor.functions"
+
+export function authQueryOptions() {
+  return queryOptions({
+    queryKey: ["harbor", "auth"] as const,
+    queryFn: () => getAuthStatus(),
+    staleTime: 30_000,
+    retry: false,
+  })
+}
 
 export function overviewQueryOptions() {
   return queryOptions({

@@ -28,8 +28,10 @@ import (
 
 func main() {
 	socket := flag.String("socket", daemon.DefaultSocketPath, "Unix socket path")
+	socketGroup := flag.String("socket-group", "", "existing group granted access to the daemon socket")
 	data := flag.String("data-dir", "/var/lib/paas", "persistent data directory")
 	listen := flag.String("listen", "127.0.0.1:8080", "loopback router address")
+	tlsAskListen := flag.String("tls-ask-listen", "", "optional numeric loopback TLS authorization address")
 	buildUser := flag.String("build-user", "paas-build", "build user when daemon runs as root")
 	runtimeUser := flag.String("runtime-user", "paas-runtime", "runtime user when daemon runs as root")
 	buildTimeout := flag.Duration("build-timeout", 5*time.Minute, "maximum build duration")
@@ -78,7 +80,10 @@ func main() {
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		log.Fatalf("another daemon is using data directory %s: %v", dataDir, err)
 	}
-	server := daemon.NewServer(*socket)
+	server, err := daemon.NewServerWithSocketGroup(*socket, *socketGroup)
+	if err != nil {
+		log.Fatal(err)
+	}
 	listener, err := server.Listen()
 	if err != nil {
 		log.Fatal(err)
@@ -111,13 +116,36 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	runtimeMgr := runtime.NewManager(dataDir)
-	svcManager := service.NewManager(db, runtimeMgr, sb, dataDir)
 	routerListener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		_ = deploySvc.Close()
 		log.Fatal(err)
 	}
+	askServer, askListener, err := listenTLSAsk(*tlsAskListen, deploySvc)
+	if err != nil {
+		_ = routerListener.Close()
+		_ = deploySvc.Close()
+		log.Fatal(err)
+	}
+	if askListener != nil {
+		defer askListener.Close()
+	}
+	runtimeMgr := runtime.NewManager(dataDir)
+	svcManager := service.NewManager(db, runtimeMgr, sb, dataDir)
+	serviceCtx, serviceCancel := context.WithTimeout(context.Background(), time.Minute)
+	serviceRestoreErr := svcManager.Restore(serviceCtx)
+	serviceCancel()
+	if serviceRestoreErr != nil {
+		log.Printf("restore managed services: %v", serviceRestoreErr)
+	}
+	// Recover every independent app even when a managed-service restore failed.
+	// Deployment checks each binding's persisted READY state, so dependent apps
+	// keep desired_running set and record a failed recovery candidate for retry.
+	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	if err := deploySvc.Recover(recoveryCtx); err != nil {
+		log.Printf("recover applications: %v", err)
+	}
+	recoveryCancel()
 	routerServer := &http.Server{Handler: hostRouter, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 
 	server = daemon.NewPlatformServerWithServicesAndBuildUser(*socket, deploySvc, svcManager, *buildUser, routerListener.Addr().String())
@@ -130,6 +158,11 @@ func main() {
 	defer signal.Stop(signals)
 	routerDone := make(chan error, 1)
 	go func() { routerDone <- routerServer.Serve(routerListener) }()
+	var askDone chan error
+	if askServer != nil {
+		askDone = make(chan error, 1)
+		go func() { askDone <- askServer.Serve(askListener) }()
+	}
 	log.Printf("paasd ready: socket=%s router=http://%s data=%s", server.SocketPath(), routerListener.Addr(), dataDir)
 
 	select {
@@ -139,16 +172,26 @@ func main() {
 		}
 	case err := <-routerDone:
 		log.Printf("router: %v", err)
+	case err := <-askDone:
+		log.Printf("TLS authorization: %v", err)
 	case sig := <-signals:
 		log.Printf("received %s; shutting down", sig)
 	}
 	if err := deploySvc.Close(); err != nil {
 		log.Printf("stop runtimes: %v", err)
 	}
+	serviceCloseCtx, serviceCloseCancel := context.WithTimeout(context.Background(), time.Minute)
+	if err := svcManager.Close(serviceCloseCtx); err != nil {
+		log.Printf("stop managed services: %v", err)
+	}
+	serviceCloseCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "shutdown daemon: %v\n", err)
 	}
 	_ = routerServer.Shutdown(ctx)
+	if askServer != nil {
+		_ = askServer.Shutdown(ctx)
+	}
 }

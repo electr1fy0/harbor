@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -22,6 +24,7 @@ const DefaultSocketPath = "/run/paas/paasd.sock"
 // Server serves the daemon API over a Unix-domain socket.
 type Server struct {
 	socketPath string
+	socketGID  int
 	http       *http.Server
 }
 
@@ -44,8 +47,28 @@ func NewServer(socketPath string) *Server {
 
 	return &Server{
 		socketPath: socketPath,
+		socketGID:  -1,
 		http:       &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second},
 	}
+}
+
+// NewServerWithSocketGroup enables owner-and-group access after validating an
+// existing system group. An empty group retains the owner-only default.
+func NewServerWithSocketGroup(socketPath, group string) (*Server, error) {
+	server := NewServer(socketPath)
+	if group == "" {
+		return server, nil
+	}
+	entry, err := user.LookupGroup(group)
+	if err != nil {
+		return nil, fmt.Errorf("look up socket group %q: %w", group, err)
+	}
+	gid, err := strconv.Atoi(entry.Gid)
+	if err != nil || gid < 0 {
+		return nil, fmt.Errorf("socket group %q has an invalid group id", group)
+	}
+	server.socketGID = gid
+	return server, nil
 }
 
 // SocketPath returns the configured Unix socket path.
@@ -81,8 +104,18 @@ func (s *Server) Listen() (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on daemon socket: %w", err)
 	}
-	if err := os.Chmod(s.socketPath, 0600); err != nil {
+	mode := os.FileMode(0600)
+	if s.socketGID >= 0 {
+		if err := os.Chown(s.socketPath, -1, s.socketGID); err != nil {
+			_ = listener.Close()
+			_ = os.Remove(s.socketPath)
+			return nil, fmt.Errorf("set daemon socket group: %w", err)
+		}
+		mode = 0660
+	}
+	if err := os.Chmod(s.socketPath, mode); err != nil {
 		_ = listener.Close()
+		_ = os.Remove(s.socketPath)
 		return nil, err
 	}
 	return listener, nil

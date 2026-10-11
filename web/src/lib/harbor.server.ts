@@ -3,6 +3,7 @@ import { request as httpRequest } from "node:http"
 import { env } from "node:process"
 import type {
   AppDetails,
+  AppSettings,
   AppView,
   Deployment,
   DeploymentResult,
@@ -12,6 +13,7 @@ import type {
   ReleaseView,
   Service,
 } from "./types"
+import type { ConfigureAppInput } from "./validation"
 
 const DEFAULT_SOCKET_PATH = "/run/paas/paasd.sock"
 const MAX_DAEMON_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -210,6 +212,49 @@ function mapRelease(value: unknown): ReleaseView {
   }
 }
 
+function safeDomain(value: unknown): string {
+  const candidate = safeString(value, 253).toLowerCase()
+  return /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(
+    candidate
+  )
+    ? candidate
+    : ""
+}
+
+function mapSettings(value: unknown): AppSettings {
+  if (!isObject(value)) {
+    throw new HarborOperationError("Harbor returned invalid app settings.")
+  }
+  const settings = isObject(value.settings)
+    ? value.settings
+    : isObject(value.Settings)
+      ? value.Settings
+      : value
+  const domains = arrayValue(settings.domains ?? settings.Domains)
+    .map(safeDomain)
+    .filter(Boolean)
+  const environmentKeys = arrayValue(
+    settings.environmentKeys ?? settings.EnvironmentKeys
+  )
+    .map((key) => safeString(key, 128))
+    .filter((key) => /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key))
+  return {
+    domains: [...new Set(domains)],
+    environmentKeys: [...new Set(environmentKeys)],
+    memoryLimit: safeString(settings.memoryLimit ?? settings.MemoryLimit, 64),
+    cpuQuota: safeNumber(settings.cpuQuota ?? settings.CPUQuota),
+    tasksLimit: safeNumber(settings.tasksLimit ?? settings.TasksLimit),
+  }
+}
+
+const emptySettings: AppSettings = {
+  domains: [],
+  environmentKeys: [],
+  memoryLimit: "",
+  cpuQuota: 0,
+  tasksLimit: 0,
+}
+
 function sanitizeLogs(value: unknown): string {
   if (typeof value !== "string") return ""
   return value
@@ -350,13 +395,13 @@ async function daemonCall(
     translateTransportError(error)
   }
 
+  if (response.statusCode === 404) throw new HarborNotFoundError()
   const payload = parseDaemonJson(response)
   const hasOperationError =
     response.statusCode < 200 ||
     response.statusCode >= 300 ||
     (typeof payload.Error === "string" && payload.Error.length > 0)
 
-  if (response.statusCode === 404) throw new HarborNotFoundError()
   if (
     hasOperationError &&
     !(allowDeploymentError && isObject(payload.Deployment))
@@ -366,7 +411,11 @@ async function daemonCall(
   return payload
 }
 
-function safeRouteUrl(value: unknown, deployment: Deployment | null): string {
+function safeRouteUrl(
+  value: unknown,
+  deployment: Deployment | null,
+  domains: string[] = []
+): string {
   if (!deployment || deployment.State !== "RUNNING" || !deployment.AppName) {
     return ""
   }
@@ -374,9 +423,6 @@ function safeRouteUrl(value: unknown, deployment: Deployment | null): string {
   try {
     const parsed = new URL(value)
     if (
-      parsed.protocol !== "http:" ||
-      parsed.hostname !== `${deployment.AppName}.localhost` ||
-      !parsed.port ||
       parsed.username ||
       parsed.password ||
       parsed.pathname !== "/" ||
@@ -385,12 +431,73 @@ function safeRouteUrl(value: unknown, deployment: Deployment | null): string {
     ) {
       return ""
     }
+
+    if (
+      parsed.protocol === "https:" &&
+      domains.includes(parsed.hostname.toLowerCase()) &&
+      (!parsed.port || parsed.port === "443")
+    ) {
+      return parsed.origin
+    }
+    if (
+      parsed.protocol !== "http:" ||
+      parsed.hostname !== `${deployment.AppName}.localhost` ||
+      !parsed.port
+    ) {
+      return ""
+    }
+
     const port = Number(parsed.port)
     if (!Number.isInteger(port) || port < 1 || port > 65535) return ""
     return parsed.origin
   } catch {
     return ""
   }
+}
+
+function configuredHTTPSUrl(
+  deployment: Deployment | null,
+  domains: string[]
+): string {
+  if (!deployment || deployment.State !== "RUNNING") return ""
+  const domain = domains[0]
+  return domain ? `https://${domain}` : ""
+}
+
+export async function getAppSettingsData(name: string): Promise<AppSettings> {
+  const response = await daemonCall(
+    "/settings",
+    { Name: name },
+    DEFAULT_TIMEOUT_MS,
+    "Could not load app settings."
+  )
+  return mapSettings(response)
+}
+
+export async function configureAppData(
+  input: ConfigureAppInput
+): Promise<AppSettings> {
+  const response = await daemonCall(
+    "/configure",
+    {
+      Name: input.name,
+      ...(input.environment !== undefined
+        ? { Environment: input.environment }
+        : {}),
+      ...(input.removeEnvironment !== undefined
+        ? { RemoveEnvironment: input.removeEnvironment }
+        : {}),
+      ...(input.domains !== undefined ? { Domains: input.domains } : {}),
+      ...(input.memoryLimit !== undefined
+        ? { MemoryLimit: input.memoryLimit }
+        : {}),
+      ...(input.cpuQuota !== undefined ? { CPUQuota: input.cpuQuota } : {}),
+      ...(input.tasksLimit !== undefined ? { TasksLimit: input.tasksLimit } : {}),
+    },
+    DEFAULT_TIMEOUT_MS,
+    "Could not update app settings."
+  )
+  return mapSettings(response)
 }
 
 async function getActiveRouteUrl(name: string): Promise<string> {
@@ -401,7 +508,12 @@ async function getActiveRouteUrl(name: string): Promise<string> {
       DEFAULT_TIMEOUT_MS,
       "Could not inspect the active app route."
     )
-    return safeRouteUrl(response.URL, mapDeployment(response.Deployment))
+    const deployment = mapDeployment(response.Deployment)
+    const settings = await getAppSettingsData(name).catch(() => emptySettings)
+    return (
+      configuredHTTPSUrl(deployment, settings.domains) ||
+      safeRouteUrl(response.URL, deployment, settings.domains)
+    )
   } catch {
     return ""
   }
@@ -490,7 +602,7 @@ export async function getOverviewData(): Promise<Overview> {
 }
 
 export async function getAppData(name: string): Promise<AppDetails> {
-  const [inspectResult, releasesResult, logsResult] = await Promise.allSettled([
+  const [inspectResult, releasesResult, logsResult, settingsResult] = await Promise.allSettled([
     daemonCall(
       "/inspect",
       { Name: name },
@@ -509,10 +621,11 @@ export async function getAppData(name: string): Promise<AppDetails> {
       DEFAULT_TIMEOUT_MS,
       "Could not load app logs."
     ),
+    getAppSettingsData(name),
   ])
 
   if (
-    [inspectResult, releasesResult, logsResult].some(
+    [inspectResult, releasesResult, logsResult, settingsResult].some(
       (result) =>
         result.status === "rejected" && isTransportFailure(result.reason)
     )
@@ -538,19 +651,30 @@ export async function getAppData(name: string): Promise<AppDetails> {
   ) {
     throw new HarborOperationError("Could not load app logs.")
   }
+  if (
+    settingsResult.status === "rejected" &&
+    !(settingsResult.reason instanceof HarborNotFoundError)
+  ) {
+    throw new HarborOperationError("Could not load app settings.")
+  }
 
   const inspect =
     inspectResult.status === "fulfilled" ? inspectResult.value : null
   const releases =
     releasesResult.status === "fulfilled" ? releasesResult.value : null
   const logs = logsResult.status === "fulfilled" ? logsResult.value : null
+  const settings =
+    settingsResult.status === "fulfilled" ? settingsResult.value : emptySettings
   const deployment = inspect ? mapDeployment(inspect.Deployment) : null
 
   return {
     deployment,
     releases: arrayValue(releases?.Releases).map(mapRelease),
     logs: sanitizeLogs(logs?.Logs),
-    url: safeRouteUrl(inspect?.URL, deployment),
+    url:
+      configuredHTTPSUrl(deployment, settings.domains) ||
+      safeRouteUrl(inspect?.URL, deployment, settings.domains),
+    settings,
   }
 }
 
@@ -578,9 +702,7 @@ export async function deployAppData(input: {
   }
   return {
     deployment,
-    url:
-      safeRouteUrl(response.URL, deployment) ||
-      (await getActiveRouteUrl(input.name)),
+    url: await getPublicOrLocalRouteUrl(input.name, response.URL, deployment),
   }
 }
 
@@ -597,8 +719,7 @@ export async function stopAppData(name: string): Promise<DeploymentResult> {
   }
   return {
     deployment,
-    url:
-      safeRouteUrl(response.URL, deployment) || (await getActiveRouteUrl(name)),
+    url: await getPublicOrLocalRouteUrl(name, response.URL, deployment),
   }
 }
 
@@ -619,8 +740,21 @@ export async function rollbackAppData(
   }
   return {
     deployment,
-    url: safeRouteUrl(response.URL, deployment),
+    url: await getPublicOrLocalRouteUrl(name, response.URL, deployment),
   }
+}
+
+async function getPublicOrLocalRouteUrl(
+  name: string,
+  value: unknown,
+  deployment: Deployment | null
+): Promise<string> {
+  const settings = await getAppSettingsData(name).catch(() => emptySettings)
+  return (
+    configuredHTTPSUrl(deployment, settings.domains) ||
+    safeRouteUrl(value, deployment, settings.domains) ||
+    (await getActiveRouteUrl(name))
+  )
 }
 
 async function readLimitedJson(response: Response): Promise<unknown> {

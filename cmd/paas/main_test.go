@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -263,7 +264,7 @@ func TestRunCommands(t *testing.T) {
 			if call.err != nil {
 				t.Fatalf("decode request: %v", call.err)
 			}
-			if call.command != test.wantCommand || call.request != test.wantRequest {
+			if call.command != test.wantCommand || !reflect.DeepEqual(call.request, test.wantRequest) {
 				t.Fatalf("daemon call = (%q, %#v), want (%q, %#v)", call.command, call.request, test.wantCommand, test.wantRequest)
 			}
 		})
@@ -285,6 +286,40 @@ func TestRunRollbackFailureShowsError(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "paas rollback: no previous release available for rollback") {
 		t.Fatalf("stderr = %q, want 'paas rollback:' prefix", stderr.String())
+	}
+}
+
+func TestRunConfigureReadsSecretsFromStdinAndPrintsMetadata(t *testing.T) {
+	secret := "cli-secret-value"
+	received := make(chan daemon.Request, 1)
+	socket := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/configure" {
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		var request daemon.Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		received <- request
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(daemon.Response{Settings: &model.Settings{
+			Domains: []string{"app.example.com"}, EnvironmentKeys: []string{"TOKEN"},
+			MemoryLimit: "128Mi", CPUQuota: 0.5, TasksLimit: 32,
+		}})
+	}))
+	var stdout, stderr bytes.Buffer
+	args := []string{"-socket", socket, "configure", "sample", "--env-stdin", "--domain", "app.example.com", "--memory", "128Mi", "--cpu", "0.5", "--tasks", "32"}
+	if code := runWithInput(args, strings.NewReader("TOKEN="+secret+"\n"), &stdout, &stderr); code != 0 {
+		t.Fatalf("runWithInput() code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	request := <-received
+	if request.Name != "sample" || request.Environment["TOKEN"] != secret || request.Domains == nil || len(*request.Domains) != 1 || (*request.Domains)[0] != "app.example.com" {
+		t.Fatalf("configure request = %#v", request)
+	}
+	if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) || !strings.Contains(stdout.String(), "TOKEN") || !strings.Contains(stdout.String(), "app.example.com") {
+		t.Fatalf("configure CLI output leaked or omitted metadata: stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 
