@@ -171,3 +171,39 @@ export interface CapacitySnapshot {
   }
   caveats: string[]
 }
+
+export interface GitHubConnection {
+  connected: boolean
+  login?: string
+  connectedAt?: string
+}
+
+export interface OnboardingConfig {
+  runtime: "go" | "node"
+  buildCommand: string
+  startCommand: string
+  healthPath: string
+  memoryLimit: string
+  cpuQuota: number
+  tasksLimit: number
+}
+
+export interface ProjectInspection {
+  existingConfig: boolean
+  config: OnboardingConfig
+  environmentKeys: string[]
+  warnings: string[]
+}
+
+export interface DeploymentJob {
+  id: string
+  name: string
+  state:
+    "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLING" | "CANCELED"
+  stage: string
+  createdAt: string
+  updatedAt: string
+  deployment?: Deployment | null
+  error?: string
+  logs: string[]
+}

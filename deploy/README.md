@@ -43,8 +43,9 @@ Set `PAASD_PUBLIC_ORIGIN` to the exact dashboard origin (for example
 encoded as 64 lowercase hexadecimal characters. Generate it with
 `openssl rand -hex 32`. Keep `/etc/harbor/harbor.env` root-owned and readable
 only by root and `paas-admins`; never put the password itself in the file,
-command line, or source tree. Also configure the optional `GITHUB_TOKEN` there
-if the web dashboard should browse private repositories.
+command line, or source tree. Connect a GitHub personal access token through the dashboard to browse and clone
+private repositories. Harbor stores it encrypted in the daemon data directory;
+see [GitHub onboarding](../docs/onboarding.md) for repository permissions.
 
 Public mode locks the dashboard if any auth variable is set without all valid
 values. With all three auth variables unset, only loopback requests are

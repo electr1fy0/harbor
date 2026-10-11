@@ -61,7 +61,7 @@ func TestRootCheckoutAskpassIsExecutableAndRootOwned(t *testing.T) {
 	root := t.TempDir()
 	git := &fakeGit{}
 	selected, cleanup, err := (githubSource{run: git.run, timeout: time.Second, tempDir: root, buildUser: "nobody"}).checkout(
-		context.Background(), "https://github.com/example/private", "", "app",
+		context.Background(), "https://github.com/example/private", "", "app", "ghp_root_test_secret",
 	)
 	if err != nil {
 		t.Fatalf("checkout: %v", err)

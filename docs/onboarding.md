@@ -1,0 +1,13 @@
+# GitHub onboarding
+
+Harbor can browse repositories from a connected GitHub account or clone a public repository URL without a connection. For private repositories, connect a personal access token in the web interface. Harbor validates it against GitHub, stores it encrypted in its private data directory, and returns only the account name and connection time. The key and encrypted record are separate files with owner-only permissions. Disconnect removes both files.
+
+For a fine-grained personal access token, select only the repositories Harbor needs. Grant **Metadata: read** to list repository names and visibility. Grant **Contents: read** to clone selected private repositories. Organization owners may need to approve the token. A classic token also works when its repository access is sufficient, but fine-grained tokens allow narrower repository selection.
+
+GitHub's `GET /user/repos` endpoint requires the fine-grained token's Metadata repository permission with read access. Harbor uses REST API version `2026-03-10`. See [repository REST endpoints](https://docs.github.com/en/rest/repos/repos) and [fine-grained token permission requirements](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens).
+
+The repository is cloned to a temporary checkout for inspection and deployment. Harbor never writes the generated `paas.yaml` back to the GitHub repository. An existing repository `paas.yaml` remains authoritative; otherwise Harbor detects supported Go and Node layouts and lets you review the generated build, start, health, and resource settings before deployment. Sample `.env.example` and `.env.sample` files contribute variable names only. Values are entered through Harbor's settings path and are never returned to the browser after saving.
+
+Deployments run as asynchronous jobs. The job API is `POST /jobs/deploy`, `GET /jobs/{id}`, and `DELETE /jobs/{id}`. Job progress is held in daemon memory, so a daemon restart can make an in-flight job's status unavailable. GitHub source details needed for a retry are stored separately from application secrets. `POST /jobs/redeploy` re-clones the saved repository and reads the current `paas.yaml`; it does not replace saved runtime overrides or environment values.
+
+The optional PostgreSQL step can create a managed service or bind an existing READY service. Harbor injects the private `DATABASE_URL` into the application runtime; credentials are not shown in the onboarding response.

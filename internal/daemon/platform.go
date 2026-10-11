@@ -13,6 +13,7 @@ import (
 	"paas/internal/config"
 	"paas/internal/deployment"
 	"paas/internal/model"
+	"paas/internal/onboarding"
 	"paas/internal/source"
 	"paas/internal/store"
 )
@@ -44,6 +45,7 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 		dataDir = service.CapacityDataDir()
 	}
 	capacityCollector := capacitymetrics.New(dataDir)
+	server.onboardingJobs = onboarding.NewManager(service, services, buildUser)
 	ping := server.http.Handler
 	mux := http.NewServeMux()
 	mux.Handle("/ping", ping)
@@ -211,6 +213,7 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 			writeResponse(w, command, output)
 		})
 	}
+	registerOnboardingRoutes(mux, server)
 	server.http.Handler = mux
 	return server
 }

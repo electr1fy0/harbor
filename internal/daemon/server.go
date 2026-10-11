@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"paas/internal/onboarding"
 )
 
 // DefaultSocketPath is the target Linux control-plane socket from the build
@@ -23,9 +25,10 @@ const DefaultSocketPath = "/run/paas/paasd.sock"
 
 // Server serves the daemon API over a Unix-domain socket.
 type Server struct {
-	socketPath string
-	socketGID  int
-	http       *http.Server
+	socketPath     string
+	socketGID      int
+	http           *http.Server
+	onboardingJobs *onboarding.Manager
 }
 
 // NewServer creates a daemon server. An empty path uses DefaultSocketPath.
@@ -133,5 +136,9 @@ func (s *Server) Serve(listener net.Listener) error {
 
 // Shutdown gracefully stops the HTTP server.
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.http.Shutdown(ctx)
+	var jobErr error
+	if s.onboardingJobs != nil {
+		jobErr = s.onboardingJobs.Close(ctx)
+	}
+	return errors.Join(jobErr, s.http.Shutdown(ctx))
 }

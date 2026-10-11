@@ -8,19 +8,27 @@ import type {
   CapacitySnapshot,
   Deployment,
   DeploymentResult,
+  DeploymentJob,
   GitHubBranch,
+  GitHubConnection,
   GitHubRepo,
   Overview,
+  ProjectInspection,
   ReleaseView,
   Service,
 } from "./types"
-import type { ConfigureAppInput } from "./validation"
+import type {
+  ConfigureAppInput,
+  InspectProjectInput,
+  SubmitOnboardingJobInput,
+} from "./validation"
 
 const DEFAULT_SOCKET_PATH = "/run/paas/paasd.sock"
 const MAX_DAEMON_RESPONSE_BYTES = 4 * 1024 * 1024
 const MAX_GITHUB_RESPONSE_BYTES = 2 * 1024 * 1024
 const DEFAULT_TIMEOUT_MS = 15_000
 const DEPLOY_TIMEOUT_MS = 10 * 60 * 1_000
+const ONBOARDING_PREFLIGHT_TIMEOUT_MS = 150_000
 const GITHUB_API_ORIGIN = "https://api.github.com"
 const SAFE_DAEMON_UNAVAILABLE = "Harbor daemon is unavailable."
 
@@ -387,7 +395,7 @@ function getSocketPath(): string {
 }
 
 function requestUnix(
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "DELETE",
   endpoint: string,
   body: string | undefined,
   timeoutMs: number
@@ -515,6 +523,33 @@ async function daemonCall(
     !(allowDeploymentError && isObject(payload.Deployment))
   ) {
     throw new HarborOperationError(safeErrorMessage)
+  }
+  return payload
+}
+
+async function onboardingDaemonCall(
+  method: "GET" | "POST" | "DELETE",
+  endpoint: string,
+  input: JsonObject | undefined,
+  timeoutMs: number
+): Promise<JsonObject> {
+  let response: UnixResponse
+  try {
+    response = await requestUnix(
+      method,
+      endpoint,
+      input === undefined ? undefined : JSON.stringify(input),
+      timeoutMs
+    )
+  } catch (error) {
+    translateTransportError(error)
+  }
+  const payload = parseDaemonJson(response)
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    const message = safeString(payload.error, 512)
+    throw new HarborOperationError(
+      message || "Harbor could not complete onboarding."
+    )
   }
   return payload
 }
@@ -829,6 +864,182 @@ export async function deployAppData(input: {
   }
 }
 
+function mapGitHubConnection(value: unknown): GitHubConnection {
+  if (!isObject(value))
+    throw new HarborOperationError(
+      "Harbor returned invalid GitHub connection data."
+    )
+  return {
+    connected: value.connected === true,
+    ...(typeof value.login === "string"
+      ? { login: safeString(value.login, 64) }
+      : {}),
+    ...(value.connectedAt ? { connectedAt: safeTime(value.connectedAt) } : {}),
+  }
+}
+
+function mapOnboardingConfig(value: unknown): ProjectInspection["config"] {
+  if (!isObject(value))
+    throw new HarborOperationError(
+      "Harbor returned invalid project configuration."
+    )
+  const runtime =
+    value.runtime === "go" || value.runtime === "node" ? value.runtime : null
+  if (!runtime)
+    throw new HarborOperationError(
+      "Harbor returned an unsupported project runtime."
+    )
+  return {
+    runtime,
+    buildCommand: safeString(value.buildCommand, 4096),
+    startCommand: safeString(value.startCommand, 4096),
+    healthPath: safeString(value.healthPath, 256),
+    memoryLimit: safeString(value.memoryLimit, 32),
+    cpuQuota: safeNumber(value.cpuQuota),
+    tasksLimit: safeNumber(value.tasksLimit),
+  }
+}
+
+function mapProjectInspection(value: unknown): ProjectInspection {
+  if (!isObject(value))
+    throw new HarborOperationError(
+      "Harbor returned invalid project inspection data."
+    )
+  return {
+    existingConfig: value.existingConfig === true,
+    config: mapOnboardingConfig(value.config),
+    environmentKeys: arrayValue(value.environmentKeys)
+      .map((key) => safeString(key, 128))
+      .filter((key) => /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)),
+    warnings: arrayValue(value.warnings)
+      .map((warning) => safeString(warning, 512))
+      .filter(Boolean),
+  }
+}
+
+const jobStates = new Set([
+  "QUEUED",
+  "RUNNING",
+  "SUCCEEDED",
+  "FAILED",
+  "CANCELLING",
+  "CANCELED",
+])
+function mapDeploymentJob(value: unknown): DeploymentJob {
+  if (!isObject(value))
+    throw new HarborOperationError(
+      "Harbor returned invalid deployment job data."
+    )
+  const stateValue = safeString(value.state, 24).toUpperCase()
+  const state = jobStates.has(stateValue)
+    ? (stateValue as DeploymentJob["state"])
+    : "FAILED"
+  const logs = arrayValue(value.logs)
+    .map((line) => sanitizeLogs(line))
+    .filter(Boolean)
+  return {
+    id: safeString(value.id, 64),
+    name: safeSlug(value.name),
+    state,
+    stage: safeString(value.stage, 32),
+    createdAt: safeTime(value.createdAt),
+    updatedAt: safeTime(value.updatedAt),
+    deployment: mapDeployment(value.deployment),
+    error: safeString(value.error, 512),
+    logs,
+  }
+}
+
+async function onboardingJobCall(
+  method: "GET" | "POST" | "DELETE",
+  endpoint: string,
+  input?: JsonObject,
+  timeoutMs = ONBOARDING_PREFLIGHT_TIMEOUT_MS
+): Promise<DeploymentJob> {
+  const response = await onboardingDaemonCall(
+    method,
+    endpoint,
+    input,
+    timeoutMs
+  )
+  return mapDeploymentJob(response.job)
+}
+
+export async function getGitHubConnectionData(): Promise<GitHubConnection> {
+  const response = await onboardingDaemonCall(
+    "GET",
+    "/github/connection",
+    undefined,
+    DEFAULT_TIMEOUT_MS
+  )
+  return mapGitHubConnection(response.connection)
+}
+
+export async function connectGitHubData(
+  token: string
+): Promise<GitHubConnection> {
+  const response = await onboardingDaemonCall(
+    "POST",
+    "/github/connection",
+    { token },
+    DEFAULT_TIMEOUT_MS
+  )
+  return mapGitHubConnection(response.connection)
+}
+
+export async function disconnectGitHubData(): Promise<GitHubConnection> {
+  const response = await onboardingDaemonCall(
+    "DELETE",
+    "/github/connection",
+    undefined,
+    DEFAULT_TIMEOUT_MS
+  )
+  return mapGitHubConnection(response.connection)
+}
+
+export async function inspectProjectData(
+  input: InspectProjectInput
+): Promise<ProjectInspection> {
+  const response = await onboardingDaemonCall(
+    "POST",
+    "/projects/inspect",
+    input,
+    ONBOARDING_PREFLIGHT_TIMEOUT_MS
+  )
+  return mapProjectInspection(response.inspection)
+}
+
+export async function submitOnboardingJobData(
+  input: SubmitOnboardingJobInput
+): Promise<DeploymentJob> {
+  return onboardingJobCall(
+    "POST",
+    "/jobs/deploy",
+    input,
+    ONBOARDING_PREFLIGHT_TIMEOUT_MS
+  )
+}
+
+export async function getOnboardingJobData(id: string): Promise<DeploymentJob> {
+  return onboardingJobCall(
+    "GET",
+    `/jobs/${encodeURIComponent(id)}`,
+    undefined,
+    DEFAULT_TIMEOUT_MS
+  )
+}
+
+export async function cancelOnboardingJobData(
+  id: string
+): Promise<DeploymentJob> {
+  return onboardingJobCall(
+    "DELETE",
+    `/jobs/${encodeURIComponent(id)}`,
+    undefined,
+    DEFAULT_TIMEOUT_MS
+  )
+}
+
 export async function stopAppData(name: string): Promise<DeploymentResult> {
   const response = await daemonCall(
     "/stop",
@@ -922,7 +1133,7 @@ async function githubRequest(path: string): Promise<unknown> {
       headers: {
         Accept: "application/vnd.github+json",
         "User-Agent": "Harbor",
-        "X-GitHub-Api-Version": "2022-11-28",
+        "X-GitHub-Api-Version": "2026-03-10",
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       redirect: "error",
@@ -981,32 +1192,68 @@ function mapGitHubRepo(value: unknown): GitHubRepo {
   }
 }
 
-export async function listGitHubReposData(
-  owner: string
-): Promise<GitHubRepo[]> {
-  const token = env.GITHUB_TOKEN?.trim()
-  const basePath = token
-    ? "/user/repos"
-    : `/users/${encodeURIComponent(owner)}/repos`
+export async function listGitHubReposData(owner = ""): Promise<GitHubRepo[]> {
+  const normalizedOwner = owner.trim()
+  let connected = false
+  try {
+    connected = (await getGitHubConnectionData()).connected
+  } catch {
+    /* Public listing remains available. */
+  }
+  if (connected) {
+    const response = await onboardingDaemonCall(
+      "GET",
+      "/github/repos",
+      undefined,
+      DEFAULT_TIMEOUT_MS
+    )
+    const repos = arrayValue(response.repositories).map((value) => {
+      if (!isObject(value))
+        throw new HarborOperationError(
+          "GitHub returned invalid repository data."
+        )
+      const [repoOwner, repoName, ...rest] = safeString(
+        value.fullName,
+        200
+      ).split("/")
+      if (rest.length || !repoOwner || !repoName)
+        throw new HarborOperationError(
+          "GitHub returned invalid repository data."
+        )
+      return mapGitHubRepo({
+        owner: { login: repoOwner },
+        name: repoName,
+        default_branch: value.defaultBranch,
+        description: value.description,
+        language: value.language,
+        private: value.private,
+        updated_at: value.updatedAt,
+      })
+    })
+    return normalizedOwner
+      ? repos.filter(
+          (repo) =>
+            repo.fullName.split("/")[0]?.toLowerCase() ===
+            normalizedOwner.toLowerCase()
+        )
+      : repos
+  }
+  if (
+    !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(normalizedOwner)
+  ) {
+    throw new HarborOperationError(
+      "Connect GitHub or enter an owner to browse public repositories."
+    )
+  }
   const repos: GitHubRepo[] = []
-
-  // Keep requests bounded while including more than the first GitHub page for
-  // accounts with a larger repository list.
-  for (let page = 1; page <= 10; page += 1) {
-    const result = await githubRequest(
-      `${basePath}?per_page=100&page=${page}&sort=updated`
+  for (let page = 1; page <= 10; page++) {
+    const response = await githubRequest(
+      `/users/${encodeURIComponent(normalizedOwner)}/repos?type=public&sort=updated&per_page=100&page=${page}`
     )
-    if (!Array.isArray(result)) {
-      throw new Error("GitHub returned invalid repository data.")
-    }
-    const pageRepos = result.map(mapGitHubRepo)
-    repos.push(
-      ...pageRepos.filter(
-        (repo) =>
-          repo.fullName.split("/")[0]?.toLowerCase() === owner.toLowerCase()
-      )
-    )
-    if (result.length < 100) break
+    if (!Array.isArray(response))
+      throw new HarborOperationError("GitHub returned invalid repository data.")
+    for (const item of response) repos.push(mapGitHubRepo(item))
+    if (response.length < 100) break
   }
   return repos
 }

@@ -55,6 +55,13 @@ type pendingDeploy struct {
 	done    chan struct{}
 }
 
+// DeploymentIdentity is the immutable app-scoped handle for one admitted
+// deployment attempt. It is safe to send to observers before the attempt ends.
+type DeploymentIdentity struct {
+	ID      string
+	AppName string
+}
+
 func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox, routes *router.HostRouter, opts Options) (*Service, error) {
 	if err := os.MkdirAll(filepath.Join(opts.DataDir, "logs"), 0700); err != nil {
 		return nil, err
@@ -195,6 +202,13 @@ func (s *Service) finishRetirement(d *model.Deployment) error {
 }
 
 func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.Deployment, error) {
+	return s.DeployWithObserver(ctx, sourceDir, name, nil)
+}
+
+// DeployWithObserver behaves like Deploy and reports the exact attempt after
+// its durable record is created. Existing synchronous callers keep using
+// Deploy; observers should copy only the identity they need.
+func (s *Service) DeployWithObserver(ctx context.Context, sourceDir, name string, observe func(DeploymentIdentity)) (*model.Deployment, error) {
 	cfg, err := config.Load(sourceDir)
 	if err != nil {
 		return nil, err
@@ -202,7 +216,7 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 	if name == "" {
 		name = cfg.Name
 	}
-	return s.deploy(ctx, sourceDir, name, cfg, nil)
+	return s.deployObserved(ctx, sourceDir, name, cfg, nil, observe)
 }
 
 func (s *Service) Rollback(ctx context.Context, name, targetReleaseID string) (*model.Deployment, error) {
@@ -232,6 +246,10 @@ func (s *Service) Recover(ctx context.Context) error {
 
 // deploy is the single candidate lifecycle for both builds and rollback.
 func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *config.Config, rollbackID *string) (*model.Deployment, error) {
+	return s.deployObserved(ctx, sourceDir, name, cfg, rollbackID, nil)
+}
+
+func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cfg *config.Config, rollbackID *string, observe func(DeploymentIdentity)) (*model.Deployment, error) {
 	if !config.ValidName(name) {
 		return nil, fmt.Errorf("invalid application name %q", name)
 	}
@@ -333,6 +351,9 @@ func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *confi
 	d.MemoryLimit, d.CPUQuota, d.TasksLimit, d.HealthPath = cfg.Resources.Memory, cfg.Resources.CPU, cfg.Resources.Tasks, cfg.Health.Path
 	if err = s.db.CreateDeployment(d); err != nil {
 		return nil, err
+	}
+	if observe != nil {
+		observe(DeploymentIdentity{ID: d.ID, AppName: d.AppName})
 	}
 	s.recordEvent(d.ID, app.ID, model.EventType(model.Queued), fmt.Sprintf("deployment queued for %s", name))
 	ctx, cancel := context.WithCancel(ctx)
@@ -594,6 +615,32 @@ func (s *Service) Inspect(name string) (*model.Deployment, error) {
 	return s.db.LatestDeployment(name)
 }
 
+// LatestDeployment returns the newest attempt, including a failed candidate.
+func (s *Service) LatestDeployment(name string) (*model.Deployment, error) {
+	return s.db.LatestDeployment(name)
+}
+
+// DeploymentForApp fetches one attempt while preventing cross-app identity use.
+func (s *Service) DeploymentForApp(name, deploymentID string) (*model.Deployment, error) {
+	if deploymentID == "" {
+		return nil, store.ErrNotFound
+	}
+	d, err := s.db.Deployment(deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	if d.AppName != name {
+		return nil, store.ErrNotFound
+	}
+	return d, nil
+}
+
+// DataDir is the private Harbor data directory used by durable daemon features.
+func (s *Service) DataDir() string { return s.opts.DataDir }
+
+// LifetimeContext is canceled when the deployment service begins shutdown.
+func (s *Service) LifetimeContext() context.Context { return s.ctx }
+
 func (s *Service) Releases(name string) ([]model.ReleaseView, error) {
 	return s.db.ReleasesForApp(name)
 }
@@ -605,6 +652,22 @@ func (s *Service) Logs(name string) (string, error) {
 	d, err := s.db.LatestDeployment(name)
 	if err != nil {
 		return "", err
+	}
+	return s.LogsForDeployment(name, d.ID)
+}
+
+// LogsForDeployment returns logs for one app-scoped attempt. Callers polling a
+// candidate must not switch to a newer production deployment mid-job.
+func (s *Service) LogsForDeployment(name, deploymentID string) (string, error) {
+	if deploymentID == "" {
+		return "", store.ErrNotFound
+	}
+	d, err := s.db.Deployment(deploymentID)
+	if err != nil {
+		return "", err
+	}
+	if d.AppName != name {
+		return "", store.ErrNotFound
 	}
 	buildLogs, err := logTail(d.LogPath)
 	if err != nil {

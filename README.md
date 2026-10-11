@@ -28,18 +28,21 @@ Open <http://127.0.0.1:3000>. The web server connects to the private control
 socket; its process identity must have permission to open that socket. Without
 a daemon, the dashboard shows a connection message and setup instructions.
 
-Import a repository by browsing a GitHub owner or entering its HTTPS URL. Select
-an optional branch, tag, or full commit SHA, and a repository-relative root
-directory. The selected directory must contain `paas.yaml`; the web dashboard
-uses the existing build, health check, and immutable-release pipeline. This is
-a manual import/deploy flow; GitHub OAuth and webhook-triggered deployments are
-not implemented.
+Import a repository by browsing a GitHub owner or entering its HTTPS URL. Connect
+a fine-grained personal access token in the dashboard to browse and clone private
+repositories; public URLs work without a connection. Harbor stores the token
+encrypted in its private data directory and returns only connection metadata.
 
-Public repositories work without credentials. To use private repositories, set
-`GITHUB_TOKEN` in both the web server and daemon environments. The token is
-server-side only and must grant access to the selected repository. Repository
-checkouts reject symlinks, path traversal, non-GitHub hosts, and embedded URL
-credentials; Git must be installed on the daemon host.
+Select a branch, tag, or full commit SHA and a repository-relative root directory.
+Harbor uses an existing `paas.yaml`, or detects supported Go/Node layouts and lets
+you review generated settings. Add runtime environment values and optionally
+create or bind a managed PostgreSQL service, then follow asynchronous deployment
+progress. Saved GitHub source details support retry without resetting application
+settings. See [docs/onboarding.md](docs/onboarding.md) for permissions and API details.
+GitHub OAuth and webhook-triggered deployments are not implemented. Legacy daemon
+`GITHUB_TOKEN` configuration is supported; a dashboard connection is preferred.
+Repository checkouts reject symlinks, path traversal, non-GitHub hosts, and embedded
+URL credentials; Git must be installed on the daemon host.
 
 For a local production build:
 

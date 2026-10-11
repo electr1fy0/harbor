@@ -1,15 +1,19 @@
 import { createServerFn } from "@tanstack/react-start"
 import {
   configureAppInputSchema,
+  connectGitHubInputSchema,
   deployAppInputSchema,
   getAppSettingsInputSchema,
   getAppInputSchema,
   getCapacityInputSchema,
   getGitHubRepoInputSchema,
+  inspectProjectInputSchema,
   listGitHubReposInputSchema,
+  onboardingJobIDSchema,
   parseGitHubRepoURL,
   parseInput,
   rollbackAppInputSchema,
+  submitOnboardingJobInputSchema,
   stopAppInputSchema,
 } from "./validation"
 
@@ -82,4 +86,55 @@ export const getGitHubRepo = createServerFn({ method: "GET" })
     const { getGitHubRepoData } = await import("./harbor.server")
     const { owner, repo } = parseGitHubRepoURL(data.repoURL)
     return getGitHubRepoData(owner, repo)
+  })
+
+export const getGitHubConnection = createServerFn({ method: "GET" }).handler(
+  async () => {
+    const { getGitHubConnectionData } = await import("./harbor.server")
+    return getGitHubConnectionData()
+  }
+)
+
+export const connectGitHub = createServerFn({ method: "POST" })
+  .validator((input: unknown) => parseInput(connectGitHubInputSchema, input))
+  .handler(async ({ data }) => {
+    const { connectGitHubData } = await import("./harbor.server")
+    return connectGitHubData(data.token)
+  })
+
+export const disconnectGitHub = createServerFn({ method: "POST" }).handler(
+  async () => {
+    const { disconnectGitHubData } = await import("./harbor.server")
+    return disconnectGitHubData()
+  }
+)
+
+export const inspectProject = createServerFn({ method: "POST" })
+  .validator((input: unknown) => parseInput(inspectProjectInputSchema, input))
+  .handler(async ({ data }) => {
+    const { inspectProjectData } = await import("./harbor.server")
+    return inspectProjectData(data)
+  })
+
+export const submitOnboardingJob = createServerFn({ method: "POST" })
+  .validator((input: unknown) =>
+    parseInput(submitOnboardingJobInputSchema, input)
+  )
+  .handler(async ({ data }) => {
+    const { submitOnboardingJobData } = await import("./harbor.server")
+    return submitOnboardingJobData(data)
+  })
+
+export const getOnboardingJob = createServerFn({ method: "GET" })
+  .validator((input: unknown) => parseInput(onboardingJobIDSchema, input))
+  .handler(async ({ data }) => {
+    const { getOnboardingJobData } = await import("./harbor.server")
+    return getOnboardingJobData(data.id)
+  })
+
+export const cancelOnboardingJob = createServerFn({ method: "POST" })
+  .validator((input: unknown) => parseInput(onboardingJobIDSchema, input))
+  .handler(async ({ data }) => {
+    const { cancelOnboardingJobData } = await import("./harbor.server")
+    return cancelOnboardingJobData(data.id)
   })

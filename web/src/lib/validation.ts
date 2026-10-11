@@ -95,10 +95,50 @@ export const deployAppInputSchema = z
   })
   .strict()
 export const listGitHubReposInputSchema = z
-  .object({ owner: githubOwner })
+  .object({
+    owner: githubOwner.optional().default(""),
+  })
   .strict()
 export const getGitHubRepoInputSchema = z
   .object({ repoURL: githubRepoUrl })
+  .strict()
+const onboardingConfigSchema = z
+  .object({
+    runtime: z.enum(["go", "node"]).optional(),
+    buildCommand: z.string().max(4096).optional(),
+    startCommand: z.string().max(4096).optional(),
+    healthPath: z.string().max(256).optional(),
+    memoryLimit: z.string().max(32).optional(),
+    cpuQuota: z.number().finite().positive().max(256).optional(),
+    tasksLimit: z.number().int().positive().max(65_536).optional(),
+  })
+  .strict()
+export const inspectProjectInputSchema = z
+  .object({
+    name: appName.optional(),
+    repoURL: githubRepoUrl,
+    ref: gitRef.optional().default(""),
+    rootDir: repositoryRoot.optional().default(""),
+    config: onboardingConfigSchema.optional(),
+  })
+  .strict()
+export const submitOnboardingJobInputSchema = z
+  .object({
+    name: appName,
+    repoURL: githubRepoUrl,
+    ref: gitRef.optional().default(""),
+    rootDir: repositoryRoot.optional().default(""),
+    config: onboardingConfigSchema.optional(),
+    environment: z.record(environmentKey, z.string().max(65_536)).optional(),
+    postgresService: appName.optional(),
+    createPostgres: z.boolean().optional(),
+  })
+  .strict()
+export const onboardingJobIDSchema = z
+  .object({ id: z.string().regex(/^job_[a-f0-9]{32}$/) })
+  .strict()
+export const connectGitHubInputSchema = z
+  .object({ token: z.string().min(10).max(4096) })
   .strict()
 export const getAppSettingsInputSchema = z.object({ name: appName }).strict()
 export const configureAppInputSchema = z
@@ -127,7 +167,8 @@ export const configureAppInputSchema = z
     "Invalid request data."
   )
   .refine(
-    (input) => !input.domains || new Set(input.domains).size === input.domains.length,
+    (input) =>
+      !input.domains || new Set(input.domains).size === input.domains.length,
     "Invalid request data."
   )
 
@@ -138,6 +179,12 @@ export type StopAppInput = z.infer<typeof stopAppInputSchema>
 export type RollbackAppInput = z.infer<typeof rollbackAppInputSchema>
 export type ListGitHubReposInput = z.infer<typeof listGitHubReposInputSchema>
 export type GetGitHubRepoInput = z.infer<typeof getGitHubRepoInputSchema>
+export type InspectProjectInput = z.infer<typeof inspectProjectInputSchema>
+export type SubmitOnboardingJobInput = z.infer<
+  typeof submitOnboardingJobInputSchema
+>
+export type OnboardingJobIDInput = z.infer<typeof onboardingJobIDSchema>
+export type ConnectGitHubInput = z.infer<typeof connectGitHubInputSchema>
 export type GetAppSettingsInput = z.infer<typeof getAppSettingsInputSchema>
 export type ConfigureAppInput = z.infer<typeof configureAppInputSchema>
 

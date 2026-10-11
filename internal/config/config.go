@@ -77,7 +77,15 @@ func Load(sourceDir string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
+	return loadBytes(data, path)
+}
 
+// LoadBytes parses a paas.yaml document already read by the caller.
+func LoadBytes(data []byte) (*Config, error) {
+	return loadBytes(data, "paas.yaml")
+}
+
+func loadBytes(data []byte, path string) (*Config, error) {
 	var document configDocument
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
@@ -115,32 +123,42 @@ func Load(sourceDir string) (*Config, error) {
 		cfg.Resources.Tasks = *document.Resources.Tasks
 	}
 
+	if err := Validate(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// Validate checks an in-memory configuration using the same rules as Load.
+func Validate(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("configuration is missing")
+	}
 	if !ValidName(cfg.Name) {
-		return nil, fmt.Errorf("invalid application name %q", cfg.Name)
+		return fmt.Errorf("invalid application name %q", cfg.Name)
 	}
 	if cfg.Runtime != "go" && cfg.Runtime != "node" {
-		return nil, fmt.Errorf("unsupported runtime %q: only go and node are supported", cfg.Runtime)
+		return fmt.Errorf("unsupported runtime %q: only go and node are supported", cfg.Runtime)
 	}
 	if strings.TrimSpace(cfg.Build.Command) == "" {
-		return nil, fmt.Errorf("build.command must not be empty")
+		return fmt.Errorf("build.command must not be empty")
 	}
 	if strings.TrimSpace(cfg.Start.Command) == "" {
-		return nil, fmt.Errorf("start.command must not be empty")
+		return fmt.Errorf("start.command must not be empty")
 	}
 	if _, err := ParseMemoryBytes(cfg.Resources.Memory); err != nil {
-		return nil, fmt.Errorf("resources.memory: %w", err)
+		return fmt.Errorf("resources.memory: %w", err)
 	}
 	if cfg.Resources.CPU <= 0 || math.IsNaN(cfg.Resources.CPU) || math.IsInf(cfg.Resources.CPU*100, 0) {
-		return nil, fmt.Errorf("resources.cpu must be a finite positive number")
+		return fmt.Errorf("resources.cpu must be a finite positive number")
 	}
 	if cfg.Resources.Tasks < 1 {
-		return nil, fmt.Errorf("resources.tasks must be a positive integer")
+		return fmt.Errorf("resources.tasks must be a positive integer")
 	}
 	if cfg.Health.Path != "" && !strings.HasPrefix(cfg.Health.Path, "/") {
-		return nil, fmt.Errorf("health.path must be empty or start with /")
+		return fmt.Errorf("health.path must be empty or start with /")
 	}
-
-	return cfg, nil
+	return nil
 }
 
 // ParseMemoryBytes parses a positive binary byte quantity that fits in int64.

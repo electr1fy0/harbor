@@ -42,10 +42,23 @@ func CheckoutGitHub(ctx context.Context, repoURL, ref, rootDir string) (string, 
 // CheckoutGitHubAs performs CheckoutGitHub with the configured unprivileged
 // build identity when the daemon runs as root on Linux.
 func CheckoutGitHubAs(ctx context.Context, repoURL, ref, rootDir, buildUser string) (string, func(), error) {
-	return (githubSource{run: runGit, timeout: defaultCheckoutTimeout, buildUser: buildUser}).checkout(ctx, repoURL, ref, rootDir)
+	return CheckoutGitHubAsWithToken(ctx, repoURL, ref, rootDir, buildUser, os.Getenv("GITHUB_TOKEN"))
 }
 
-func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir string) (string, func(), error) {
+// CheckoutGitHubWithToken checks out a repository using token only for this
+// call. An empty token preserves public repository access.
+func CheckoutGitHubWithToken(ctx context.Context, repoURL, ref, rootDir, token string) (string, func(), error) {
+	return CheckoutGitHubAsWithToken(ctx, repoURL, ref, rootDir, "paas-build", token)
+}
+
+// CheckoutGitHubAsWithToken performs a private checkout without mutating the
+// process environment. The legacy CheckoutGitHubAs wrapper retains the
+// GITHUB_TOKEN environment fallback for CLI compatibility.
+func CheckoutGitHubAsWithToken(ctx context.Context, repoURL, ref, rootDir, buildUser, token string) (string, func(), error) {
+	return (githubSource{run: runGit, timeout: defaultCheckoutTimeout, buildUser: buildUser}).checkout(ctx, repoURL, ref, rootDir, token)
+}
+
+func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir, token string) (string, func(), error) {
 	if ctx == nil {
 		return "", nil, errors.New("checkout context must not be nil")
 	}
@@ -92,10 +105,9 @@ func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir string
 	}
 
 	repoDir := filepath.Join(gitWorkDir, "repo")
-	token := os.Getenv("GITHUB_TOKEN")
 	if strings.ContainsAny(token, "\r\n") {
 		cleanup()
-		return "", nil, errors.New("GITHUB_TOKEN contains an invalid line break")
+		return "", nil, errors.New("GitHub token contains an invalid line break")
 	}
 	askpassPath := ""
 	if token != "" {
@@ -245,6 +257,19 @@ func canonicalGitHubURL(raw string) (string, error) {
 		return "", errors.New("RepoURL contains an invalid repository name")
 	}
 	return "https://github.com/" + parts[0] + "/" + parts[1], nil
+}
+
+// ValidateGitHubCheckoutRequest validates repository coordinates without
+// contacting GitHub, so daemon APIs can reject malformed input before queueing.
+func ValidateGitHubCheckoutRequest(repoURL, ref, rootDir string) error {
+	if _, err := canonicalGitHubURL(repoURL); err != nil {
+		return err
+	}
+	if err := validateRef(ref); err != nil {
+		return err
+	}
+	_, err := cleanRootDir(rootDir)
+	return err
 }
 
 func validateRef(ref string) error {

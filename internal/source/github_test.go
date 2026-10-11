@@ -64,7 +64,7 @@ func TestCheckoutGitHubKeepsTokenOutOfURLAndAskpassFile(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", token)
 	git := &fakeGit{}
 	selected, cleanup, err := (githubSource{run: git.run, tempDir: t.TempDir(), buildUser: "custom-build"}).checkout(
-		context.Background(), "https://github.com/example/private", "main", "app",
+		context.Background(), "https://github.com/example/private", "main", "app", token,
 	)
 	if err != nil {
 		t.Fatalf("checkout: %v", err)
@@ -113,7 +113,7 @@ func TestCheckoutGitHubSelectsRefAndRootAndCleansWorkspace(t *testing.T) {
 	work := t.TempDir()
 	git := &fakeGit{}
 	selected, cleanup, err := (githubSource{run: git.run, timeout: time.Second, tempDir: work}).checkout(
-		context.Background(), "https://github.com/example/app.git", "refs/heads/release/v2", "app",
+		context.Background(), "https://github.com/example/app.git", "refs/heads/release/v2", "app", "",
 	)
 	if err != nil {
 		t.Fatalf("checkout: %v", err)
@@ -158,7 +158,7 @@ func TestCheckoutGitHubSelectsRefAndRootAndCleansWorkspace(t *testing.T) {
 func TestCheckoutGitHubDefaultRefDoesNotFetchAndDetachesHEAD(t *testing.T) {
 	git := &fakeGit{}
 	selected, cleanup, err := (githubSource{run: git.run, tempDir: t.TempDir()}).checkout(
-		context.Background(), "https://github.com/example/app", "", "",
+		context.Background(), "https://github.com/example/app", "", "", "",
 	)
 	if err != nil {
 		t.Fatalf("checkout: %v", err)
@@ -197,7 +197,7 @@ func TestCheckoutGitHubRejectsInvalidInputBeforeRunningGit(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			git := &fakeGit{}
 			_, cleanup, err := (githubSource{run: git.run, tempDir: t.TempDir()}).checkout(
-				context.Background(), test.repoURL, test.ref, test.rootDir,
+				context.Background(), test.repoURL, test.ref, test.rootDir, "",
 			)
 			if err == nil {
 				if cleanup != nil {
@@ -218,7 +218,7 @@ func TestCheckoutGitHubRejectsSymlinksAndCleansFailedCheckout(t *testing.T) {
 		return os.Symlink("../../outside", filepath.Join(repoDir, "app", "escape"))
 	}}
 	_, cleanup, err := (githubSource{run: git.run, tempDir: work}).checkout(
-		context.Background(), "https://github.com/example/app", "", "app",
+		context.Background(), "https://github.com/example/app", "", "app", "",
 	)
 	if err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("symlink checkout error = %v", err)
@@ -241,7 +241,7 @@ func TestCheckoutGitHubHonorsContextAndCleansCanceledCheckout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	_, cleanup, err := (githubSource{run: git.run, timeout: time.Second, tempDir: work}).checkout(
-		ctx, "https://github.com/example/app", "", "",
+		ctx, "https://github.com/example/app", "", "", "",
 	)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("checkout error = %v, want deadline exceeded", err)
