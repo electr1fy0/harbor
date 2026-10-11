@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 
+	capacitymetrics "paas/internal/capacity"
+	"paas/internal/config"
 	"paas/internal/deployment"
 	"paas/internal/model"
 	"paas/internal/source"
@@ -37,10 +39,15 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 		}
 	}
 	server := NewServer(socketPath)
+	dataDir := ""
+	if service != nil {
+		dataDir = service.CapacityDataDir()
+	}
+	capacityCollector := capacitymetrics.New(dataDir)
 	ping := server.http.Handler
 	mux := http.NewServeMux()
 	mux.Handle("/ping", ping)
-	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop", "releases", "rollback", "add", "link", "services", "settings", "configure"} {
+	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop", "releases", "rollback", "add", "link", "services", "settings", "configure", "capacity"} {
 		command := command
 		mux.HandleFunc("/"+command, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -146,6 +153,41 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 					})
 				} else {
 					err = errors.New("application settings are unavailable")
+				}
+			case "capacity":
+				if input.Name != "" && !config.ValidName(input.Name) {
+					err = errors.New("invalid application name")
+					break
+				}
+				var runtimes []capacitymetrics.RuntimeLimit
+				if service != nil {
+					var configured []deployment.CapacityRuntime
+					configured, err = service.CapacityRuntimes(r.Context(), input.Name)
+					for _, runtime := range configured {
+						memory, _ := config.ParseMemoryBytes(runtime.MemoryLimit)
+						cpuQuota := runtime.CPUQuota
+						if cpuQuota <= 0 && runtime.ID != "" {
+							cpuQuota = config.DefaultCPU
+						}
+						tasks := runtime.TasksLimit
+						if tasks <= 0 && runtime.ID != "" {
+							tasks = config.DefaultTasks
+						}
+						runtimes = append(runtimes, capacitymetrics.RuntimeLimit{
+							Identity: runtime.ID, Name: runtime.AppName, State: string(runtime.State), PID: runtime.PID,
+							ControlGroup: runtime.ControlGroup, MemoryLimit: memory,
+							CPUQuotaCores: cpuQuota, TasksLimit: tasks,
+						})
+					}
+				} else if input.Name != "" {
+					err = store.ErrNotFound
+				}
+				if err == nil {
+					var snapshot capacitymetrics.Snapshot
+					snapshot, err = capacityCollector.Sample(r.Context(), runtimes)
+					if err == nil {
+						output.Capacity = &snapshot
+					}
 				}
 			}
 			if err != nil {

@@ -4,6 +4,7 @@ import {
   deployAppInputSchema,
   getAppSettingsInputSchema,
   getAppInputSchema,
+  getCapacityInputSchema,
   getGitHubRepoInputSchema,
   listGitHubReposInputSchema,
   parseGitHubRepoURL,
@@ -38,6 +39,13 @@ export const configureApp = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const { configureAppData } = await import("./harbor.server")
     return configureAppData(data)
+  })
+
+export const getCapacity = createServerFn({ method: "GET" })
+  .validator((input: unknown) => parseInput(getCapacityInputSchema, input))
+  .handler(async ({ data }) => {
+    const { getCapacityData } = await import("./harbor.server")
+    return getCapacityData(data.name)
   })
 
 export const deployApp = createServerFn({ method: "POST" })

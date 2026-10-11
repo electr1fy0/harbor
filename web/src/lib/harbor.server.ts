@@ -5,6 +5,7 @@ import type {
   AppDetails,
   AppSettings,
   AppView,
+  CapacitySnapshot,
   Deployment,
   DeploymentResult,
   GitHubBranch,
@@ -82,6 +83,22 @@ function safeString(value: unknown, maxLength = 512): string {
 
 function safeNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0
+}
+
+function safeOptionalNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null
+}
+
+function safeOptionalBytes(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null
+}
+
+function safeOptionalSignedBytes(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null
 }
 
 function safeBoolean(value: unknown): boolean {
@@ -253,6 +270,97 @@ const emptySettings: AppSettings = {
   memoryLimit: "",
   cpuQuota: 0,
   tasksLimit: 0,
+}
+
+function mapCapacity(value: unknown): CapacitySnapshot {
+  if (!isObject(value)) {
+    throw new HarborOperationError("Harbor returned invalid capacity data.")
+  }
+  const platform = isObject(value.platform) ? value.platform : {}
+  const host = isObject(value.host) ? value.host : {}
+  const disk = isObject(value.disk) ? value.disk : {}
+  const builds = isObject(value.builds) ? value.builds : {}
+  const headroom = isObject(value.headroom) ? value.headroom : {}
+  const apps = arrayValue(value.apps).map((item) => {
+    if (!isObject(item)) {
+      throw new HarborOperationError("Harbor returned invalid capacity data.")
+    }
+    return {
+      deploymentId: safeString(item.deploymentId, 128),
+      name: safeSlug(item.name),
+      state: safeString(item.state, 32),
+      memoryLimitBytes: safeOptionalBytes(item.memoryLimitBytes),
+      memoryCurrentBytes: safeOptionalBytes(item.memoryCurrentBytes),
+      memoryPeakBytes: safeOptionalBytes(item.memoryPeakBytes),
+      cpuQuotaCores: safeOptionalNumber(item.cpuQuotaCores),
+      cpuUsageCores: safeOptionalNumber(item.cpuUsageCores),
+      tasksLimit: safeOptionalBytes(item.tasksLimit),
+      tasksCurrent: safeOptionalBytes(item.tasksCurrent),
+      metricsSource: safeString(item.metricsSource, 32),
+    }
+  })
+  const caveats = Array.isArray(value.caveats)
+    ? value.caveats.flatMap((item) =>
+        typeof item === "string" ? [item.slice(0, 256)] : []
+      )
+    : []
+
+  return {
+    sampledAt: safeTime(value.sampledAt),
+    platform: {
+      supported: safeBoolean(platform.supported),
+      name: safeString(platform.name, 32),
+      reason: safeString(platform.reason, 256),
+    },
+    host: {
+      memoryTotalBytes: safeOptionalBytes(host.memoryTotalBytes),
+      memoryAvailableBytes: safeOptionalBytes(host.memoryAvailableBytes),
+      memoryUsedBytes: safeOptionalBytes(host.memoryUsedBytes),
+      cpuUsagePercent: safeOptionalNumber(host.cpuUsagePercent),
+      logicalCPUs: safeOptionalBytes(host.logicalCPUs),
+    },
+    disk: {
+      filesystemTotalBytes: safeOptionalBytes(disk.filesystemTotalBytes),
+      filesystemAvailableBytes: safeOptionalBytes(
+        disk.filesystemAvailableBytes
+      ),
+      filesystemUsedBytes: safeOptionalBytes(disk.filesystemUsedBytes),
+      harborDataBytes: safeOptionalBytes(disk.harborDataBytes),
+      harborDataComplete: safeBoolean(disk.harborDataComplete),
+      harborDataChangeBytes: safeOptionalSignedBytes(
+        disk.harborDataChangeBytes
+      ),
+      releasesChangeBytes: safeOptionalSignedBytes(disk.releasesChangeBytes),
+      buildCacheChangeBytes: safeOptionalSignedBytes(
+        disk.buildCacheChangeBytes
+      ),
+      logsChangeBytes: safeOptionalSignedBytes(disk.logsChangeBytes),
+      changeIntervalSeconds: safeOptionalNumber(disk.changeIntervalSeconds),
+      releasesBytes: safeOptionalBytes(disk.releasesBytes),
+      buildCacheBytes: safeOptionalBytes(disk.buildCacheBytes),
+      logsBytes: safeOptionalBytes(disk.logsBytes),
+    },
+    apps,
+    builds: {
+      systemdManagedActiveCount: safeOptionalBytes(
+        builds.systemdManagedActiveCount
+      ),
+      memoryLimitBytes: safeOptionalBytes(builds.memoryLimitBytes),
+      memoryCurrentBytes: safeOptionalBytes(builds.memoryCurrentBytes),
+      memoryPeakBytes: safeOptionalBytes(builds.memoryPeakBytes),
+      cpuQuotaCores: safeOptionalNumber(builds.cpuQuotaCores),
+      cpuUsageCores: safeOptionalNumber(builds.cpuUsageCores),
+    },
+    headroom: {
+      memoryReservePercent:
+        safeOptionalNumber(headroom.memoryReservePercent) ?? 0,
+      memoryReserveBytes: safeOptionalBytes(headroom.memoryReserveBytes),
+      estimatedMemoryAfterReserveBytes: safeOptionalBytes(
+        headroom.estimatedMemoryAfterReserveBytes
+      ),
+    },
+    caveats,
+  }
 }
 
 function sanitizeLogs(value: unknown): string {
@@ -492,7 +600,9 @@ export async function configureAppData(
         ? { MemoryLimit: input.memoryLimit }
         : {}),
       ...(input.cpuQuota !== undefined ? { CPUQuota: input.cpuQuota } : {}),
-      ...(input.tasksLimit !== undefined ? { TasksLimit: input.tasksLimit } : {}),
+      ...(input.tasksLimit !== undefined
+        ? { TasksLimit: input.tasksLimit }
+        : {}),
     },
     DEFAULT_TIMEOUT_MS,
     "Could not update app settings."
@@ -602,27 +712,28 @@ export async function getOverviewData(): Promise<Overview> {
 }
 
 export async function getAppData(name: string): Promise<AppDetails> {
-  const [inspectResult, releasesResult, logsResult, settingsResult] = await Promise.allSettled([
-    daemonCall(
-      "/inspect",
-      { Name: name },
-      DEFAULT_TIMEOUT_MS,
-      "Could not load app status."
-    ),
-    daemonCall(
-      "/releases",
-      { Name: name },
-      DEFAULT_TIMEOUT_MS,
-      "Could not load app releases."
-    ),
-    daemonCall(
-      "/logs",
-      { Name: name },
-      DEFAULT_TIMEOUT_MS,
-      "Could not load app logs."
-    ),
-    getAppSettingsData(name),
-  ])
+  const [inspectResult, releasesResult, logsResult, settingsResult] =
+    await Promise.allSettled([
+      daemonCall(
+        "/inspect",
+        { Name: name },
+        DEFAULT_TIMEOUT_MS,
+        "Could not load app status."
+      ),
+      daemonCall(
+        "/releases",
+        { Name: name },
+        DEFAULT_TIMEOUT_MS,
+        "Could not load app releases."
+      ),
+      daemonCall(
+        "/logs",
+        { Name: name },
+        DEFAULT_TIMEOUT_MS,
+        "Could not load app logs."
+      ),
+      getAppSettingsData(name),
+    ])
 
   if (
     [inspectResult, releasesResult, logsResult, settingsResult].some(
@@ -676,6 +787,18 @@ export async function getAppData(name: string): Promise<AppDetails> {
       safeRouteUrl(inspect?.URL, deployment, settings.domains),
     settings,
   }
+}
+
+export async function getCapacityData(
+  name?: string
+): Promise<CapacitySnapshot> {
+  const response = await daemonCall(
+    "/capacity",
+    name ? { Name: name } : {},
+    DEFAULT_TIMEOUT_MS,
+    "Could not load capacity metrics."
+  )
+  return mapCapacity(response.Capacity)
 }
 
 export async function deployAppData(input: {

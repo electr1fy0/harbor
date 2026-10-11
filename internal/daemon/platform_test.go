@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -138,7 +139,7 @@ func TestPlatformLogsResponseWriteFailure(t *testing.T) {
 
 func TestPlatformMethodsAndPing(t *testing.T) {
 	server := NewPlatformServer("", nil)
-	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop", "add", "link", "services"} {
+	for _, command := range []string{"deploy", "apps", "inspect", "logs", "stop", "add", "link", "services", "capacity"} {
 		recorder := httptest.NewRecorder()
 		server.http.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/"+command, nil))
 		if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != "POST" {
@@ -149,5 +150,33 @@ func TestPlatformMethodsAndPing(t *testing.T) {
 	server.http.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ping", nil))
 	if recorder.Code != http.StatusOK || recorder.Body.String() != "pong\n" {
 		t.Fatalf("ping status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPlatformCapacitySnapshotAndOptionalName(t *testing.T) {
+	server := NewPlatformServer("", nil)
+	for _, test := range []struct {
+		body       string
+		wantStatus int
+	}{
+		{body: `{}`, wantStatus: http.StatusOK},
+		{body: `{"Name":"demo"}`, wantStatus: http.StatusNotFound},
+		{body: `{"Name":"invalid-"}`, wantStatus: http.StatusBadRequest},
+	} {
+		recorder := httptest.NewRecorder()
+		server.http.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/capacity", strings.NewReader(test.body)))
+		if recorder.Code != test.wantStatus {
+			t.Fatalf("capacity request %s status=%d body=%q, want %d", test.body, recorder.Code, recorder.Body.String(), test.wantStatus)
+		}
+		if test.wantStatus != http.StatusOK {
+			continue
+		}
+		var response Response
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Capacity == nil || response.Capacity.SampledAt.IsZero() || response.Capacity.Platform.Name == "" {
+			t.Fatalf("capacity snapshot missing sample or platform: %+v", response.Capacity)
+		}
 	}
 }

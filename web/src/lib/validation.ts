@@ -76,6 +76,9 @@ const repositoryRoot = z
   }, "Invalid request data.")
 
 export const getAppInputSchema = z.object({ name: appName }).strict()
+export const getCapacityInputSchema = z
+  .object({ name: appName.optional() })
+  .strict()
 export const stopAppInputSchema = z.object({ name: appName }).strict()
 export const rollbackAppInputSchema = z
   .object({
@@ -129,6 +132,7 @@ export const configureAppInputSchema = z
   )
 
 export type GetAppInput = z.infer<typeof getAppInputSchema>
+export type GetCapacityInput = z.infer<typeof getCapacityInputSchema>
 export type DeployAppInput = z.infer<typeof deployAppInputSchema>
 export type StopAppInput = z.infer<typeof stopAppInputSchema>
 export type RollbackAppInput = z.infer<typeof rollbackAppInputSchema>

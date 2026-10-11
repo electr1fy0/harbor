@@ -13,6 +13,7 @@ import {
   configureAppData,
   deployAppData,
   getAppData,
+  getCapacityData,
   getOverviewData,
 } from "./harbor.server"
 
@@ -149,6 +150,136 @@ describe("Harbor daemon transport", () => {
           CPUQuota: 2,
           TasksLimit: 64,
         })
+      }
+    )
+  })
+
+  it("loads a filtered capacity sample and preserves unavailable metrics", async () => {
+    await withDaemon(
+      (request, response) => {
+        if (request.url !== "/capacity") {
+          response.statusCode = 404
+          response.end("not found")
+          return
+        }
+        let body = ""
+        request.setEncoding("utf8")
+        request.on("data", (chunk: string) => (body += chunk))
+        request.on("end", () => {
+          expect(JSON.parse(body)).toEqual({ Name: "harbor-web" })
+          jsonResponse(response, 200, {
+            Capacity: {
+              sampledAt: "2026-10-11T01:00:00Z",
+              platform: { supported: true, name: "linux", reason: "" },
+              host: {
+                memoryTotalBytes: 2_147_483_648,
+                memoryAvailableBytes: 1_073_741_824,
+                memoryUsedBytes: 1_073_741_824,
+                cpuUsagePercent: 18.5,
+                logicalCPUs: 2,
+              },
+              disk: {
+                filesystemTotalBytes: 20_000,
+                filesystemAvailableBytes: 12_000,
+                filesystemUsedBytes: 8_000,
+                harborDataBytes: 1_000,
+                harborDataComplete: true,
+                harborDataChangeBytes: -4,
+                releasesChangeBytes: 2,
+                buildCacheChangeBytes: 0,
+                logsChangeBytes: -6,
+                changeIntervalSeconds: 15.5,
+                releasesBytes: 500,
+                buildCacheBytes: 300,
+                logsBytes: 200,
+              },
+              apps: [
+                {
+                  deploymentId: "dep_42",
+                  name: "harbor-web",
+                  state: "RUNNING",
+                  memoryLimitBytes: 134_217_728,
+                  memoryCurrentBytes: 32_768,
+                  memoryPeakBytes: 65_536,
+                  cpuQuotaCores: 0.5,
+                  cpuUsageCores: null,
+                  tasksLimit: 64,
+                  tasksCurrent: 2,
+                  metricsSource: "cgroup v2",
+                  logPath: "/var/lib/paas/private.log",
+                },
+              ],
+              builds: {
+                systemdManagedActiveCount: 0,
+                memoryLimitBytes: 0,
+                memoryCurrentBytes: 0,
+                memoryPeakBytes: 0,
+                cpuQuotaCores: 0,
+                cpuUsageCores: 0,
+              },
+              headroom: {
+                memoryReservePercent: 10,
+                memoryReserveBytes: 214_748_364,
+                estimatedMemoryAfterReserveBytes: 858_993_460,
+              },
+              caveats: ["Configured limits are ceilings, not reservations."],
+              dataDir: "/var/lib/paas",
+            },
+          })
+        })
+      },
+      async () => {
+        const capacity = await getCapacityData("harbor-web")
+        expect(capacity.platform.supported).toBe(true)
+        expect(capacity.host.memoryTotalBytes).toBe(2_147_483_648)
+        expect(capacity.apps[0]?.cpuUsageCores).toBeNull()
+        expect(capacity.apps[0]?.memoryLimitBytes).toBe(134_217_728)
+        expect(capacity.apps[0]?.deploymentId).toBe("dep_42")
+        expect(capacity.disk.harborDataChangeBytes).toBe(-4)
+        expect(capacity.disk.releasesChangeBytes).toBe(2)
+        expect(capacity.disk.changeIntervalSeconds).toBe(15.5)
+        expect(capacity.builds.systemdManagedActiveCount).toBe(0)
+        expect(JSON.stringify(capacity)).not.toContain("/var/lib/paas")
+      }
+    )
+  })
+
+  it("keeps unsupported host and runtime values unavailable", async () => {
+    await withDaemon(
+      (_request, response) => {
+        jsonResponse(response, 200, {
+          Capacity: {
+            sampledAt: "2026-10-11T01:00:00Z",
+            platform: {
+              supported: false,
+              name: "darwin",
+              reason: "Linux host metrics are unavailable.",
+            },
+            host: {},
+            disk: {},
+            apps: [
+              {
+                name: "configured-app",
+                state: "RUNNING",
+                memoryLimitBytes: 67_108_864,
+                memoryCurrentBytes: null,
+                cpuQuotaCores: 0.25,
+                cpuUsageCores: null,
+                metricsSource: "unavailable",
+              },
+            ],
+            builds: {},
+            headroom: { memoryReservePercent: 10 },
+            caveats: [],
+          },
+        })
+      },
+      async () => {
+        const capacity = await getCapacityData()
+        expect(capacity.platform.supported).toBe(false)
+        expect(capacity.host.memoryTotalBytes).toBeNull()
+        expect(capacity.apps[0]?.memoryCurrentBytes).toBeNull()
+        expect(capacity.apps[0]?.cpuUsageCores).toBeNull()
       }
     )
   })

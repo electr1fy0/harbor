@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   deployAppInputSchema,
+  getCapacityInputSchema,
   getAppInputSchema,
   parseGitHubRepoURL,
   parseInput,
@@ -25,6 +26,16 @@ describe("Harbor input validation", () => {
     expect(() => parseInput(getAppInputSchema, { name: "invalid-" })).toThrow(
       "Invalid request data."
     )
+  })
+
+  it("allows capacity requests for all apps or one validated app", () => {
+    expect(parseInput(getCapacityInputSchema, {})).toEqual({})
+    expect(parseInput(getCapacityInputSchema, { name: "harbor-web" })).toEqual({
+      name: "harbor-web",
+    })
+    expect(() =>
+      parseInput(getCapacityInputSchema, { name: "invalid-" })
+    ).toThrow("Invalid request data.")
   })
 
   it("rejects repository URLs that could target another host", () => {

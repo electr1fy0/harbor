@@ -1,6 +1,7 @@
 import {
   IconActivity,
   IconApps,
+  IconChartBar,
   IconLayersIntersect,
   IconSettings,
   IconShip,
@@ -33,6 +34,12 @@ const navigation = [
     to: "/services",
     icon: IconLayersIntersect,
     match: (path: string) => path.startsWith("/services"),
+  },
+  {
+    label: "Capacity",
+    to: "/capacity",
+    icon: IconChartBar,
+    match: (path: string) => path.startsWith("/capacity"),
   },
   {
     label: "Settings",

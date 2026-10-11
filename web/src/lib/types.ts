@@ -117,3 +117,57 @@ export interface GitHubRepo {
   updatedAt: string
   branches?: GitHubBranch[]
 }
+
+export interface CapacitySnapshot {
+  sampledAt: string
+  platform: { supported: boolean; name: string; reason: string }
+  host: {
+    memoryTotalBytes: number | null
+    memoryAvailableBytes: number | null
+    memoryUsedBytes: number | null
+    cpuUsagePercent: number | null
+    logicalCPUs: number | null
+  }
+  disk: {
+    filesystemTotalBytes: number | null
+    filesystemAvailableBytes: number | null
+    filesystemUsedBytes: number | null
+    harborDataBytes: number | null
+    harborDataComplete: boolean
+    harborDataChangeBytes: number | null
+    releasesChangeBytes: number | null
+    buildCacheChangeBytes: number | null
+    logsChangeBytes: number | null
+    changeIntervalSeconds: number | null
+    releasesBytes: number | null
+    buildCacheBytes: number | null
+    logsBytes: number | null
+  }
+  apps: Array<{
+    deploymentId: string
+    name: string
+    state: string
+    memoryLimitBytes: number | null
+    memoryCurrentBytes: number | null
+    memoryPeakBytes: number | null
+    cpuQuotaCores: number | null
+    cpuUsageCores: number | null
+    tasksLimit: number | null
+    tasksCurrent: number | null
+    metricsSource: string
+  }>
+  builds: {
+    systemdManagedActiveCount: number | null
+    memoryLimitBytes: number | null
+    memoryCurrentBytes: number | null
+    memoryPeakBytes: number | null
+    cpuQuotaCores: number | null
+    cpuUsageCores: number | null
+  }
+  headroom: {
+    memoryReservePercent: number
+    memoryReserveBytes: number | null
+    estimatedMemoryAfterReserveBytes: number | null
+  }
+  caveats: string[]
+}

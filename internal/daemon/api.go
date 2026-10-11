@@ -1,6 +1,9 @@
 package daemon
 
-import "paas/internal/model"
+import (
+	"paas/internal/capacity"
+	"paas/internal/model"
+)
 
 // Request describes a local control-plane operation.
 type Request struct {
@@ -37,4 +40,5 @@ type Response struct {
 	Services   []model.Service     `json:"Services,omitempty"`
 	Binding    *model.Binding      `json:"Binding,omitempty"`
 	Settings   *model.Settings     `json:"settings,omitempty"`
+	Capacity   *capacity.Snapshot  `json:"Capacity,omitempty"`
 }

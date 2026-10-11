@@ -117,6 +117,35 @@ func TestStopPreservesFinishedFailure(t *testing.T) {
 	}
 }
 
+func TestCapacityRuntimesKeepsLatestConfiguredDeploymentAfterStop(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	deployed, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.Stop(context.Background(), "demo"); err != nil {
+		t.Fatal(err)
+	}
+	memory, cpu, tasks := "256Mi", 0.75, 32
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{
+		MemoryLimit: &memory, CPUQuota: &cpu, TasksLimit: &tasks,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtimes, err := h.service.CapacityRuntimes(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runtimes) != 1 {
+		t.Fatalf("capacity runtimes = %+v, want latest deployment after stop", runtimes)
+	}
+	runtime := runtimes[0]
+	if runtime.ID != deployed.ID || runtime.AppName != "demo" || runtime.State != model.Stopped ||
+		runtime.MemoryLimit != memory || runtime.CPUQuota != cpu || runtime.TasksLimit != tasks || !runtime.ConfigurationOnly || runtime.PID != 0 || runtime.ControlGroup != "" {
+		t.Fatalf("stopped app capacity config = %+v", runtime)
+	}
+}
+
 func TestCanceledStopLeavesRuntimeUntouched(t *testing.T) {
 	h := newServiceHarness(t, testConfig)
 	active, err := h.service.Deploy(context.Background(), h.source, "demo")

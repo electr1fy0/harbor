@@ -1,6 +1,11 @@
 import { queryOptions } from "@tanstack/react-query"
 import { getAuthStatus } from "./auth.functions"
-import { getApp, getOverview, listGitHubRepos } from "./harbor.functions"
+import {
+  getApp,
+  getCapacity,
+  getOverview,
+  listGitHubRepos,
+} from "./harbor.functions"
 
 export function authQueryOptions() {
   return queryOptions({
@@ -27,6 +32,16 @@ export function appQueryOptions(name: string) {
     queryFn: () => getApp({ data: { name } }),
     staleTime: 3_000,
     refetchInterval: 5_000,
+    refetchIntervalInBackground: false,
+  })
+}
+
+export function capacityQueryOptions(name?: string) {
+  return queryOptions({
+    queryKey: ["harbor", "capacity", name ?? "all"] as const,
+    queryFn: () => getCapacity({ data: name ? { name } : {} }),
+    staleTime: 10_000,
+    refetchInterval: 15_000,
     refetchIntervalInBackground: false,
   })
 }

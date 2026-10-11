@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as CapacityRouteImport } from './routes/capacity'
 import { Route as DeploymentsRouteImport } from './routes/deployments'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as NewRouteImport } from './routes/new'
@@ -20,6 +21,11 @@ import { Route as ProjectsNameRouteImport } from './routes/projects.$name'
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CapacityRoute = CapacityRouteImport.update({
+  id: '/capacity',
+  path: '/capacity',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DeploymentsRoute = DeploymentsRouteImport.update({
@@ -55,6 +61,7 @@ const ProjectsNameRoute = ProjectsNameRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/capacity': typeof CapacityRoute
   '/deployments': typeof DeploymentsRoute
   '/login': typeof LoginRoute
   '/new': typeof NewRoute
@@ -64,6 +71,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/capacity': typeof CapacityRoute
   '/deployments': typeof DeploymentsRoute
   '/login': typeof LoginRoute
   '/new': typeof NewRoute
@@ -74,6 +82,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/capacity': typeof CapacityRoute
   '/deployments': typeof DeploymentsRoute
   '/login': typeof LoginRoute
   '/new': typeof NewRoute
@@ -85,6 +94,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/capacity'
     | '/deployments'
     | '/login'
     | '/new'
@@ -94,6 +104,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/capacity'
     | '/deployments'
     | '/login'
     | '/new'
@@ -103,6 +114,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/capacity'
     | '/deployments'
     | '/login'
     | '/new'
@@ -113,6 +125,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  CapacityRoute: typeof CapacityRoute
   DeploymentsRoute: typeof DeploymentsRoute
   LoginRoute: typeof LoginRoute
   NewRoute: typeof NewRoute
@@ -128,6 +141,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/capacity': {
+      id: '/capacity'
+      path: '/capacity'
+      fullPath: '/capacity'
+      preLoaderRoute: typeof CapacityRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/deployments': {
@@ -177,6 +197,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  CapacityRoute: CapacityRoute,
   DeploymentsRoute: DeploymentsRoute,
   LoginRoute: LoginRoute,
   NewRoute: NewRoute,

@@ -62,6 +62,11 @@ backups of the data directory. Settings responses contain environment key names
 only, and application diagnostics redact configured values, including previous
 values after rotation or removal.
 
+The **Capacity** page reports host memory/CPU, filesystem and Harbor storage
+growth, app limits and measured usage, and active systemd build usage. Unsupported
+measurements stay unavailable. See [docs/capacity.md](docs/capacity.md) for the
+sampling boundaries and the deployment headroom estimate.
+
 ## Linux setup and demo
 
     make build
