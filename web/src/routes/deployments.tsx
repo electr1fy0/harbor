@@ -49,30 +49,35 @@ const columns = column.columns([
       </Link>
     ),
   }),
-  column.accessor((app) => app.Deployment?.ID ?? "", {
+  column.accessor((app) => app.LatestAttempt?.ID ?? "", {
     id: "attempt",
-    header: "Deployment",
+    header: "Latest attempt",
     cell: ({ getValue }) => (
       <span className="font-mono text-xs text-muted-foreground">
         {shortHash(getValue())}
       </span>
     ),
   }),
-  column.accessor((app) => app.Deployment?.State ?? "Unknown", {
+  column.accessor((app) => app.LatestAttempt?.State ?? "Unknown", {
     id: "status",
-    header: "Status",
+    header: "Attempt status",
     cell: ({ getValue }) => <StatusBadge state={getValue()} />,
   }),
-  column.accessor((app) => app.Deployment?.CreatedAt ?? "", {
+  column.accessor((app) => app.Production?.State ?? "No production route", {
+    id: "production",
+    header: "Production",
+    cell: ({ getValue }) => <StatusBadge state={getValue()} />,
+  }),
+  column.accessor((app) => app.LatestAttempt?.CreatedAt ?? "", {
     id: "started",
-    header: "Started",
+    header: "Attempt time",
     cell: ({ getValue }) => (
       <span className="text-xs text-muted-foreground">
         {formatDate(getValue())}
       </span>
     ),
   }),
-  column.accessor((app) => app.Deployment?.Error ?? "", {
+  column.accessor((app) => app.LatestAttempt?.Error ?? "", {
     id: "details",
     header: "Details",
     cell: ({ getValue }) => (
@@ -91,7 +96,7 @@ function DeploymentsPage() {
   const apps = useMemo(
     () =>
       (overview.data?.apps ?? emptyApps).filter(
-        (app) => app.Deployment !== null
+        (app) => app.LatestAttempt !== null
       ),
     [overview.data?.apps]
   )

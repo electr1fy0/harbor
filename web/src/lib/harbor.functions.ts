@@ -3,6 +3,7 @@ import {
   configureAppInputSchema,
   connectGitHubInputSchema,
   deployAppInputSchema,
+  getDeploymentJobInputSchema,
   getAppSettingsInputSchema,
   getAppInputSchema,
   getCapacityInputSchema,
@@ -57,6 +58,20 @@ export const deployApp = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const { deployAppData } = await import("./harbor.server")
     return deployAppData(data)
+  })
+
+export const retryGitHubDeployment = createServerFn({ method: "POST" })
+  .validator((input: unknown) => parseInput(getAppInputSchema, input))
+  .handler(async ({ data }) => {
+    const { retryGitHubDeploymentData } = await import("./harbor.server")
+    return retryGitHubDeploymentData(data.name)
+  })
+
+export const getDeploymentJob = createServerFn({ method: "GET" })
+  .validator((input: unknown) => parseInput(getDeploymentJobInputSchema, input))
+  .handler(async ({ data }) => {
+    const { getDeploymentJobData } = await import("./harbor.server")
+    return getDeploymentJobData(data.id)
   })
 
 export const stopApp = createServerFn({ method: "POST" })

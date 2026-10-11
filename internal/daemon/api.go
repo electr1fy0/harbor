@@ -8,6 +8,7 @@ import (
 // Request describes a local control-plane operation.
 type Request struct {
 	Name              string            `json:"Name,omitempty"`
+	DeploymentID      string            `json:"DeploymentID,omitempty"`
 	SourceDir         string            `json:"SourceDir,omitempty"`
 	RepoURL           string            `json:"RepoURL,omitempty"`
 	Ref               string            `json:"Ref,omitempty"`
@@ -25,20 +26,23 @@ type Request struct {
 }
 
 type AppView struct {
-	Application model.Application
-	Deployment  *model.Deployment
+	Application   model.Application
+	Deployment    *model.Deployment
+	Production    *model.Deployment
+	LatestAttempt *model.Deployment
 }
 
 type Response struct {
-	URL        string              `json:"URL,omitempty"`
-	Deployment *model.Deployment   `json:"Deployment,omitempty"`
-	Apps       []AppView           `json:"Apps,omitempty"`
-	Releases   []model.ReleaseView `json:"Releases,omitempty"`
-	Logs       string              `json:"Logs,omitempty"`
-	Error      string              `json:"Error,omitempty"`
-	Service    *model.Service      `json:"Service,omitempty"`
-	Services   []model.Service     `json:"Services,omitempty"`
-	Binding    *model.Binding      `json:"Binding,omitempty"`
-	Settings   *model.Settings     `json:"settings,omitempty"`
-	Capacity   *capacity.Snapshot  `json:"Capacity,omitempty"`
+	URL         string              `json:"URL,omitempty"`
+	Deployment  *model.Deployment   `json:"Deployment,omitempty"`
+	Apps        []AppView           `json:"Apps,omitempty"`
+	Releases    []model.ReleaseView `json:"Releases,omitempty"`
+	Logs        string              `json:"Logs,omitempty"`
+	Error       string              `json:"Error,omitempty"`
+	Service     *model.Service      `json:"Service,omitempty"`
+	Services    []model.Service     `json:"Services,omitempty"`
+	Binding     *model.Binding      `json:"Binding,omitempty"`
+	Settings    *model.Settings     `json:"settings,omitempty"`
+	Capacity    *capacity.Snapshot  `json:"Capacity,omitempty"`
+	Diagnostics *model.Diagnostics  `json:"diagnostics,omitempty"`
 }

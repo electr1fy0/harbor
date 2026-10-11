@@ -53,6 +53,26 @@ type Settings struct {
 	TasksLimit      int      `json:"tasksLimit"`
 }
 
+// DiagnosticAction describes a safe control-plane action without suggesting
+// that it is available when the required app state or source metadata is absent.
+type DiagnosticAction struct {
+	ID        string `json:"id"`
+	Label     string `json:"label"`
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+	ReleaseID string `json:"releaseID,omitempty"`
+}
+
+// Diagnostics separates the route currently serving production from the
+// newest deployment attempt. Excerpt contains a short, redacted log tail.
+type Diagnostics struct {
+	Production    *Deployment        `json:"production"`
+	LatestAttempt *Deployment        `json:"latestAttempt"`
+	Summary       string             `json:"summary"`
+	Excerpt       string             `json:"excerpt,omitempty"`
+	Actions       []DiagnosticAction `json:"actions"`
+}
+
 type Deployment struct {
 	ID             string
 	AppID          string

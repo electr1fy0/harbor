@@ -1,4 +1,10 @@
-import { useCallback, useMemo, useState, type ReactNode } from "react"
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   createColumnHelper,
@@ -41,8 +47,16 @@ import { formatDate, shortHash } from "@/components/app/format"
 import { PageError, PageLoading } from "@/components/app/page-state"
 import { StatusBadge } from "@/components/app/status-badge"
 import { ProjectSettings } from "@/components/app/project-settings"
-import { appQueryOptions, overviewQueryOptions } from "@/lib/queries"
-import { rollbackApp, stopApp } from "@/lib/harbor.functions"
+import {
+  appQueryOptions,
+  deploymentJobQueryOptions,
+  overviewQueryOptions,
+} from "@/lib/queries"
+import {
+  retryGitHubDeployment,
+  rollbackApp,
+  stopApp,
+} from "@/lib/harbor.functions"
 import type { ReleaseView } from "@/lib/types"
 
 export const Route = createFileRoute("/projects/$name")({
@@ -53,13 +67,20 @@ const releaseFeatures = tableFeatures({})
 const releaseColumn = createColumnHelper<typeof releaseFeatures, ReleaseView>()
 
 type PendingAction =
-  { kind: "stop" } | { kind: "rollback"; release: ReleaseView }
+  | { kind: "stop" }
+  | { kind: "rollback"; release: ReleaseView | null; releaseID?: string }
 
 function ProjectDetailPage() {
   const { name } = Route.useParams()
   const queryClient = useQueryClient()
   const details = useQuery(appQueryOptions(name))
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null)
+  const [activeTab, setActiveTab] = useState("history")
+  const [jobID, setJobID] = useState("")
+  const jobQuery = useQuery({
+    ...deploymentJobQueryOptions(jobID),
+    enabled: Boolean(jobID),
+  })
 
   const refresh = useCallback(async () => {
     await Promise.all([
@@ -101,6 +122,26 @@ function ProjectDetailPage() {
       toast.error(error.message || `Could not roll back ${name}`),
   })
 
+  const retryMutation = useMutation({
+    mutationFn: () => retryGitHubDeployment({ data: { name } }),
+    onSuccess: async (job) => {
+      setJobID(job.id)
+      queryClient.setQueryData(["harbor", "job", job.id], job)
+      await refresh()
+      toast.success(`Redeployment queued for ${name}`)
+    },
+    onError: (error) => toast.error(error.message || `Could not retry ${name}`),
+  })
+
+  useEffect(() => {
+    if (
+      jobQuery.data &&
+      ["SUCCEEDED", "FAILED", "CANCELED"].includes(jobQuery.data.state)
+    ) {
+      void refresh()
+    }
+  }, [jobQuery.data?.state, refresh])
+
   if (details.isPending) return <PageLoading rows={4} />
   if (details.isError && !details.data) {
     return (
@@ -112,22 +153,42 @@ function ProjectDetailPage() {
   }
 
   const deployment = details.data.deployment
+  const diagnostics = details.data.diagnostics
+  const production = diagnostics
+    ? diagnostics.production
+    : deployment?.State === "RUNNING"
+      ? deployment
+      : null
+  const latestAttempt = diagnostics ? diagnostics.latestAttempt : deployment
+  const runtimeDeployment = production ?? latestAttempt
   const releases = details.data.releases
   const canStop =
-    deployment &&
-    [
-      "QUEUED",
-      "BUILDING",
-      "BUILT",
-      "STARTING",
-      "HEALTH_CHECKING",
-      "RUNNING",
-    ].includes(deployment.State)
+    production?.State === "RUNNING" ||
+    Boolean(
+      latestAttempt &&
+      [
+        "QUEUED",
+        "BUILDING",
+        "BUILT",
+        "STARTING",
+        "HEALTH_CHECKING",
+        "RUNNING",
+      ].includes(latestAttempt.State)
+    )
   const canCancelAttempt =
-    deployment && ["QUEUED", "BUILDING", "BUILT"].includes(deployment.State)
-  const mutationPending = stopMutation.isPending || rollbackMutation.isPending
+    latestAttempt &&
+    ["QUEUED", "BUILDING", "BUILT"].includes(latestAttempt.State)
+  const mutationPending =
+    stopMutation.isPending ||
+    rollbackMutation.isPending ||
+    retryMutation.isPending
   const mutationError =
-    stopMutation.error?.message || rollbackMutation.error?.message
+    stopMutation.error?.message ||
+    rollbackMutation.error?.message ||
+    retryMutation.error?.message
+
+  const diagnosticAction = (id: string) =>
+    diagnostics?.actions.find((action) => action.id === id)
 
   return (
     <>
@@ -146,7 +207,11 @@ function ProjectDetailPage() {
             <h1 className="max-w-full truncate text-[26px] leading-tight font-semibold tracking-[-0.045em] text-[#18211f] sm:text-[30px]">
               {name}
             </h1>
-            <StatusBadge state={deployment?.State ?? "Not deployed"} />
+            <StatusBadge
+              state={
+                production?.State ?? latestAttempt?.State ?? "Not deployed"
+              }
+            />
           </div>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
@@ -191,6 +256,7 @@ function ProjectDetailPage() {
             onClick={() => {
               stopMutation.reset()
               rollbackMutation.reset()
+              retryMutation.reset()
             }}
           >
             Dismiss
@@ -206,31 +272,31 @@ function ProjectDetailPage() {
                 <IconServer size={17} />
               </span>
               <div>
-                <CardTitle className="text-sm">Current deployment</CardTitle>
+                <CardTitle className="text-sm">Production</CardTitle>
               </div>
             </div>
-            {deployment ? <StatusBadge state={deployment.State} /> : null}
+            {production ? <StatusBadge state={production.State} /> : null}
           </CardHeader>
-          {deployment ? (
+          {production ? (
             <CardContent className="grid gap-x-6 gap-y-4 pt-4 sm:grid-cols-2">
               <DetailField
                 label="Deployment ID"
                 value={
                   <span className="font-mono text-xs">
-                    {shortHash(deployment.ID)}
+                    {shortHash(production.ID)}
                   </span>
                 }
               />
               <DetailField
                 label="Last updated"
-                value={formatDate(deployment.StartedAt || deployment.CreatedAt)}
+                value={formatDate(production.StartedAt || production.CreatedAt)}
               />
-              <DetailField label="Port" value={deployment.Port || "—"} />
+              <DetailField label="Port" value={production.Port || "—"} />
               <DetailField
                 label="Release"
                 value={
                   <span className="font-mono text-xs">
-                    {shortHash(deployment.ReleaseID)}
+                    {shortHash(production.ReleaseID)}
                   </span>
                 }
               />
@@ -250,14 +316,14 @@ function ProjectDetailPage() {
                   }
                 />
               ) : null}
-              {deployment.Error ? (
+              {production.Error ? (
                 <div className="sm:col-span-2">
                   <Separator className="mb-3" />
                   <p className="text-[10px] font-semibold tracking-[0.1em] text-muted-foreground uppercase">
                     Latest error
                   </p>
                   <p className="mt-1.5 text-sm leading-6 text-[#a4463f]">
-                    {deployment.Error}
+                    {production.Error}
                   </p>
                 </div>
               ) : null}
@@ -268,7 +334,14 @@ function ProjectDetailPage() {
                 <IconServer size={16} />
               </span>
               <div>
-                <p className="text-sm font-medium">No deployment yet</p>
+                <p className="text-sm font-medium">
+                  No production route is serving traffic.
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {latestAttempt
+                    ? "The latest attempt is shown in deployment diagnostics."
+                    : "Deploy the application to start production."}
+                </p>
               </div>
             </CardContent>
           )}
@@ -286,30 +359,195 @@ function ProjectDetailPage() {
           <CardContent className="grid grid-cols-2 gap-x-4 gap-y-4 pt-4">
             <DetailField
               label="Memory"
-              value={deployment?.MemoryLimit || "—"}
+              value={runtimeDeployment?.MemoryLimit || "—"}
             />
             <DetailField
               label="CPU quota"
               value={
-                deployment?.CPUQuota
-                  ? `${Number(deployment.CPUQuota.toFixed(2))} vCPU`
+                runtimeDeployment?.CPUQuota
+                  ? `${Number(runtimeDeployment.CPUQuota.toFixed(2))} vCPU`
                   : "—"
               }
             />
             <DetailField
               label="Tasks limit"
-              value={deployment?.TasksLimit || "—"}
+              value={runtimeDeployment?.TasksLimit || "—"}
             />
             <DetailField
               label="Health path"
-              value={deployment?.HealthPath || "—"}
+              value={runtimeDeployment?.HealthPath || "—"}
             />
           </CardContent>
         </Card>
       </div>
 
+      {diagnostics ? (
+        <Card
+          className="mt-4 border-border/80 bg-white"
+          aria-label="Deployment diagnostics"
+        >
+          <CardHeader className="flex-row items-start justify-between gap-3 border-b border-border/60 pb-4">
+            <div>
+              <CardTitle className="text-sm">Deployment diagnostics</CardTitle>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Production health and the latest deployment attempt are tracked
+                separately.
+              </p>
+            </div>
+            {latestAttempt ? <StatusBadge state={latestAttempt.State} /> : null}
+          </CardHeader>
+          <CardContent className="space-y-4 pt-4">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <p className="text-[10px] font-semibold tracking-[0.1em] text-muted-foreground uppercase">
+                  Production
+                </p>
+                <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                  <StatusBadge
+                    state={production?.State ?? "No production route"}
+                  />
+                  {production ? (
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {shortHash(production.ID)}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+              <div>
+                <p className="text-[10px] font-semibold tracking-[0.1em] text-muted-foreground uppercase">
+                  Latest attempt
+                </p>
+                <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                  {latestAttempt ? (
+                    <>
+                      <StatusBadge state={latestAttempt.State} />
+                      <span className="font-mono text-xs text-muted-foreground">
+                        {shortHash(latestAttempt.ID)}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-sm text-muted-foreground">
+                      None recorded
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+            {diagnostics.summary ? (
+              <p className="text-sm leading-6 text-foreground">
+                {diagnostics.summary}
+              </p>
+            ) : null}
+            {diagnostics.excerpt ? (
+              <pre className="max-h-40 overflow-auto rounded-lg border border-[#242927] bg-[#202726] p-3 font-mono text-[11px] leading-5 text-[#e6ebe7]">
+                <code>{diagnostics.excerpt}</code>
+              </pre>
+            ) : null}
+            {jobID && (jobQuery.data || jobQuery.isError) ? (
+              <div className="rounded-lg border border-border/70 bg-[#fbfcfb] px-3 py-2.5 text-sm">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">GitHub redeployment</span>
+                  <StatusBadge
+                    state={
+                      jobQuery.isError
+                        ? "Status unavailable"
+                        : jobQuery.data.state
+                    }
+                  />
+                  {jobQuery.data && !jobQuery.isError ? (
+                    <span className="text-xs text-muted-foreground">
+                      {jobQuery.data.stage.toLowerCase().replaceAll("_", " ")}
+                    </span>
+                  ) : null}
+                </div>
+                {jobQuery.isError ? (
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                    <p role="alert" className="text-xs text-[#a4463f]">
+                      {jobQuery.error.message ||
+                        "Redeployment status is unavailable; retry the status check."}
+                    </p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={jobQuery.isFetching}
+                      onClick={() => void jobQuery.refetch()}
+                    >
+                      {jobQuery.isFetching ? "Checking…" : "Retry status"}
+                    </Button>
+                  </div>
+                ) : jobQuery.data.error ? (
+                  <p className="mt-1.5 text-xs text-[#a4463f]">
+                    {jobQuery.data.error}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            <div className="flex flex-wrap gap-2">
+              {diagnosticAction("view_attempt_logs")?.available ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setActiveTab("logs")}
+                >
+                  <IconTerminal2 data-icon="inline-start" /> View failed attempt
+                  logs
+                </Button>
+              ) : null}
+              {diagnosticAction("configure_settings")?.available ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setActiveTab("settings")}
+                >
+                  Configure memory or environment
+                </Button>
+              ) : null}
+              {diagnosticAction("retry_github_deploy")?.available ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={retryMutation.isPending}
+                  onClick={() => retryMutation.mutate()}
+                >
+                  <IconRotateClockwise data-icon="inline-start" />
+                  {retryMutation.isPending
+                    ? "Queueing…"
+                    : "Retry GitHub deployment"}
+                </Button>
+              ) : null}
+              {diagnosticAction("rollback_release")?.available ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    setPendingAction({
+                      kind: "rollback",
+                      release: null,
+                      releaseID:
+                        diagnosticAction("rollback_release")?.releaseID,
+                    })
+                  }
+                >
+                  <IconRotateClockwise data-icon="inline-start" /> Roll back
+                  last good release
+                </Button>
+              ) : null}
+            </div>
+            {diagnosticAction("retry_github_deploy")?.available === false ? (
+              <p className="text-xs text-muted-foreground">
+                {diagnosticAction("retry_github_deploy")?.reason}
+              </p>
+            ) : null}
+          </CardContent>
+        </Card>
+      ) : null}
+
       <section className="mt-7" aria-label="Deployment activity">
-        <Tabs defaultValue="history" className="gap-4">
+        <Tabs
+          value={activeTab}
+          onValueChange={(value) => setActiveTab(String(value ?? "history"))}
+          className="gap-4"
+        >
           <div className="flex flex-col gap-3 border-b border-border/70 sm:flex-row sm:items-center sm:justify-between">
             <TabsList variant="line" className="h-9 rounded-none px-0">
               <TabsTrigger value="history" className="flex-none gap-1.5 px-2.5">
@@ -388,7 +626,12 @@ function ProjectDetailPage() {
                 ? canCancelAttempt
                   ? `Cancel the in-progress deployment for ${name}?`
                   : `${name} will stop serving traffic. You can deploy it again later.`
-                : `Harbor will make release ${pendingAction?.kind === "rollback" ? shortHash(pendingAction.release.id) : ""} active for ${name}.`}
+                : pendingAction?.kind === "rollback" && pendingAction.release
+                  ? `Harbor will make release ${shortHash(pendingAction.release.id)} active for ${name}.`
+                  : pendingAction?.kind === "rollback" &&
+                      pendingAction.releaseID
+                    ? `Harbor will make release ${shortHash(pendingAction.releaseID)} active for ${name}.`
+                    : `Harbor will restore the last good release for ${name}.`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -407,14 +650,18 @@ function ProjectDetailPage() {
               onClick={() => {
                 if (pendingAction?.kind === "stop") stopMutation.mutate()
                 if (pendingAction?.kind === "rollback")
-                  rollbackMutation.mutate(pendingAction.release.id)
+                  rollbackMutation.mutate(
+                    pendingAction.release?.id ?? pendingAction.releaseID ?? ""
+                  )
               }}
             >
               {mutationPending
                 ? "Working…"
                 : pendingAction?.kind === "stop" &&
-                    deployment &&
-                    ["QUEUED", "BUILDING", "BUILT"].includes(deployment.State)
+                    latestAttempt &&
+                    ["QUEUED", "BUILDING", "BUILT"].includes(
+                      latestAttempt.State
+                    )
                   ? "Cancel attempt"
                   : pendingAction?.kind === "stop"
                     ? "Stop application"

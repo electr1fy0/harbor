@@ -80,6 +80,17 @@ func TestSettingsAndConfigureMetadataAPI(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "data", "environment.key")); err != nil {
 		t.Fatal(err)
 	}
+
+	apps := httptest.NewRecorder()
+	server.http.Handler.ServeHTTP(apps, httptest.NewRequest(http.MethodPost, "/apps", strings.NewReader(`{}`)))
+	if apps.Code != http.StatusOK || !strings.Contains(apps.Body.String(), `"Production":null`) || !strings.Contains(apps.Body.String(), `"LatestAttempt":null`) {
+		t.Fatalf("apps response did not include production/latest-attempt metadata: status=%d body=%s", apps.Code, apps.Body.String())
+	}
+	diagnostics := httptest.NewRecorder()
+	server.http.Handler.ServeHTTP(diagnostics, httptest.NewRequest(http.MethodPost, "/diagnostics", strings.NewReader(`{"Name":"private"}`)))
+	if diagnostics.Code != http.StatusOK || strings.Contains(diagnostics.Body.String(), "api-secret") || !strings.Contains(diagnostics.Body.String(), `"latestAttempt":null`) {
+		t.Fatalf("diagnostics route status=%d body=%s", diagnostics.Code, diagnostics.Body.String())
+	}
 }
 
 func TestSettingsAndConfigureRoutesRequirePOST(t *testing.T) {

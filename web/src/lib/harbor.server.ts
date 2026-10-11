@@ -3,12 +3,15 @@ import { request as httpRequest } from "node:http"
 import { env } from "node:process"
 import type {
   AppDetails,
+  AppDiagnostics,
   AppSettings,
   AppView,
   CapacitySnapshot,
+  DiagnosticAction,
   Deployment,
-  DeploymentResult,
   DeploymentJob,
+  DeploymentJobState,
+  DeploymentResult,
   GitHubBranch,
   GitHubConnection,
   GitHubRepo,
@@ -46,6 +49,9 @@ interface DaemonResponse extends JsonObject {
   Services?: unknown
   Releases?: unknown
   Logs?: unknown
+  diagnostics?: unknown
+  Diagnostics?: unknown
+  job?: unknown
   Error?: unknown
 }
 
@@ -139,7 +145,7 @@ function safeDeploymentError(state: string): string {
     case "CRASHED":
       return "App stopped unexpectedly. Review the app logs for details."
     case "OOM_KILLED":
-      return "App exceeded its memory limit. Review the app logs for details."
+      return "Runtime was OOM-killed. Review app diagnostics and memory usage."
     default:
       return ""
   }
@@ -197,13 +203,121 @@ function mapAppView(value: unknown): AppView {
   }
 
   const application = value.Application
+  const deployment = mapDeployment(value.Deployment)
+  const production =
+    value.Production === undefined
+      ? deployment?.State === "RUNNING"
+        ? deployment
+        : null
+      : mapDeployment(value.Production)
+  const latestAttempt =
+    value.LatestAttempt === undefined
+      ? deployment
+      : mapDeployment(value.LatestAttempt)
+
   return {
     Application: {
       ID: safeString(application.ID, 128),
       Name: safeSlug(application.Name),
       CreatedAt: safeTime(application.CreatedAt),
     },
-    Deployment: mapDeployment(value.Deployment),
+    Deployment: deployment,
+    Production: production,
+    LatestAttempt: latestAttempt,
+  }
+}
+
+const diagnosticActionLabels: Record<DiagnosticAction["id"], string> = {
+  view_attempt_logs: "View failed attempt logs",
+  configure_settings: "Configure memory and environment",
+  retry_github_deploy: "Retry deployment from configured GitHub source",
+  rollback_release: "Roll back last good release",
+}
+
+function mapDiagnostics(value: unknown): AppDiagnostics {
+  if (!isObject(value)) {
+    throw new HarborOperationError("Harbor returned invalid diagnostics data.")
+  }
+  const validActions = new Set(Object.keys(diagnosticActionLabels))
+  const actions = arrayValue(value.actions ?? value.Actions)
+    .filter(isObject)
+    .flatMap((action): DiagnosticAction[] => {
+      const id = safeString(action.id ?? action.ID, 64)
+      if (!validActions.has(id)) return []
+      const safeID = id as DiagnosticAction["id"]
+      return [
+        {
+          id: safeID,
+          label: diagnosticActionLabels[safeID],
+          available: safeBoolean(action.available ?? action.Available),
+          reason: safeString(action.reason ?? action.Reason, 300),
+          releaseID: safeString(action.releaseID ?? action.ReleaseID, 128),
+        },
+      ]
+    })
+
+  return {
+    production: mapDeployment(value.production ?? value.Production),
+    latestAttempt: mapDeployment(value.latestAttempt ?? value.LatestAttempt),
+    summary: safeString(value.summary ?? value.Summary, 1000),
+    excerpt: sanitizeLogs(value.excerpt ?? value.Excerpt).slice(-8_000),
+    actions,
+  }
+}
+
+const deploymentJobStates = new Set<DeploymentJobState>([
+  "QUEUED",
+  "RUNNING",
+  "SUCCEEDED",
+  "FAILED",
+  "CANCELLING",
+  "CANCELED",
+])
+
+const deploymentJobStages = new Set([
+  "QUEUED",
+  "CLONING",
+  "PROVISIONING_DATABASE",
+  "BUILDING",
+  "STARTING",
+  "HEALTH_CHECK",
+  "COMPLETED",
+  "FAILED",
+  "CANCELED",
+])
+
+function mapDeploymentJob(value: unknown): DeploymentJob {
+  if (!isObject(value)) {
+    throw new HarborOperationError(
+      "Harbor returned invalid deployment job data."
+    )
+  }
+  const stateValue = safeString(value.state, 32).toUpperCase()
+  const state = deploymentJobStates.has(stateValue as DeploymentJobState)
+    ? (stateValue as DeploymentJobState)
+    : "UNKNOWN"
+  const stageValue = safeString(value.stage, 64).toUpperCase()
+  const stage = deploymentJobStages.has(stageValue) ? stageValue : "UNKNOWN"
+  const safeError =
+    state === "FAILED"
+      ? "The deployment failed. Review its logs and deployment diagnostics."
+      : state === "CANCELED"
+        ? "The deployment was canceled."
+        : ""
+
+  return {
+    id: safeString(value.id, 128),
+    name: safeSlug(value.name),
+    state,
+    stage,
+    createdAt: safeTime(value.createdAt),
+    updatedAt: safeTime(value.updatedAt),
+    deployment: mapDeployment(value.deployment),
+    error: sanitizeLogs(value.error).slice(-512) || safeError,
+    logs: arrayValue(value.logs)
+      .filter((line): line is string => typeof line === "string")
+      .slice(-200)
+      .map((line) => sanitizeLogs(line).slice(-4_000)),
   }
 }
 
@@ -747,7 +861,7 @@ export async function getOverviewData(): Promise<Overview> {
 }
 
 export async function getAppData(name: string): Promise<AppDetails> {
-  const [inspectResult, releasesResult, logsResult, settingsResult] =
+  const [inspectResult, releasesResult, settingsResult, diagnosticsResult] =
     await Promise.allSettled([
       daemonCall(
         "/inspect",
@@ -761,17 +875,17 @@ export async function getAppData(name: string): Promise<AppDetails> {
         DEFAULT_TIMEOUT_MS,
         "Could not load app releases."
       ),
+      getAppSettingsData(name),
       daemonCall(
-        "/logs",
+        "/diagnostics",
         { Name: name },
         DEFAULT_TIMEOUT_MS,
-        "Could not load app logs."
+        "Could not load deployment diagnostics."
       ),
-      getAppSettingsData(name),
     ])
 
   if (
-    [inspectResult, releasesResult, logsResult, settingsResult].some(
+    [inspectResult, releasesResult, settingsResult, diagnosticsResult].some(
       (result) =>
         result.status === "rejected" && isTransportFailure(result.reason)
     )
@@ -792,34 +906,72 @@ export async function getAppData(name: string): Promise<AppDetails> {
     throw new HarborOperationError("Could not load app releases.")
   }
   if (
-    logsResult.status === "rejected" &&
-    !(logsResult.reason instanceof HarborNotFoundError)
-  ) {
-    throw new HarborOperationError("Could not load app logs.")
-  }
-  if (
     settingsResult.status === "rejected" &&
     !(settingsResult.reason instanceof HarborNotFoundError)
   ) {
     throw new HarborOperationError("Could not load app settings.")
+  }
+  if (
+    diagnosticsResult.status === "rejected" &&
+    !(diagnosticsResult.reason instanceof HarborNotFoundError)
+  ) {
+    throw new HarborOperationError("Could not load deployment diagnostics.")
   }
 
   const inspect =
     inspectResult.status === "fulfilled" ? inspectResult.value : null
   const releases =
     releasesResult.status === "fulfilled" ? releasesResult.value : null
-  const logs = logsResult.status === "fulfilled" ? logsResult.value : null
   const settings =
     settingsResult.status === "fulfilled" ? settingsResult.value : emptySettings
   const deployment = inspect ? mapDeployment(inspect.Deployment) : null
+  const rawDiagnostics =
+    diagnosticsResult.status === "fulfilled"
+      ? (diagnosticsResult.value.diagnostics ??
+        diagnosticsResult.value.Diagnostics)
+      : null
+  const diagnostics = rawDiagnostics ? mapDiagnostics(rawDiagnostics) : null
+  const logsResult = await Promise.allSettled([
+    daemonCall(
+      "/logs",
+      {
+        Name: name,
+        ...(diagnostics?.latestAttempt?.ID
+          ? { DeploymentID: diagnostics.latestAttempt.ID }
+          : {}),
+      },
+      DEFAULT_TIMEOUT_MS,
+      "Could not load app logs."
+    ),
+  ]).then(([result]) => result)
+  if (
+    logsResult.status === "rejected" &&
+    isTransportFailure(logsResult.reason)
+  ) {
+    throw new HarborUnavailableError()
+  }
+  if (
+    logsResult.status === "rejected" &&
+    !(logsResult.reason instanceof HarborNotFoundError)
+  ) {
+    throw new HarborOperationError("Could not load app logs.")
+  }
+  const logs = logsResult.status === "fulfilled" ? logsResult.value : null
+  const routeDeployment = diagnostics
+    ? diagnostics.production
+    : deployment?.State === "RUNNING"
+      ? deployment
+      : null
 
   return {
     deployment,
+    diagnostics,
     releases: arrayValue(releases?.Releases).map(mapRelease),
     logs: sanitizeLogs(logs?.Logs),
-    url:
-      configuredHTTPSUrl(deployment, settings.domains) ||
-      safeRouteUrl(inspect?.URL, deployment, settings.domains),
+    url: routeDeployment
+      ? configuredHTTPSUrl(routeDeployment, settings.domains) ||
+        safeRouteUrl(inspect?.URL, routeDeployment, settings.domains)
+      : "",
     settings,
   }
 }
@@ -917,39 +1069,6 @@ function mapProjectInspection(value: unknown): ProjectInspection {
   }
 }
 
-const jobStates = new Set([
-  "QUEUED",
-  "RUNNING",
-  "SUCCEEDED",
-  "FAILED",
-  "CANCELLING",
-  "CANCELED",
-])
-function mapDeploymentJob(value: unknown): DeploymentJob {
-  if (!isObject(value))
-    throw new HarborOperationError(
-      "Harbor returned invalid deployment job data."
-    )
-  const stateValue = safeString(value.state, 24).toUpperCase()
-  const state = jobStates.has(stateValue)
-    ? (stateValue as DeploymentJob["state"])
-    : "FAILED"
-  const logs = arrayValue(value.logs)
-    .map((line) => sanitizeLogs(line))
-    .filter(Boolean)
-  return {
-    id: safeString(value.id, 64),
-    name: safeSlug(value.name),
-    state,
-    stage: safeString(value.stage, 32),
-    createdAt: safeTime(value.createdAt),
-    updatedAt: safeTime(value.updatedAt),
-    deployment: mapDeployment(value.deployment),
-    error: safeString(value.error, 512),
-    logs,
-  }
-}
-
 async function onboardingJobCall(
   method: "GET" | "POST" | "DELETE",
   endpoint: string,
@@ -1038,6 +1157,26 @@ export async function cancelOnboardingJobData(
     undefined,
     DEFAULT_TIMEOUT_MS
   )
+}
+
+export async function retryGitHubDeploymentData(
+  name: string
+): Promise<DeploymentJob> {
+  return onboardingJobCall(
+    "POST",
+    "/jobs/redeploy",
+    { name },
+    DEFAULT_TIMEOUT_MS
+  )
+}
+
+export async function getDeploymentJobData(id: string): Promise<DeploymentJob> {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) {
+    throw new HarborOperationError(
+      "Harbor returned invalid deployment job data."
+    )
+  }
+  return getOnboardingJobData(id)
 }
 
 export async function stopAppData(name: string): Promise<DeploymentResult> {

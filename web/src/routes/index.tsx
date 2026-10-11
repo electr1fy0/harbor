@@ -34,7 +34,7 @@ function ProjectsPage() {
     [apps, search]
   )
   const running = apps.filter(
-    (app) => app.Deployment?.State.toLowerCase() === "running"
+    (app) => app.Production?.State.toLowerCase() === "running"
   ).length
   const failed = apps.filter((app) =>
     [
@@ -45,7 +45,7 @@ function ProjectsPage() {
       "unhealthy",
       "crashed",
       "oom_killed",
-    ].includes(app.Deployment?.State.toLowerCase() ?? "")
+    ].includes(app.LatestAttempt?.State.toLowerCase() ?? "")
   ).length
 
   if (overview.isPending) return <PageLoading rows={4} />
@@ -194,8 +194,11 @@ function SummaryMetric({
 }
 
 function ProjectCard({ app }: { app: AppView }) {
-  const deployment = app.Deployment
-  const state = deployment?.State || "Not deployed"
+  const production = app.Production
+  const latestAttempt = app.LatestAttempt
+  const state = production?.State ?? latestAttempt?.State ?? "Not deployed"
+  const separateAttempt =
+    latestAttempt !== null && latestAttempt.ID !== production?.ID
 
   return (
     <Link
@@ -224,14 +227,26 @@ function ProjectCard({ app }: { app: AppView }) {
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3">
             <StatusBadge state={state} />
             <span className="text-[11px] text-muted-foreground">
-              {deployment
-                ? `Updated ${formatRelative(deployment.CreatedAt)}`
+              {latestAttempt
+                ? `Updated ${formatRelative(latestAttempt.CreatedAt)}`
                 : "No deployment yet"}
             </span>
           </div>
-          {deployment?.Error ? (
+          {separateAttempt ? (
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-border/50 pt-2">
+              <span className="text-[11px] text-muted-foreground">
+                Latest attempt
+              </span>
+              <StatusBadge state={latestAttempt.State} />
+              {latestAttempt.Error ? (
+                <p className="line-clamp-1 min-w-0 text-xs text-[#a4463f]">
+                  {latestAttempt.Error}
+                </p>
+              ) : null}
+            </div>
+          ) : latestAttempt?.Error ? (
             <p className="line-clamp-1 text-xs text-[#a4463f]">
-              {deployment.Error}
+              {latestAttempt.Error}
             </p>
           ) : null}
         </CardContent>

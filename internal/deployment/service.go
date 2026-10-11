@@ -647,8 +647,6 @@ func (s *Service) Releases(name string) ([]model.ReleaseView, error) {
 
 func (s *Service) Apps() ([]model.Application, error) { return s.db.Apps() }
 func (s *Service) Logs(name string) (string, error) {
-	// A failed candidate's diagnostics must remain accessible while inspection
-	// and traffic continue to identify the active deployment.
 	d, err := s.db.LatestDeployment(name)
 	if err != nil {
 		return "", err
@@ -656,18 +654,22 @@ func (s *Service) Logs(name string) (string, error) {
 	return s.LogsForDeployment(name, d.ID)
 }
 
-// LogsForDeployment returns logs for one app-scoped attempt. Callers polling a
-// candidate must not switch to a newer production deployment mid-job.
+// LogsForDeployment returns logs for one deployment belonging to name. The
+// application name is checked before reading either build or runtime output so
+// a caller cannot use a deployment ID to access another app's logs.
 func (s *Service) LogsForDeployment(name, deploymentID string) (string, error) {
+	var d *model.Deployment
+	var err error
 	if deploymentID == "" {
-		return "", store.ErrNotFound
+		d, err = s.db.LatestDeployment(name)
+	} else {
+		d, err = s.db.Deployment(deploymentID)
+		if err == nil && d.AppName != name {
+			return "", fmt.Errorf("%w: deployment %q", store.ErrNotFound, deploymentID)
+		}
 	}
-	d, err := s.db.Deployment(deploymentID)
 	if err != nil {
 		return "", err
-	}
-	if d.AppName != name {
-		return "", store.ErrNotFound
 	}
 	buildLogs, err := logTail(d.LogPath)
 	if err != nil {

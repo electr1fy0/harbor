@@ -123,6 +123,7 @@ describe("Harbor daemon transport", () => {
       async () => {
         const app = await getAppData("harbor-web")
         expect(app.url).toBe("https://app.example.com")
+        expect(app.diagnostics).toBeNull()
         expect(app.settings).toEqual({
           domains: ["app.example.com"],
           environmentKeys: ["API_TOKEN"],
@@ -427,6 +428,199 @@ describe("Harbor daemon transport", () => {
         expect(app.logs).not.toContain("/run/paas")
         expect(app.logs).not.toContain("/home/runner")
         expect(app.logs).not.toContain("user:secret")
+      }
+    )
+  })
+
+  it("maps production separately from a failed attempt and keeps diagnostics actions safe", async () => {
+    let attemptLogsRequest: Record<string, unknown> | undefined
+    await withDaemon(
+      (request, response) => {
+        if (request.url === "/inspect") {
+          jsonResponse(response, 200, {
+            URL: "https://app.example.com",
+            Deployment: {
+              ID: "dep_prod",
+              AppID: "app_1",
+              AppName: "harbor-web",
+              ReleaseID: "rel_prod",
+              Port: 8080,
+              State: "RUNNING",
+              CreatedAt: "2026-01-01T00:00:00Z",
+            },
+          })
+        } else if (request.url === "/releases") {
+          jsonResponse(response, 200, { Releases: [] })
+        } else if (request.url === "/logs") {
+          const chunks: Buffer[] = []
+          request.on("data", (chunk: Buffer | string) => {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+          })
+          request.on("end", () => {
+            attemptLogsRequest = JSON.parse(
+              Buffer.concat(chunks).toString("utf8")
+            )
+            jsonResponse(response, 200, { Logs: "candidate build output" })
+          })
+        } else if (request.url === "/settings") {
+          jsonResponse(response, 200, { settings: {} })
+        } else if (request.url === "/diagnostics") {
+          jsonResponse(response, 200, {
+            diagnostics: {
+              production: {
+                ID: "dep_prod",
+                AppID: "app_1",
+                AppName: "harbor-web",
+                ReleaseID: "rel_prod",
+                Port: 8080,
+                State: "RUNNING",
+                CreatedAt: "2026-01-01T00:00:00Z",
+              },
+              latestAttempt: {
+                ID: "dep_failed",
+                AppID: "app_1",
+                AppName: "harbor-web",
+                ReleaseID: "rel_failed",
+                Port: 0,
+                State: "BUILD_FAILED",
+                Error: "compiler said token=private",
+                CreatedAt: "2026-01-02T00:00:00Z",
+              },
+              summary:
+                "Production remains healthy and is serving traffic. Latest attempt: build failed.",
+              excerpt: "token=private\ncompiler output",
+              actions: [
+                {
+                  id: "view_attempt_logs",
+                  available: true,
+                },
+                {
+                  id: "rollback_release",
+                  available: true,
+                  releaseID: "rel_previous",
+                },
+                {
+                  id: "unknown_action",
+                  available: true,
+                },
+              ],
+            },
+          })
+        } else {
+          response.statusCode = 404
+          response.end("not found")
+        }
+      },
+      async () => {
+        const app = await getAppData("harbor-web")
+        expect(app.deployment?.ID).toBe("dep_prod")
+        expect(app.diagnostics?.production?.ID).toBe("dep_prod")
+        expect(app.diagnostics?.production?.State).toBe("RUNNING")
+        expect(app.diagnostics?.latestAttempt?.ID).toBe("dep_failed")
+        expect(app.diagnostics?.latestAttempt?.State).toBe("BUILD_FAILED")
+        expect(app.diagnostics?.excerpt).toContain("compiler output")
+        expect(app.diagnostics?.excerpt).not.toContain("private")
+        expect(attemptLogsRequest).toEqual({
+          Name: "harbor-web",
+          DeploymentID: "dep_failed",
+        })
+        expect(app.diagnostics?.actions).toEqual([
+          {
+            id: "view_attempt_logs",
+            label: "View failed attempt logs",
+            available: true,
+            reason: "",
+            releaseID: "",
+          },
+          {
+            id: "rollback_release",
+            label: "Roll back last good release",
+            available: true,
+            reason: "",
+            releaseID: "rel_previous",
+          },
+        ])
+        expect(JSON.stringify(app)).not.toContain("unknown_action")
+        expect(JSON.stringify(app)).not.toContain("token=private")
+      }
+    )
+  })
+
+  it("preserves an explicit null production route and maps a later successful attempt", async () => {
+    let diagnostics: unknown = {
+      production: null,
+      latestAttempt: {
+        ID: "dep_starting",
+        AppID: "app_1",
+        AppName: "harbor-web",
+        ReleaseID: "rel_starting",
+        Port: 8080,
+        State: "RUNNING",
+        CreatedAt: "2026-01-02T00:00:00Z",
+      },
+      summary:
+        "The latest deployment reports RUNNING, but no production route is active.",
+      actions: [],
+    }
+
+    await withDaemon(
+      (request, response) => {
+        if (request.url === "/inspect") {
+          jsonResponse(response, 200, {
+            Deployment: {
+              ID: "dep_starting",
+              AppID: "app_1",
+              AppName: "harbor-web",
+              ReleaseID: "rel_starting",
+              Port: 8080,
+              State: "RUNNING",
+              CreatedAt: "2026-01-02T00:00:00Z",
+            },
+          })
+        } else if (request.url === "/releases") {
+          jsonResponse(response, 200, { Releases: [] })
+        } else if (request.url === "/logs") {
+          jsonResponse(response, 200, { Logs: "" })
+        } else if (request.url === "/diagnostics") {
+          jsonResponse(response, 200, { diagnostics })
+        } else {
+          response.statusCode = 404
+          response.end("not found")
+        }
+      },
+      async () => {
+        const recovering = await getAppData("harbor-web")
+        expect(recovering.deployment?.State).toBe("RUNNING")
+        expect(recovering.diagnostics?.production).toBeNull()
+        expect(recovering.diagnostics?.latestAttempt?.ID).toBe("dep_starting")
+
+        const successfulDeployment = {
+          ID: "dep_success",
+          AppID: "app_1",
+          AppName: "harbor-web",
+          ReleaseID: "rel_success",
+          Port: 8080,
+          State: "RUNNING",
+          CreatedAt: "2026-01-03T00:00:00Z",
+        }
+        diagnostics = {
+          production: successfulDeployment,
+          latestAttempt: successfulDeployment,
+          summary:
+            "The latest deployment is healthy and serving production traffic.",
+          actions: [
+            {
+              id: "view_attempt_logs",
+              available: false,
+              reason: "No failed deployment attempt is recorded.",
+            },
+          ],
+        }
+        const successful = await getAppData("harbor-web")
+        expect(successful.diagnostics?.production?.ID).toBe("dep_success")
+        expect(successful.diagnostics?.latestAttempt?.ID).toBe("dep_success")
+        expect(successful.diagnostics?.summary).not.toContain("failed")
+        expect(successful.diagnostics?.actions[0]?.available).toBe(false)
       }
     )
   })

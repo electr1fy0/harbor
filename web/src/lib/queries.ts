@@ -3,6 +3,7 @@ import { getAuthStatus } from "./auth.functions"
 import {
   getApp,
   getCapacity,
+  getDeploymentJob,
   getOverview,
   listGitHubRepos,
 } from "./harbor.functions"
@@ -43,6 +44,22 @@ export function capacityQueryOptions(name?: string) {
     staleTime: 10_000,
     refetchInterval: 15_000,
     refetchIntervalInBackground: false,
+  })
+}
+
+export function deploymentJobQueryOptions(id: string) {
+  return queryOptions({
+    queryKey: ["harbor", "job", id] as const,
+    queryFn: () => getDeploymentJob({ data: { id } }),
+    staleTime: 1_000,
+    refetchInterval: (query) =>
+      query.state.error ||
+      (query.state.data &&
+        ["SUCCEEDED", "FAILED", "CANCELED"].includes(query.state.data.state))
+        ? false
+        : 1_500,
+    refetchIntervalInBackground: false,
+    retry: false,
   })
 }
 

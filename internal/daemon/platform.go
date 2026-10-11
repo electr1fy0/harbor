@@ -98,7 +98,7 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 				}
 			case "logs":
 				if service != nil {
-					output.Logs, err = service.Logs(input.Name)
+					output.Logs, err = service.LogsForDeployment(input.Name, input.DeploymentID)
 				}
 			case "releases":
 				if service != nil {
@@ -114,12 +114,25 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 					err = listErr
 					output.Apps = make([]AppView, 0, len(apps))
 					for _, app := range apps {
-						d, getErr := service.Inspect(app.Name)
-						if getErr != nil && !errors.Is(getErr, store.ErrNotFound) {
-							err = getErr
+						legacy, inspectErr := service.Inspect(app.Name)
+						if inspectErr != nil && !errors.Is(inspectErr, store.ErrNotFound) {
+							err = inspectErr
 							break
 						}
-						output.Apps = append(output.Apps, AppView{Application: app, Deployment: d})
+						production, productionErr := service.Production(app.Name)
+						if productionErr != nil {
+							err = productionErr
+							break
+						}
+						latestAttempt, latestErr := service.LatestAttempt(app.Name)
+						if latestErr != nil {
+							err = latestErr
+							break
+						}
+						output.Apps = append(output.Apps, AppView{
+							Application: app, Deployment: legacy,
+							Production: production, LatestAttempt: latestAttempt,
+						})
 					}
 				}
 			case "add":
@@ -214,6 +227,7 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 		})
 	}
 	registerOnboardingRoutes(mux, server)
+	registerDiagnosticsRoute(mux, service, server.onboardingJobs.CanRedeploy)
 	server.http.Handler = mux
 	return server
 }

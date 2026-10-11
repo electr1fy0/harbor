@@ -715,6 +715,26 @@ func (s *Store) PreviousRelease(appName string) (*contracts.Release, error) {
 	return r, nil
 }
 
+// PreviousPromotedRelease returns the most recently promoted release other
+// than excludedReleaseID. Diagnostics uses this when the failed production
+// route has already been removed, so it never offers the crashed release as
+// its own rollback target.
+func (s *Store) PreviousPromotedRelease(appName, excludedReleaseID string) (*contracts.Release, error) {
+	r, err := scanRelease(s.db.QueryRow(`
+		SELECT r.id, r.source_hash, r.runtime, r.artifact_dir, r.command, r.created_at
+		FROM deployments AS d JOIN releases AS r ON r.id = d.release_id
+		JOIN apps AS a ON a.id = d.app_id
+		WHERE a.name = ? AND d.promoted_at IS NOT NULL AND r.id != ?
+		ORDER BY d.promoted_at DESC, d.created_at DESC, d.id DESC LIMIT 1`, appName, excludedReleaseID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: no previous release available for application %q", ErrNotFound, appName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read previous promoted release: %w", err)
+	}
+	return r, nil
+}
+
 // ReleaseForApp refuses release IDs owned by other applications.
 func (s *Store) ReleaseForApp(appName, releaseID string) (*contracts.Release, error) {
 	r, err := scanRelease(s.db.QueryRow(`

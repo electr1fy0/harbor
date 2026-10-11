@@ -49,6 +49,53 @@ export interface Deployment {
 export interface AppView {
   Application: Application
   Deployment: Deployment | null
+  /** Deployment currently mapped to production, or null when no route serves. */
+  Production: Deployment | null
+  /** Most recent deployment attempt, even if an older production stays live. */
+  LatestAttempt: Deployment | null
+}
+
+export type DiagnosticActionID =
+  | "view_attempt_logs"
+  | "configure_settings"
+  | "retry_github_deploy"
+  | "rollback_release"
+
+export interface DiagnosticAction {
+  id: DiagnosticActionID
+  label: string
+  available: boolean
+  reason: string
+  releaseID?: string
+}
+
+export interface AppDiagnostics {
+  production: Deployment | null
+  latestAttempt: Deployment | null
+  summary: string
+  excerpt: string
+  actions: DiagnosticAction[]
+}
+
+export type DeploymentJobState =
+  | "QUEUED"
+  | "RUNNING"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "CANCELLING"
+  | "CANCELED"
+  | "UNKNOWN"
+
+export interface DeploymentJob {
+  id: string
+  name: string
+  state: DeploymentJobState
+  stage: string
+  createdAt: string
+  updatedAt: string
+  deployment: Deployment | null
+  error: string
+  logs: string[]
 }
 
 export interface Service {
@@ -81,6 +128,7 @@ export interface Overview {
 
 export interface AppDetails {
   deployment: Deployment | null
+  diagnostics: AppDiagnostics | null
   releases: ReleaseView[]
   logs: string
   url: string
@@ -193,17 +241,4 @@ export interface ProjectInspection {
   config: OnboardingConfig
   environmentKeys: string[]
   warnings: string[]
-}
-
-export interface DeploymentJob {
-  id: string
-  name: string
-  state:
-    "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLING" | "CANCELED"
-  stage: string
-  createdAt: string
-  updatedAt: string
-  deployment?: Deployment | null
-  error?: string
-  logs: string[]
 }

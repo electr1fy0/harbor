@@ -70,6 +70,12 @@ growth, app limits and measured usage, and active systemd build usage. Unsupport
 measurements stay unavailable. See [docs/capacity.md](docs/capacity.md) for the
 sampling boundaries and the deployment headroom estimate.
 
+Project diagnostics show the active production deployment separately from the
+latest attempt. Failed candidates keep the healthy version serving traffic and
+show a bounded, redacted log excerpt with available retry, settings, and rollback
+actions. See [docs/diagnostics.md](docs/diagnostics.md) for the evidence and action
+boundaries.
+
 ## Linux setup and demo
 
     make build

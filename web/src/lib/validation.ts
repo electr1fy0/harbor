@@ -79,11 +79,14 @@ export const getAppInputSchema = z.object({ name: appName }).strict()
 export const getCapacityInputSchema = z
   .object({ name: appName.optional() })
   .strict()
+export const getDeploymentJobInputSchema = z
+  .object({ id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/) })
+  .strict()
 export const stopAppInputSchema = z.object({ name: appName }).strict()
 export const rollbackAppInputSchema = z
   .object({
     name: appName,
-    releaseID: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+    releaseID: z.string().regex(/^(?:[A-Za-z0-9_-]{1,128})?$/),
   })
   .strict()
 export const deployAppInputSchema = z
@@ -174,6 +177,7 @@ export const configureAppInputSchema = z
 
 export type GetAppInput = z.infer<typeof getAppInputSchema>
 export type GetCapacityInput = z.infer<typeof getCapacityInputSchema>
+export type GetDeploymentJobInput = z.infer<typeof getDeploymentJobInputSchema>
 export type DeployAppInput = z.infer<typeof deployAppInputSchema>
 export type StopAppInput = z.infer<typeof stopAppInputSchema>
 export type RollbackAppInput = z.infer<typeof rollbackAppInputSchema>
