@@ -120,7 +120,7 @@ func main() {
 	}
 	routerServer := &http.Server{Handler: hostRouter, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 
-	server = daemon.NewPlatformServerWithServices(*socket, deploySvc, svcManager, routerListener.Addr().String())
+	server = daemon.NewPlatformServerWithServicesAndBuildUser(*socket, deploySvc, svcManager, *buildUser, routerListener.Addr().String())
 
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(listener) }()

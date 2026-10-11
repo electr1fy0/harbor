@@ -11,6 +11,7 @@ import (
 
 	"paas/internal/deployment"
 	"paas/internal/model"
+	"paas/internal/source"
 	"paas/internal/store"
 )
 
@@ -21,10 +22,14 @@ type ServiceManager interface {
 }
 
 func NewPlatformServer(socketPath string, service *deployment.Service, routerAddress ...string) *Server {
-	return NewPlatformServerWithServices(socketPath, service, nil, routerAddress...)
+	return NewPlatformServerWithServicesAndBuildUser(socketPath, service, nil, "paas-build", routerAddress...)
 }
 
 func NewPlatformServerWithServices(socketPath string, service *deployment.Service, services ServiceManager, routerAddress ...string) *Server {
+	return NewPlatformServerWithServicesAndBuildUser(socketPath, service, services, "paas-build", routerAddress...)
+}
+
+func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deployment.Service, services ServiceManager, buildUser string, routerAddress ...string) *Server {
 	port := "8080"
 	if len(routerAddress) > 0 {
 		if _, p, err := net.SplitHostPort(routerAddress[0]); err == nil {
@@ -63,8 +68,16 @@ func NewPlatformServerWithServices(socketPath string, service *deployment.Servic
 			var err error
 			switch command {
 			case "deploy":
-				if service != nil {
-					output.Deployment, err = service.Deploy(r.Context(), input.SourceDir, input.Name)
+				if err = validateDeployRequest(input); err == nil && service != nil {
+					sourceDir := input.SourceDir
+					cleanup := func() {}
+					if input.RepoURL != "" {
+						sourceDir, cleanup, err = source.CheckoutGitHubAs(r.Context(), input.RepoURL, input.Ref, input.RootDir, buildUser)
+					}
+					if err == nil {
+						defer cleanup()
+						output.Deployment, err = service.Deploy(r.Context(), sourceDir, input.Name)
+					}
 				}
 			case "inspect":
 				if service != nil {
@@ -135,6 +148,19 @@ func NewPlatformServerWithServices(socketPath string, service *deployment.Servic
 	}
 	server.http.Handler = mux
 	return server
+}
+
+func validateDeployRequest(input *Request) error {
+	if input.RepoURL == "" {
+		if input.Ref != "" || input.RootDir != "" {
+			return errors.New("Ref and RootDir require RepoURL")
+		}
+		return nil
+	}
+	if input.SourceDir != "" {
+		return errors.New("SourceDir and RepoURL cannot be used together")
+	}
+	return nil
 }
 
 func writeResponse(w http.ResponseWriter, command string, response Response) {

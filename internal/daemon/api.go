@@ -6,6 +6,9 @@ import "paas/internal/model"
 type Request struct {
 	Name        string `json:"Name,omitempty"`
 	SourceDir   string `json:"SourceDir,omitempty"`
+	RepoURL     string `json:"RepoURL,omitempty"`
+	Ref         string `json:"Ref,omitempty"`
+	RootDir     string `json:"RootDir,omitempty"`
 	ReleaseID   string `json:"ReleaseID,omitempty"`
 	ServiceType string `json:"ServiceType,omitempty"`
 	AppName     string `json:"AppName,omitempty"`

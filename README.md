@@ -1,14 +1,56 @@
 # Harbor PaaS
 
-Harbor deploys local Go HTTP applications to a single machine:
+Harbor deploys HTTP applications to a single machine:
 
     source → unprivileged build → immutable release → Bubblewrap + systemd → health check → hostname route
 
 The target is Ubuntu/Debian Linux with Go, a C compiler (SQLite), Git, systemd,
 cgroup v2, Bubblewrap, and curl. Linux runtimes use namespace isolation and
-systemd resource limits. PostgreSQL, Node, Git URL deployment, and public HTTPS
-are not implemented yet. Apps must be trusted: this is a local
+systemd resource limits. Go and Node runtimes, managed PostgreSQL services, and
+GitHub HTTPS source deployments are supported. Public HTTPS is not implemented.
+Apps must be trusted: this is a local
 development platform, not multi-tenant hosting.
+
+## Web dashboard
+
+The `web/` application provides a responsive project dashboard, deployment and
+release views, logs, stop/rollback actions, managed-service status, and GitHub
+repository import. It uses TanStack Start, Router, Query, Form, and Table with
+the Base UI shadcn preset `b6F9PjJnG`.
+
+Run the daemon using the local development commands below, then in another terminal:
+
+    cd web
+    bun install
+    PAASD_SOCKET=/tmp/paasd.sock bun run dev
+
+Open <http://127.0.0.1:3000>. The web server connects to the private control
+socket; its process identity must have permission to open that socket. Without
+a daemon, the dashboard shows a connection message and setup instructions.
+
+Import a repository by browsing a GitHub owner or entering its HTTPS URL. Select
+an optional branch, tag, or full commit SHA, and a repository-relative root
+directory. The selected directory must contain `paas.yaml`; the web dashboard
+uses the existing build, health check, and immutable-release pipeline. This is
+a manual import/deploy flow; GitHub OAuth and webhook-triggered deployments are
+not implemented.
+
+Public repositories work without credentials. To use private repositories, set
+`GITHUB_TOKEN` in both the web server and daemon environments. The token is
+server-side only and must grant access to the selected repository. Repository
+checkouts reject symlinks, path traversal, non-GitHub hosts, and embedded URL
+credentials; Git must be installed on the daemon host.
+
+For a local production build:
+
+    cd web
+    bun run build
+    PAASD_SOCKET=/tmp/paasd.sock bun run start
+
+Both development and production startup bind to loopback. The dashboard is a
+local administrator interface with access to the control plane; authentication
+for remote hosting is not implemented. See [web/README.md](web/README.md) for
+frontend checks and configuration.
 
 ## Linux setup and demo
 

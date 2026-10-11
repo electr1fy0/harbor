@@ -21,6 +21,29 @@ func TestPlatformRejectsMalformedRequests(t *testing.T) {
 	}
 }
 
+func TestPlatformDeployAcceptsGitHubFieldsAndRejectsMixedSources(t *testing.T) {
+	server := NewPlatformServer("", nil)
+	valid := httptest.NewRecorder()
+	server.http.Handler.ServeHTTP(valid, httptest.NewRequest(http.MethodPost, "/deploy", strings.NewReader(
+		`{"Name":"demo","RepoURL":"https://github.com/example/app.git","Ref":"main","RootDir":"web"}`,
+	)))
+	if valid.Code != http.StatusOK {
+		t.Fatalf("GitHub deploy request status=%d body=%q", valid.Code, valid.Body.String())
+	}
+
+	for _, body := range []string{
+		`{"SourceDir":"./app","RepoURL":"https://github.com/example/app"}`,
+		`{"Ref":"main"}`,
+		`{"RootDir":"web"}`,
+	} {
+		recorder := httptest.NewRecorder()
+		server.http.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/deploy", strings.NewReader(body)))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("invalid deploy request %q status=%d body=%q", body, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
 type failedResponseWriter struct {
 	*httptest.ResponseRecorder
 }

@@ -1,0 +1,120 @@
+import { z } from "zod"
+
+const appName = z
+  .string()
+  .regex(/^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/, "Invalid request data.")
+
+const githubOwner = z
+  .string()
+  .trim()
+  .regex(
+    /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/,
+    "Invalid request data."
+  )
+
+const githubRepoUrl = z
+  .string()
+  .trim()
+  .regex(
+    /^https:\/\/github\.com\/[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:\.git)?$/,
+    "Invalid request data."
+  )
+
+const gitRef = z
+  .string()
+  .max(255)
+  .refine((value) => {
+    if (value === "") return true
+    if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)) return false
+    const parts = value.split("/")
+    return (
+      !value.includes("..") &&
+      !value.includes("//") &&
+      !value.endsWith("/") &&
+      !value.endsWith(".") &&
+      parts.every(
+        (part) =>
+          part.length > 0 &&
+          !part.startsWith(".") &&
+          !part.toLowerCase().endsWith(".lock")
+      )
+    )
+  }, "Invalid request data.")
+
+const repositoryRoot = z
+  .string()
+  .max(256)
+  .refine((value) => {
+    if (value === "" || value === ".") return true
+    if (
+      value.startsWith("/") ||
+      value.includes("\\") ||
+      /^[A-Za-z]:/.test(value) ||
+      // eslint-disable-next-line no-control-regex
+      /[\u0000-\u001f\u007f]/.test(value)
+    ) {
+      return false
+    }
+
+    return value
+      .split("/")
+      .every((part) => part.length > 0 && part !== "." && part !== "..")
+  }, "Invalid request data.")
+
+export const getAppInputSchema = z.object({ name: appName }).strict()
+export const stopAppInputSchema = z.object({ name: appName }).strict()
+export const rollbackAppInputSchema = z
+  .object({
+    name: appName,
+    releaseID: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+  })
+  .strict()
+export const deployAppInputSchema = z
+  .object({
+    name: appName,
+    repoURL: githubRepoUrl,
+    ref: gitRef.optional().default(""),
+    rootDir: repositoryRoot.optional().default(""),
+  })
+  .strict()
+export const listGitHubReposInputSchema = z
+  .object({ owner: githubOwner })
+  .strict()
+export const getGitHubRepoInputSchema = z
+  .object({ repoURL: githubRepoUrl })
+  .strict()
+
+export type GetAppInput = z.infer<typeof getAppInputSchema>
+export type DeployAppInput = z.infer<typeof deployAppInputSchema>
+export type StopAppInput = z.infer<typeof stopAppInputSchema>
+export type RollbackAppInput = z.infer<typeof rollbackAppInputSchema>
+export type ListGitHubReposInput = z.infer<typeof listGitHubReposInputSchema>
+export type GetGitHubRepoInput = z.infer<typeof getGitHubRepoInputSchema>
+
+/**
+ * Normalize validation failures so Zod's diagnostic object never crosses the
+ * server-function boundary.
+ */
+export function parseInput<TSchema extends z.ZodType>(
+  schema: TSchema,
+  input: unknown
+): z.infer<TSchema> {
+  const result = schema.safeParse(input)
+  if (!result.success) throw new Error("Invalid request data.")
+  return result.data
+}
+
+export function parseGitHubRepoURL(repoURL: string): {
+  owner: string
+  repo: string
+} {
+  const parsed = parseInput(githubRepoUrl, repoURL)
+  const [, owner, rawRepo] =
+    parsed.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)$/) ?? []
+  if (!owner || !rawRepo) throw new Error("Invalid request data.")
+
+  return {
+    owner,
+    repo: rawRepo.endsWith(".git") ? rawRepo.slice(0, -4) : rawRepo,
+  }
+}
