@@ -409,24 +409,54 @@ func TestManagerDeploysGeneratedNodeAndGoConfiguration(t *testing.T) {
 	}
 }
 
-func TestManagerCreatesAndBindsReadyManagedPostgres(t *testing.T) {
+func TestManagerCreatesAndBindsReadyManagedSqlite(t *testing.T) {
 	services := &fakeOnboardingServices{}
 	h := newOnboardingHarness(t, services)
-	fixture := authoritativeGoFixture(t, "pg-app", "go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi")
+	fixture := authoritativeGoFixture(t, "sqlite-app", "go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi")
 	h.manager.checkout = singleFixtureCheckout(t, fixture)
-	request := deployRequest("pg-app", "https://github.com/example/pg-app", authoritativeSelection("go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi"))
-	request.CreatePostgres = true
-	request.PostgresService = "primary-db"
+	request := deployRequest("sqlite-app", "https://github.com/example/sqlite-app", authoritativeSelection("go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi"))
+	request.CreateSqlite = true
+	request.SqliteService = "primary-db"
 	job, err := h.manager.Submit(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := awaitJobTerminal(t, h.manager, job.ID); got.State != "SUCCEEDED" {
-		t.Fatalf("managed PostgreSQL deployment = %+v", got)
+		t.Fatalf("managed SQLite deployment = %+v", got)
 	}
 	events := services.Events()
-	if len(events) != 2 || events[0] != "add:postgres:primary-db:READY" || events[1] != "link:pg-app:primary-db" {
-		t.Fatalf("managed PostgreSQL create/bind events = %v", events)
+	if len(events) != 2 || events[0] != "add:sqlite:primary-db:READY" || events[1] != "link:sqlite-app:primary-db" {
+		t.Fatalf("managed SQLite create/bind events = %v", events)
+	}
+	createdServices, err := services.List(context.Background())
+	if err != nil || len(createdServices) != 1 || createdServices[0].Port != 0 {
+		t.Fatalf("SQLite service unexpectedly depends on a listening port: %+v (err=%v)", createdServices, err)
+	}
+}
+
+func TestManagerValidatesSqliteServiceSelection(t *testing.T) {
+	readySqlite := model.Service{Name: "ready-db", Type: "sqlite", State: model.ServiceReady}
+	tests := []struct {
+		name    string
+		service *fakeOnboardingServices
+		request DeployRequest
+		wantErr bool
+	}{
+		{name: "no database", request: DeployRequest{}},
+		{name: "create name must be valid", service: &fakeOnboardingServices{}, request: DeployRequest{CreateSqlite: true, SqliteService: "invalid name"}, wantErr: true},
+		{name: "create cannot reuse an existing service name", service: &fakeOnboardingServices{services: []model.Service{readySqlite}}, request: DeployRequest{CreateSqlite: true, SqliteService: "ready-db"}, wantErr: true},
+		{name: "ready sqlite without port", service: &fakeOnboardingServices{services: []model.Service{readySqlite}}, request: DeployRequest{SqliteService: "ready-db"}},
+		{name: "wrong service type", service: &fakeOnboardingServices{services: []model.Service{{Name: "ready-db", Type: "postgres", State: model.ServiceReady}}}, request: DeployRequest{SqliteService: "ready-db"}, wantErr: true},
+		{name: "not ready", service: &fakeOnboardingServices{services: []model.Service{{Name: "ready-db", Type: "sqlite", State: model.ServiceStarting}}}, request: DeployRequest{SqliteService: "ready-db"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := &Manager{services: tt.service}
+			err := manager.validateSqlite(context.Background(), tt.request)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateSqlite() error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -660,7 +690,7 @@ type fakeOnboardingServices struct {
 func (s *fakeOnboardingServices) AddService(_ context.Context, serviceType, name string) (*model.Service, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	service := model.Service{ID: "service-" + name, Name: name, Type: serviceType, State: model.ServiceReady, Port: 5432}
+	service := model.Service{ID: "service-" + name, Name: name, Type: serviceType, State: model.ServiceReady}
 	s.services = append(s.services, service)
 	s.events = append(s.events, fmt.Sprintf("add:%s:%s:%s", serviceType, name, service.State))
 	return &service, nil

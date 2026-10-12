@@ -433,14 +433,29 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 		if bindingErr != nil {
 			return s.fail(&d, model.StartFailed, bindingErr)
 		}
+		binds := make([]contracts.BindMount, 0, len(bindings))
+		bindingKeys := make(map[string]bool, len(bindings))
 		for _, b := range bindings {
+			if b.EnvKey == "" || bindingKeys[b.EnvKey] {
+				return s.fail(&d, model.StartFailed, fmt.Errorf("multiple managed service bindings use environment key %q", b.EnvKey))
+			}
+			bindingKeys[b.EnvKey] = true
 			svc, serviceErr := s.db.GetService(b.ServiceID)
-			if serviceErr != nil || svc.State != model.ServiceReady || svc.Port < 1 {
+			if serviceErr != nil {
 				return s.fail(&d, model.StartFailed, errors.New("a bound managed service is not ready"))
 			}
-			dbURL := fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable",
-				b.Username, b.Password, svc.Port, b.DatabaseName)
+			if svc.Type != "sqlite" {
+				return s.fail(&d, model.StartFailed, fmt.Errorf("bound service %q uses unsupported type %q; migrate its PostgreSQL data to a SQLite service before deploying", svc.Name, svc.Type))
+			}
+			if svc.State != model.ServiceReady {
+				return s.fail(&d, model.StartFailed, fmt.Errorf("bound SQLite service %q is not ready", svc.Name))
+			}
+			dbURL, databasePath, pathErr := s.sqliteBinding(b, svc)
+			if pathErr != nil {
+				return s.fail(&d, model.StartFailed, fmt.Errorf("prepare SQLite binding %q: %w", svc.Name, pathErr))
+			}
 			deployEnv = append(deployEnv, b.EnvKey+"="+dbURL)
+			binds = append(binds, contracts.BindMount{HostPath: databasePath, MountPath: databasePath})
 		}
 		customEnvironment, envErr := s.runtimeEnvironment(app.ID)
 		if envErr != nil {
@@ -456,8 +471,9 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 		locked = false
 		handle, err = s.sandbox.Start(ctx, contracts.SandboxSpec{
 			ID: d.ID, Command: release.Command, Dir: release.ArtifactDir,
-			Env:  deployEnv,
-			User: s.opts.RuntimeUser, LogPath: d.LogPath,
+			Env:   deployEnv,
+			Binds: binds,
+			User:  s.opts.RuntimeUser, LogPath: d.LogPath,
 			MemoryMax: cfg.Resources.Memory,
 			CPUQuota:  cfg.Resources.CPU,
 			TasksMax:  cfg.Resources.Tasks,

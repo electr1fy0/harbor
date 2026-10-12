@@ -17,11 +17,3 @@ func TestEnsurePolicyJSON(t *testing.T) {
 		t.Fatalf("policy.json does not exist: %v", err)
 	}
 }
-
-func TestManagerPaths(t *testing.T) {
-	m := NewManager("/var/lib/paas")
-	expected := "/var/lib/paas/services/cache"
-	if m.ServiceCacheDir() != expected {
-		t.Fatalf("expected %s, got %s", expected, m.ServiceCacheDir())
-	}
-}

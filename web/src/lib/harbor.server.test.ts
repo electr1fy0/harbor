@@ -332,9 +332,9 @@ describe("Harbor daemon transport", () => {
               {
                 id: "svc_1",
                 name: "primary-db",
-                type: "postgres",
-                version: "16",
-                port: 5432,
+                type: "sqlite",
+                version: "",
+                port: 0,
                 state: "READY",
                 volume_dir: "/var/lib/paas/services/private-db",
                 created_at: "2026-01-01T00:00:00Z",

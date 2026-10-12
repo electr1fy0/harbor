@@ -18,6 +18,7 @@ import (
 
 	"paas/internal/config"
 	"paas/internal/model"
+	managedservice "paas/internal/service"
 	"paas/internal/store"
 )
 
@@ -449,10 +450,22 @@ func (s *Service) redactText(name, value string) (string, error) {
 	for _, binding := range bindings {
 		secrets = append(secrets, binding.Password)
 		svc, err := s.db.GetService(binding.ServiceID)
-		if err != nil || svc.Port < 1 {
-			return "", errors.New("configured service credentials could not be loaded")
+		if err != nil {
+			// Preserve the stored password redaction for bindings to old or
+			// unavailable services without making diagnostics unavailable too.
+			continue
 		}
-		secrets = append(secrets, fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable", binding.Username, binding.Password, svc.Port, binding.DatabaseName))
+		switch svc.Type {
+		case "postgres":
+			if svc.Port > 0 {
+				secrets = append(secrets, fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable",
+					binding.Username, binding.Password, svc.Port, binding.DatabaseName))
+			}
+		case "sqlite":
+			if databaseURL, urlErr := managedservice.DatabaseURL(&binding, svc); urlErr == nil {
+				secrets = append(secrets, databaseURL)
+			}
+		}
 	}
 	// Replace longer values first so a short secret that is a substring of a
 	// longer value cannot leave the longer value partially visible.

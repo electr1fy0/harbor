@@ -5,6 +5,7 @@ import {
   getAppInputSchema,
   parseGitHubRepoURL,
   parseInput,
+  submitOnboardingJobInputSchema,
 } from "./validation"
 
 describe("Harbor input validation", () => {
@@ -78,5 +79,24 @@ describe("Harbor input validation", () => {
         repo: "Example",
       }
     )
+  })
+
+  it("accepts SQLite service selections and rejects obsolete PostgreSQL fields", () => {
+    expect(
+      parseInput(submitOnboardingJobInputSchema, {
+        name: "harbor-web",
+        repoURL: "https://github.com/harbor/example",
+        sqliteService: "app-db",
+        createSqlite: true,
+      })
+    ).toMatchObject({ sqliteService: "app-db", createSqlite: true })
+
+    expect(() =>
+      parseInput(submitOnboardingJobInputSchema, {
+        name: "harbor-web",
+        repoURL: "https://github.com/harbor/example",
+        postgresService: "old-db",
+      })
+    ).toThrow("Invalid request data.")
   })
 })

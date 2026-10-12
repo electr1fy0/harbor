@@ -1,7 +1,7 @@
-name: postgres-app
+name: sqlite-app
 runtime: go
 build:
-  command: go build -o "$PAAS_OUT/server" .
+  command: CGO_ENABLED=1 go build -o "$PAAS_OUT/server" main.go
 start:
   command: /app/server
 resources:

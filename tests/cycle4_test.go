@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -215,17 +217,13 @@ func TestCycle4NodeDeploymentAndConcurrency(t *testing.T) {
 	}
 }
 
-func TestCycle4PostgresManagedServiceAndPersistence(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("skipping Linux-only Cycle 4 integration test")
-	}
-
+func TestCycle4SQLiteManagedServiceAndPersistence(t *testing.T) {
 	root, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	work, err := os.MkdirTemp("/tmp", "harbor-cycle4-pg-")
+	work, err := os.MkdirTemp("", "harbor-cycle4-sqlite-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +255,7 @@ func TestCycle4PostgresManagedServiceAndPersistence(t *testing.T) {
 
 	startDaemon := func() string {
 		stopDaemon()
-		log, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		log, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -325,10 +323,10 @@ func TestCycle4PostgresManagedServiceAndPersistence(t *testing.T) {
 		return resp.StatusCode, string(body), nil
 	}
 
-	// 1. Add PostgreSQL managed service
-	addOut, err := cli("add", "postgres", "--name", "db")
+	// 1. Add SQLite managed service
+	addOut, err := cli("add", "sqlite", "--name", "db")
 	if err != nil {
-		t.Fatalf("paas add postgres failed: %v: %s", err, addOut)
+		t.Fatalf("paas add sqlite failed: %v: %s", err, addOut)
 	}
 	if !strings.Contains(addOut, "✓ db READY") {
 		t.Fatalf("unexpected paas add output: %s", addOut)
@@ -339,70 +337,89 @@ func TestCycle4PostgresManagedServiceAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("paas services failed: %v: %s", err, servicesOut)
 	}
-	if !strings.Contains(servicesOut, "db postgres READY") {
+	if !strings.Contains(servicesOut, "db sqlite READY") {
 		t.Fatalf("unexpected services list: %s", servicesOut)
 	}
 
 	// 3. Link application to db
-	linkOut, err := cli("link", "pgapp", "db")
+	linkOut, err := cli("link", "sqliteapp", "db")
 	if err != nil {
 		t.Fatalf("paas link failed: %v: %s", err, linkOut)
 	}
-	if !strings.Contains(linkOut, "✓ Injected DATABASE_URL into pgapp") {
+	if !strings.Contains(linkOut, "✓ Injected DATABASE_URL into sqliteapp") {
 		t.Fatalf("unexpected link output: %s", linkOut)
 	}
 
-	// 4. Deploy postgres-app
-	pgSrc := filepath.Join(root, "examples", "postgres-app")
-	deployOut, err := cli("deploy", pgSrc, "--name", "pgapp")
+	// 4. Deploy the SQLite counter app
+	sqliteSrc := filepath.Join(root, "examples", "sqlite-app")
+	deployOut, err := cli("deploy", sqliteSrc, "--name", "sqliteapp")
 	if err != nil {
-		t.Fatalf("deploy postgres-app failed: %v: %s", err, deployOut)
+		t.Fatalf("deploy sqlite-app failed: %v: %s", err, deployOut)
 	}
 	if !strings.Contains(deployOut, "State: RUNNING") {
 		t.Fatalf("unexpected deploy output: %s", deployOut)
 	}
 
 	// 5. Query /counter twice (expect 1, then 2)
-	status, body, err := query("pgapp.localhost", "/counter")
+	status, body, err := query("sqliteapp.localhost", "/counter")
 	if err != nil || status != 200 || strings.TrimSpace(body) != "1" {
 		t.Fatalf("counter query 1: status=%d body=%q err=%v", status, body, err)
 	}
 
-	status, body, err = query("pgapp.localhost", "/counter")
+	status, body, err = query("sqliteapp.localhost", "/counter")
 	if err != nil || status != 200 || strings.TrimSpace(body) != "2" {
 		t.Fatalf("counter query 2: status=%d body=%q err=%v", status, body, err)
 	}
 
-	// 6. Stop pgapp
-	if stopOut, err := cli("stop", "pgapp"); err != nil {
-		t.Fatalf("stop pgapp failed: %v: %s", err, stopOut)
+	// 6. Re-linking is idempotent and retains the binding's database.
+	if relinkOut, err := cli("link", "sqliteapp", "db"); err != nil {
+		t.Fatalf("repeat link failed: %v: %s", err, relinkOut)
+	}
+	status, body, err = query("sqliteapp.localhost", "/counter")
+	if err != nil || status != 200 || strings.TrimSpace(body) != "3" {
+		t.Fatalf("counter after idempotent re-link: status=%d body=%q err=%v", status, body, err)
 	}
 
-	// Verify route withdrawn
-	s, _, _ := query("pgapp.localhost", "/counter")
-	if s != 404 {
-		t.Fatalf("expected 404 after stop, got %d", s)
-	}
-
-	// 7. Redeploy pgapp to verify persistent volume data survived
-	deployOut2, err := cli("deploy", pgSrc, "--name", "pgapp")
+	// 7. Redeploy and verify the per-binding database survives.
+	deployOut2, err := cli("deploy", sqliteSrc, "--name", "sqliteapp")
 	if err != nil {
-		t.Fatalf("redeploy pgapp failed: %v: %s", err, deployOut2)
+		t.Fatalf("redeploy sqlite-app failed: %v: %s", err, deployOut2)
 	}
 	if !strings.Contains(deployOut2, "State: RUNNING") {
 		t.Fatalf("unexpected redeploy output: %s", deployOut2)
 	}
 
-	// Query /counter (expect 3, then 4)
-	status, body, err = query("pgapp.localhost", "/counter")
-	if err != nil || status != 200 || strings.TrimSpace(body) != "3" {
-		t.Fatalf("counter query 3: status=%d body=%q err=%v", status, body, err)
+	// Query /counter after redeploy (expect 4).
+	status, body, err = query("sqliteapp.localhost", "/counter")
+	if err != nil || status != 200 || strings.TrimSpace(body) != "4" {
+		t.Fatalf("counter after redeploy: status=%d body=%q err=%v", status, body, err)
 	}
 
-	status, body, err = query("pgapp.localhost", "/counter")
-	if err != nil || status != 200 || strings.TrimSpace(body) != "4" {
-		t.Fatalf("counter query 4: status=%d body=%q err=%v", status, body, err)
+	// Rollback starts the earlier immutable release and must use the same DB.
+	rollbackOut, err := cli("rollback", "sqliteapp")
+	if err != nil || !strings.Contains(rollbackOut, "State: RUNNING") {
+		t.Fatalf("rollback sqliteapp failed: %v: %s", err, rollbackOut)
 	}
+	status, body, err = query("sqliteapp.localhost", "/counter")
+	if err != nil || status != 200 || strings.TrimSpace(body) != "5" {
+		t.Fatalf("counter after rollback: status=%d body=%q err=%v", status, body, err)
+	}
+
+	// Stop and redeploy also preserve the file-backed database.
+	if stopOut, err := cli("stop", "sqliteapp"); err != nil {
+		t.Fatalf("stop sqliteapp failed: %v: %s", err, stopOut)
+	}
+	if s, _, _ := query("sqliteapp.localhost", "/counter"); s != 404 {
+		t.Fatalf("expected 404 after stop, got %d", s)
+	}
+	if deployOut, err := cli("deploy", sqliteSrc, "--name", "sqliteapp"); err != nil || !strings.Contains(deployOut, "State: RUNNING") {
+		t.Fatalf("redeploy after stop failed: %v: %s", err, deployOut)
+	}
+	status, body, err = query("sqliteapp.localhost", "/counter")
+	if err != nil || status != 200 || strings.TrimSpace(body) != "6" {
+		t.Fatalf("counter after stop and redeploy: status=%d body=%q err=%v", status, body, err)
+	}
+	assertRootSQLitePermissions(t, data)
 
 	// 8. Daemon restart reconciliation test:
 	// Stop daemon and restart pointing to the same data directory
@@ -414,16 +431,81 @@ func TestCycle4PostgresManagedServiceAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apps after restart failed: %v: %s", err, appsOut)
 	}
-	if !strings.Contains(appsOut, "pgapp") {
-		t.Fatalf("expected pgapp in apps list after restart: %s", appsOut)
+	if !strings.Contains(appsOut, "sqliteapp") {
+		t.Fatalf("expected sqliteapp in apps list after restart: %s", appsOut)
 	}
-	// Managed PostgreSQL must be restored before its dependent application.
-	// The recovered release continues from the same persistent database volume.
-	status, body, err = query("pgapp.localhost", "/counter")
-	if err != nil || status != 200 || strings.TrimSpace(body) != "5" {
-		t.Fatalf("counter after daemon restart: status=%d body=%q err=%v", status, body, err)
+	// Recovery must preserve the database and publish the app after service
+	// restoration.
+	status, body, err = query("sqliteapp.localhost", "/counter")
+	if err != nil || status != 200 || strings.TrimSpace(body) != "7" {
+		daemonLog, _ := os.ReadFile(logPath)
+		t.Fatalf("counter after daemon restart: status=%d body=%q err=%v; daemon log: %s", status, body, err, daemonLog)
 	}
 
-	// Clean up: stop pgapp and services
-	_, _ = cli("stop", "pgapp")
+	// Clean up the recovered app; daemon shutdown handles service state.
+	_, _ = cli("stop", "sqliteapp")
+}
+
+func assertRootSQLitePermissions(t *testing.T, dataDir string) {
+	t.Helper()
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		return
+	}
+	runtimeUser, err := user.Lookup("paas-runtime")
+	if err != nil {
+		t.Skipf("paas-runtime is not configured for root permission assertions: %v", err)
+	}
+	volumesDir := filepath.Join(dataDir, "volumes")
+	var databasePaths []string
+	err = filepath.WalkDir(volumesDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() && entry.Name() == "database.sqlite" {
+			databasePaths = append(databasePaths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("find SQLite database file: %v", err)
+	}
+	if len(databasePaths) != 1 {
+		t.Fatalf("SQLite database files = %v, want exactly one", databasePaths)
+	}
+	wantUID := uint32(mustParseUserID(t, runtimeUser.Uid))
+	checkOwner := func(path string, mode os.FileMode) {
+		t.Helper()
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Uid != wantUID || info.Mode().Perm() != mode {
+			t.Fatalf("%s owner/mode = %+v, want UID %d and mode %04o", path, info, wantUID, mode)
+		}
+	}
+	databasePath := databasePaths[0]
+	checkOwner(filepath.Dir(databasePath), 0700)
+	checkOwner(databasePath, 0600)
+	for directory := filepath.Dir(filepath.Dir(databasePath)); ; directory = filepath.Dir(directory) {
+		info, err := os.Stat(directory)
+		if err != nil {
+			t.Fatalf("stat SQLite parent %s: %v", directory, err)
+		}
+		if !info.IsDir() || info.Mode().Perm() != 0711 {
+			t.Fatalf("SQLite parent %s mode = %04o, want execute-only 0711", directory, info.Mode().Perm())
+		}
+		if directory == dataDir {
+			break
+		}
+	}
+}
+
+func mustParseUserID(t *testing.T, value string) int {
+	t.Helper()
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }

@@ -87,7 +87,7 @@ function stageLabel(stage: string) {
   const labels: Record<string, string> = {
     QUEUED: "Queued",
     CLONING: "Getting source",
-    PROVISIONING_DATABASE: "Starting PostgreSQL",
+    PROVISIONING_DATABASE: "Preparing SQLite database",
     BUILDING: "Building project",
     STARTING: "Starting app",
     HEALTH_CHECK: "Checking app",
@@ -118,9 +118,9 @@ function ImportProjectPage() {
   const [inspectedKey, setInspectedKey] = useState("")
   const [config, setConfig] = useState<OnboardingConfig | null>(null)
   const [environment, setEnvironment] = useState<Record<string, string>>({})
-  const [createPostgres, setCreatePostgres] = useState(false)
-  const [postgresName, setPostgresName] = useState("")
-  const [postgresService, setPostgresService] = useState("")
+  const [createSqlite, setCreateSqlite] = useState(false)
+  const [sqliteName, setSqliteName] = useState("")
+  const [sqliteService, setSqliteService] = useState("")
   const [jobID, setJobID] = useState("")
   const [formError, setFormError] = useState("")
   const currentValues = useRef<ImportValues>({
@@ -206,8 +206,8 @@ function ImportProjectPage() {
       rootDir: string
       config: OnboardingConfig
       environment: Record<string, string>
-      postgresService?: string
-      createPostgres?: boolean
+      sqliteService?: string
+      createSqlite?: boolean
     }) => {
       const parsed = submitOnboardingJobInputSchema.safeParse(input)
       if (!parsed.success)
@@ -255,10 +255,10 @@ function ImportProjectPage() {
         ...normalized,
         config,
         environment,
-        ...(createPostgres
-          ? { postgresService: postgresName.trim(), createPostgres: true }
-          : postgresService
-            ? { postgresService }
+        ...(createSqlite
+          ? { sqliteService: sqliteName.trim(), createSqlite: true }
+          : sqliteService
+            ? { sqliteService }
             : {}),
       })
     },
@@ -919,56 +919,57 @@ function ImportProjectPage() {
                 <div>
                   <h3 className="text-sm font-medium">Database</h3>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    Optional. A READY managed PostgreSQL service is linked
-                    privately as DATABASE_URL.
+                    Optional. The app gets a persistent, isolated SQLite
+                    database file through DATABASE_URL. Your app needs a SQLite
+                    driver; no database credentials or server are needed.
                   </p>
                 </div>
                 <label className="flex items-center gap-2 text-sm">
                   <input
                     type="radio"
                     name="database-choice"
-                    checked={!createPostgres && !postgresService}
+                    checked={!createSqlite && !sqliteService}
                     disabled={Boolean(busy)}
                     onChange={() => {
-                      setCreatePostgres(false)
-                      setPostgresService("")
-                      setPostgresName("")
+                      setCreateSqlite(false)
+                      setSqliteService("")
+                      setSqliteName("")
                     }}
                   />
                   No database
                 </label>
                 {overview.data?.services.some(
                   (service) =>
-                    service.type === "postgres" && service.state === "READY"
+                    service.type === "sqlite" && service.state === "READY"
                 ) ? (
                   <>
                     <label className="flex items-center gap-2 text-sm">
                       <input
                         type="radio"
                         name="database-choice"
-                        checked={!createPostgres && Boolean(postgresService)}
+                        checked={!createSqlite && Boolean(sqliteService)}
                         disabled={Boolean(busy)}
                         onChange={() => {
-                          setCreatePostgres(false)
-                          setPostgresName("")
-                          setPostgresService(
+                          setCreateSqlite(false)
+                          setSqliteName("")
+                          setSqliteService(
                             overview.data.services.find(
                               (service) =>
-                                service.type === "postgres" &&
+                                service.type === "sqlite" &&
                                 service.state === "READY"
                             )?.name ?? ""
                           )
                         }}
                       />
-                      Link an existing PostgreSQL service
+                      Link an existing SQLite service
                     </label>
-                    {!createPostgres && postgresService ? (
+                    {!createSqlite && sqliteService ? (
                       <select
-                        aria-label="PostgreSQL service"
-                        value={postgresService}
+                        aria-label="SQLite service"
+                        value={sqliteService}
                         disabled={Boolean(busy)}
                         onChange={(event) =>
-                          setPostgresService(event.target.value)
+                          setSqliteService(event.target.value)
                         }
                         className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                       >
@@ -976,7 +977,7 @@ function ImportProjectPage() {
                         {overview.data.services
                           .filter(
                             (service) =>
-                              service.type === "postgres" &&
+                              service.type === "sqlite" &&
                               service.state === "READY"
                           )
                           .map((service) => (
@@ -992,24 +993,22 @@ function ImportProjectPage() {
                   <input
                     type="radio"
                     name="database-choice"
-                    checked={createPostgres}
+                    checked={createSqlite}
                     disabled={Boolean(busy)}
                     onChange={() => {
-                      setCreatePostgres(true)
-                      setPostgresService("")
+                      setCreateSqlite(true)
+                      setSqliteService("")
                     }}
                   />
-                  Create a managed PostgreSQL service
+                  Create a managed SQLite service
                 </label>
-                {createPostgres ? (
+                {createSqlite ? (
                   <Field>
-                    <FieldLabel htmlFor="postgres-name">
-                      Service name
-                    </FieldLabel>
+                    <FieldLabel htmlFor="sqlite-name">Service name</FieldLabel>
                     <Input
-                      id="postgres-name"
-                      value={postgresName}
-                      onChange={(event) => setPostgresName(event.target.value)}
+                      id="sqlite-name"
+                      value={sqliteName}
+                      onChange={(event) => setSqliteName(event.target.value)}
                       placeholder={`${form.state.values.name}-db`}
                       disabled={Boolean(busy)}
                     />

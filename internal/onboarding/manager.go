@@ -42,8 +42,8 @@ type DeployRequest struct {
 	RootDir          string            `json:"rootDir,omitempty"`
 	Config           ConfigSelection   `json:"config,omitempty"`
 	Environment      map[string]string `json:"environment,omitempty"`
-	PostgresService  string            `json:"postgresService,omitempty"`
-	CreatePostgres   bool              `json:"createPostgres,omitempty"`
+	SqliteService    string            `json:"sqliteService,omitempty"`
+	CreateSqlite     bool              `json:"createSqlite,omitempty"`
 	preserveSettings bool
 }
 
@@ -204,7 +204,7 @@ func (m *Manager) Submit(ctx context.Context, request DeployRequest) (Job, error
 	if _, err := configFromSelection(request.Name, request.Config); err != nil {
 		return Job{}, err
 	}
-	if err := m.validatePostgres(ctx, request); err != nil {
+	if err := m.validateSqlite(ctx, request); err != nil {
 		return Job{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -254,35 +254,35 @@ func (m *Manager) Redeploy(ctx context.Context, name string) (Job, error) {
 	return job, nil
 }
 
-func (m *Manager) validatePostgres(ctx context.Context, request DeployRequest) error {
-	if !request.CreatePostgres && request.PostgresService == "" {
+func (m *Manager) validateSqlite(ctx context.Context, request DeployRequest) error {
+	if !request.CreateSqlite && request.SqliteService == "" {
 		return nil
 	}
 	if m.services == nil {
-		return errors.New("managed PostgreSQL is unavailable")
+		return errors.New("managed SQLite is unavailable")
 	}
-	if request.CreatePostgres && !config.ValidName(request.PostgresService) {
-		return errors.New("enter a valid name for the PostgreSQL service")
+	if request.CreateSqlite && !config.ValidName(request.SqliteService) {
+		return errors.New("enter a valid name for the SQLite service")
 	}
 	list, err := m.services.List(ctx)
 	if err != nil {
 		return errors.New("managed services could not be checked")
 	}
 	for _, service := range list {
-		if service.Name != request.PostgresService {
+		if service.Name != request.SqliteService {
 			continue
 		}
-		if request.CreatePostgres {
+		if request.CreateSqlite {
 			return errors.New("a managed service already uses that name")
 		}
-		if service.Type == "postgres" && service.State == model.ServiceReady {
+		if service.Type == "sqlite" && service.State == model.ServiceReady {
 			return nil
 		}
 	}
-	if request.CreatePostgres {
+	if request.CreateSqlite {
 		return nil
 	}
-	return errors.New("choose a READY managed PostgreSQL service")
+	return errors.New("choose a READY managed SQLite service")
 }
 
 func (m *Manager) reserve() error {
@@ -452,17 +452,17 @@ func (m *Manager) run(id string) {
 			return
 		}
 	}
-	if request.CreatePostgres {
+	if request.CreateSqlite {
 		m.setStage(id, "PROVISIONING_DATABASE")
-		created, err := m.services.AddService(ctx, "postgres", request.PostgresService)
-		if err != nil || created == nil || created.State != model.ServiceReady {
-			m.finish(id, "FAILED", "FAILED", "PostgreSQL could not be created and started.", nil)
+		created, err := m.services.AddService(ctx, "sqlite", request.SqliteService)
+		if err != nil || created == nil || created.Type != "sqlite" || created.State != model.ServiceReady {
+			m.finish(id, "FAILED", "FAILED", "SQLite service could not be created.", nil)
 			return
 		}
 	}
-	if request.PostgresService != "" {
-		if err := m.bindDatabase(ctx, request.Name, request.PostgresService); err != nil {
-			m.finish(id, "FAILED", "FAILED", "The PostgreSQL service could not be linked.", nil)
+	if request.SqliteService != "" {
+		if err := m.bindDatabase(ctx, request.Name, request.SqliteService); err != nil {
+			m.finish(id, "FAILED", "FAILED", "The SQLite service could not be linked.", nil)
 			return
 		}
 	}
@@ -532,13 +532,13 @@ func (m *Manager) bindDatabase(ctx context.Context, appName, serviceName string)
 	}
 	ready := false
 	for _, svc := range list {
-		if svc.Name == serviceName && svc.Type == "postgres" && svc.State == model.ServiceReady {
+		if svc.Name == serviceName && svc.Type == "sqlite" && svc.State == model.ServiceReady {
 			ready = true
 			break
 		}
 	}
 	if !ready {
-		return errors.New("managed PostgreSQL service is not ready")
+		return errors.New("managed SQLite service is not ready")
 	}
 	_, err = m.services.Link(ctx, appName, serviceName)
 	return err

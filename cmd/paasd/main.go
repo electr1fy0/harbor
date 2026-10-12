@@ -20,7 +20,6 @@ import (
 	"paas/internal/daemon"
 	"paas/internal/deployment"
 	"paas/internal/router"
-	"paas/internal/runtime"
 	"paas/internal/sandbox"
 	"paas/internal/service"
 	"paas/internal/store"
@@ -130,8 +129,7 @@ func main() {
 	if askListener != nil {
 		defer askListener.Close()
 	}
-	runtimeMgr := runtime.NewManager(dataDir)
-	svcManager := service.NewManager(db, runtimeMgr, sb, dataDir)
+	svcManager := service.NewManager(db, dataDir)
 	serviceCtx, serviceCancel := context.WithTimeout(context.Background(), time.Minute)
 	serviceRestoreErr := svcManager.Restore(serviceCtx)
 	serviceCancel()

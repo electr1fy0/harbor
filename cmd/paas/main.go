@@ -106,12 +106,7 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		}
 	case "add":
 		if response != nil && response.Service != nil {
-			fmt.Fprintf(stdout, "→ Preparing %s runtime\n", response.Service.Type)
-			fmt.Fprintf(stdout, "→ Creating persistent volume\n")
-			fmt.Fprintf(stdout, "→ Initializing database\n")
-			fmt.Fprintf(stdout, "→ Starting service\n")
-			fmt.Fprintf(stdout, "→ Health check passed\n\n")
-			fmt.Fprintf(stdout, "✓ %s READY (port %d)\n", response.Service.Name, response.Service.Port)
+			fmt.Fprintf(stdout, "✓ %s READY (%s)\n", response.Service.Name, response.Service.Type)
 		}
 	case "link":
 		if response != nil && response.Binding != nil {
@@ -281,7 +276,11 @@ func printServices(stdout io.Writer, svcs []model.Service) error {
 		return err
 	}
 	for _, s := range svcs {
-		if _, err := fmt.Fprintf(stdout, "%s %s %s %d\n", s.Name, s.Type, s.State, s.Port); err != nil {
+		port := "-"
+		if s.Port > 0 {
+			port = strconv.Itoa(s.Port)
+		}
+		if _, err := fmt.Fprintf(stdout, "%s %s %s %s\n", s.Name, s.Type, s.State, port); err != nil {
 			return err
 		}
 	}

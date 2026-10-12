@@ -133,8 +133,8 @@ export const submitOnboardingJobInputSchema = z
     rootDir: repositoryRoot.optional().default(""),
     config: onboardingConfigSchema.optional(),
     environment: z.record(environmentKey, z.string().max(65_536)).optional(),
-    postgresService: appName.optional(),
-    createPostgres: z.boolean().optional(),
+    sqliteService: appName.optional(),
+    createSqlite: z.boolean().optional(),
   })
   .strict()
 export const onboardingJobIDSchema = z

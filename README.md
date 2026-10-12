@@ -6,7 +6,7 @@ Harbor deploys HTTP applications to a single machine:
 
 The target is Ubuntu/Debian Linux with Go, a C compiler (SQLite), Git, systemd,
 cgroup v2, Bubblewrap, and curl. Linux runtimes use namespace isolation and
-systemd resource limits. Go and Node runtimes, managed PostgreSQL services, and
+systemd resource limits. Go and Node runtimes, managed SQLite services, and
 GitHub HTTPS source deployments are supported. Caddy provides public HTTPS for
 configured custom domains and an authenticated dashboard. Apps and operators
 must be trusted; applications share the host network and runtime account.
@@ -36,7 +36,7 @@ encrypted in its private data directory and returns only connection metadata.
 Select a branch, tag, or full commit SHA and a repository-relative root directory.
 Harbor uses an existing `paas.yaml`, or detects supported Go/Node layouts and lets
 you review generated settings. Add runtime environment values and optionally
-create or bind a managed PostgreSQL service, then follow asynchronous deployment
+create or bind a managed SQLite service, then follow asynchronous deployment
 progress. Saved GitHub source details support retry without resetting application
 settings. See [docs/onboarding.md](docs/onboarding.md) for permissions and API details.
 GitHub OAuth and webhook-triggered deployments are not implemented. Legacy daemon
@@ -170,6 +170,34 @@ reclaims persisted application units before marking their deployments stopped;
 a cleanup failure prevents startup rather than losing ownership of a live unit.
 Graceful shutdown stops and waits for each runtime. Failed cleanup is recorded
 and retried, and replacement is blocked until it succeeds.
+
+## Managed SQLite services
+
+Create and link a service with `paas add sqlite --name db` and
+`paas link APP db`. Each application binding has its own persistent SQLite file
+and writable directory. Harbor injects a `file:` SQLite URI in `DATABASE_URL`
+with read/write mode and the `_busy_timeout=5000` and `_foreign_keys=on` options
+used by the included `go-sqlite3` example. The binding directory is mounted
+writable at the same absolute path in the app runtime so SQLite can create its
+WAL and journal sidecar files. Relinking an application, redeploying, rolling
+back, and daemon recovery all reuse that file.
+
+Applications must use a SQLite driver that accepts SQLite file URIs and honors
+the driver options in `DATABASE_URL`; PostgreSQL drivers and PostgreSQL URLs do
+not work with this service. Other SQLite drivers must accept the file URI and
+`mode=rw`, then configure a five-second busy timeout and foreign keys on each
+connection using that driver's supported options. The example uses
+[`github.com/mattn/go-sqlite3` v1.14.52](https://github.com/mattn/go-sqlite3),
+which bundles SQLite 3.53.4 and requires CGO plus a C compiler at build time.
+Keep bundled SQLite libraries current: the WAL-reset corruption issue described
+in the [SQLite WAL documentation](https://www.sqlite.org/wal.html#walreset) is
+fixed in SQLite 3.51.3 and later. Store Harbor's SQLite volumes on a local
+filesystem; SQLite WAL does not support network filesystems.
+
+Existing PostgreSQL service records and data volumes are preserved, but Harbor
+does not start PostgreSQL or convert PostgreSQL data into SQLite. To migrate an
+existing application, create a replacement application and SQLite service,
+transfer its schema and data explicitly, then cut over after validation.
 
 ## Local macOS development
 
