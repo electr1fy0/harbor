@@ -642,11 +642,7 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 	now := time.Now().UTC()
 	d.PromotedAt = &now
 	var oldDeploymentID string
-	currentSettings, err := s.db.AppSettings(name)
-	if err != nil {
-		return s.fail(&d, model.StartFailed, err)
-	}
-	routeHosts := append([]string{name + ".localhost"}, currentSettings.Domains...)
+	routeHosts := []string{name + ".localhost"}
 	drained, err := s.router.SwitchRoutes(routeHosts, "http://127.0.0.1:"+strconv.Itoa(d.Port), func() error {
 		if err := ctx.Err(); err != nil {
 			return err

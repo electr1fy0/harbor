@@ -392,13 +392,13 @@ func mapRelease(value any) (map[string]any, bool) {
 		return nil, false
 	}
 	return map[string]any{
-		"id":         safeString(release["id"], 128),
-		"appId":      safeString(release["app_id"], 128),
-		"appName":    safeSlug(release["app_name"]),
-		"sourceHash": safeString(release["source_hash"], 128),
-		"runtime":    safeString(release["runtime"], 64),
-		"createdAt":  safeTime(release["created_at"]),
-		"isActive":   safeBoolean(release["is_active"]),
+		"id":                safeString(release["id"], 128),
+		"appId":             safeString(release["app_id"], 128),
+		"appName":           safeSlug(release["app_name"]),
+		"sourceHash":        safeString(release["source_hash"], 128),
+		"runtime":           safeString(release["runtime"], 64),
+		"createdAt":         safeTime(release["created_at"]),
+		"isActive":          safeBoolean(release["is_active"]),
 		"artifactAvailable": safeBoolean(release["artifactAvailable"]),
 	}, true
 }
@@ -412,18 +412,6 @@ func mapSettings(value any) map[string]any {
 		settings = nested
 	} else if nested, nestedOK := object(settings["Settings"]); nestedOK {
 		settings = nested
-	}
-	domains := []any{}
-	seenDomains := map[string]bool{}
-	if raw := firstValue(settings, "domains", "Domains"); raw != nil {
-		if values, valid := arrayOf(raw); valid {
-			for _, value := range values {
-				if domain := safeDomain(value); domain != "" && !seenDomains[domain] {
-					domains = append(domains, domain)
-					seenDomains[domain] = true
-				}
-			}
-		}
 	}
 	keys := []any{}
 	seenKeys := map[string]bool{}
@@ -439,7 +427,6 @@ func mapSettings(value any) map[string]any {
 		}
 	}
 	return map[string]any{
-		"domains":         domains,
 		"environmentKeys": keys,
 		"memoryLimit":     safeString(firstValue(settings, "memoryLimit", "MemoryLimit"), 64),
 		"cpuQuota":        safeNumber(firstValue(settings, "cpuQuota", "CPUQuota")),
@@ -448,15 +435,7 @@ func mapSettings(value any) map[string]any {
 }
 
 func emptySettings() map[string]any {
-	return map[string]any{"domains": []any{}, "environmentKeys": []any{}, "memoryLimit": "", "cpuQuota": float64(0), "tasksLimit": float64(0)}
-}
-
-func safeDomain(value any) string {
-	candidate := strings.ToLower(safeString(value, 253))
-	if !domainPattern.MatchString(candidate) {
-		return ""
-	}
-	return candidate
+	return map[string]any{"environmentKeys": []any{}, "memoryLimit": "", "cpuQuota": float64(0), "tasksLimit": float64(0)}
 }
 
 func mapCapacity(value any) map[string]any {
@@ -703,7 +682,7 @@ func nullableString(value string, limit int) any {
 	return safeString(value, limit)
 }
 
-func routeURL(value any, deployment map[string]any, domains any) string {
+func routeURL(value any, deployment map[string]any) string {
 	if deployment == nil || deployment["State"] != "RUNNING" {
 		return ""
 	}
@@ -722,18 +701,6 @@ func routeURL(value any, deployment map[string]any, domains any) string {
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
 	host := strings.ToLower(parsed.Hostname())
 	port := parsed.Port()
-	allowedDomain := false
-	if values, valid := arrayOf(domains); valid {
-		for _, domain := range values {
-			if safeDomain(domain) == host {
-				allowedDomain = true
-				break
-			}
-		}
-	}
-	if parsed.Scheme == "https" && allowedDomain && (port == "" || port == "443") {
-		return "https://" + host
-	}
 	if parsed.Scheme != "http" || host != appName+".localhost" || port == "" {
 		return ""
 	}
@@ -742,20 +709,4 @@ func routeURL(value any, deployment map[string]any, domains any) string {
 		return ""
 	}
 	return "http://" + host + ":" + strconv.Itoa(portNumber)
-}
-
-func configuredHTTPSURL(deployment map[string]any, domains any) string {
-	if deployment == nil || deployment["State"] != "RUNNING" {
-		return ""
-	}
-	values, valid := arrayOf(domains)
-	if !valid {
-		return ""
-	}
-	for _, value := range values {
-		if domain := safeDomain(value); domain != "" {
-			return "https://" + domain
-		}
-	}
-	return ""
 }

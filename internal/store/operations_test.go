@@ -34,7 +34,7 @@ func TestOperationSettingsRevisionAndRestartStatePersist(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings.MemoryLimit = "256Mi"
-	if _, _, err := db.UpdateAppSettings(app.Name, *settings, nil); err != nil {
+	if err := db.UpdateAppSettings(app.Name, *settings); err != nil {
 		t.Fatal(err)
 	}
 	changed, err := db.OperationSettings(app.Name)
@@ -107,7 +107,7 @@ func TestMarkSettingsAppliedRevisionLeavesNewerChangesPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings.MemoryLimit = "128Mi"
-	if _, _, err := db.UpdateAppSettings(app.Name, *settings, nil); err != nil {
+	if err := db.UpdateAppSettings(app.Name, *settings); err != nil {
 		t.Fatal(err)
 	}
 	consumed, err := db.OperationSettings(app.Name)
@@ -119,7 +119,7 @@ func TestMarkSettingsAppliedRevisionLeavesNewerChangesPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings.MemoryLimit = "256Mi"
-	if _, _, err := db.UpdateAppSettings(app.Name, *settings, nil); err != nil {
+	if err := db.UpdateAppSettings(app.Name, *settings); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.MarkSettingsAppliedRevision(app.ID, consumed.SettingsRevision); err != nil {

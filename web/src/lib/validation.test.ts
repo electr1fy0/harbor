@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  configureAppInputSchema,
   deployAppInputSchema,
   explainFailureInputSchema,
   getCapacityInputSchema,
@@ -10,6 +11,16 @@ import {
 } from "./validation"
 
 describe("Harbor input validation", () => {
+  it("rejects custom domain fields even with valid runtime changes", () => {
+    expect(() =>
+      parseInput(configureAppInputSchema, {
+        name: "demo",
+        memoryLimit: "128Mi",
+        domains: ["example.com"],
+      })
+    ).toThrow("Invalid request data.")
+  })
+
   it("accepts Go-compatible app names and repository defaults", () => {
     expect(
       parseInput(deployAppInputSchema, {

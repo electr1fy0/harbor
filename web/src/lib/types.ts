@@ -147,7 +147,6 @@ export interface AppDetails {
 
 /** Safe project settings metadata. Secret values are never returned. */
 export interface AppSettings {
-  domains: string[]
   environmentKeys: string[]
   memoryLimit: string
   cpuQuota: number

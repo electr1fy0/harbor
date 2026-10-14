@@ -305,20 +305,20 @@ func TestRunConfigureReadsSecretsFromStdinAndPrintsMetadata(t *testing.T) {
 		received <- request
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(daemon.Response{Settings: &model.Settings{
-			Domains: []string{"app.example.com"}, EnvironmentKeys: []string{"TOKEN"},
-			MemoryLimit: "128Mi", CPUQuota: 0.5, TasksLimit: 32,
+			EnvironmentKeys: []string{"TOKEN"},
+			MemoryLimit:     "128Mi", CPUQuota: 0.5, TasksLimit: 32,
 		}})
 	}))
 	var stdout, stderr bytes.Buffer
-	args := []string{"-socket", socket, "configure", "sample", "--env-stdin", "--domain", "app.example.com", "--memory", "128Mi", "--cpu", "0.5", "--tasks", "32"}
+	args := []string{"-socket", socket, "configure", "sample", "--env-stdin", "--memory", "128Mi", "--cpu", "0.5", "--tasks", "32"}
 	if code := runWithInput(args, strings.NewReader("TOKEN="+secret+"\n"), &stdout, &stderr); code != 0 {
 		t.Fatalf("runWithInput() code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	request := <-received
-	if request.Name != "sample" || request.Environment["TOKEN"] != secret || request.Domains == nil || len(*request.Domains) != 1 || (*request.Domains)[0] != "app.example.com" {
+	if request.Name != "sample" || request.Environment["TOKEN"] != secret {
 		t.Fatalf("configure request = %#v", request)
 	}
-	if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) || !strings.Contains(stdout.String(), "TOKEN") || !strings.Contains(stdout.String(), "app.example.com") {
+	if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) || !strings.Contains(stdout.String(), "TOKEN") {
 		t.Fatalf("configure CLI output leaked or omitted metadata: stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }

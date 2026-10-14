@@ -55,8 +55,8 @@ serving uses the Go binary and does not need a Bun server process.
 ## Operations, data services, and observability
 
 Project tabs expose operations, all deployment attempts and events, repository
-automation, incremental redacted logs, historical metrics, maintenance and
-primary-domain routing, notifications, and diagnostic exports. The Services
+automation, incremental redacted logs, historical metrics, maintenance
+mode, notifications, and diagnostic exports. The Services
 page manages SQLite bindings, snapshots, scheduled retention, verification,
 clone restore, and encrypted Harbor exports. See [`../docs/features.md`](../docs/features.md)
 for behavior, authentication, limits, and the first 50 feature coverage map.

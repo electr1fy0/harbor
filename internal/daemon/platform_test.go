@@ -47,7 +47,7 @@ func TestSettingsAndConfigureMetadataAPI(t *testing.T) {
 
 	configure := httptest.NewRecorder()
 	server.http.Handler.ServeHTTP(configure, httptest.NewRequest(http.MethodPost, "/configure", strings.NewReader(
-		`{"Name":"private","Environment":{"TOKEN":"api-secret"},"Domains":["App.Example.com"],"MemoryLimit":"192Mi","CPUQuota":0.5,"TasksLimit":24}`)))
+		`{"Name":"private","Environment":{"TOKEN":"api-secret"},"MemoryLimit":"192Mi","CPUQuota":0.5,"TasksLimit":24}`)))
 	if configure.Code != http.StatusOK {
 		t.Fatalf("configure status=%d body=%s", configure.Code, configure.Body.String())
 	}
@@ -55,7 +55,7 @@ func TestSettingsAndConfigureMetadataAPI(t *testing.T) {
 	if strings.Contains(body, "api-secret") {
 		t.Fatalf("configure response leaked an environment value: %s", body)
 	}
-	for _, required := range []string{`"settings"`, `"domains":["app.example.com"]`, `"environmentKeys":["TOKEN"]`, `"memoryLimit":"192Mi"`, `"cpuQuota":0.5`, `"tasksLimit":24`} {
+	for _, required := range []string{`"settings"`, `"environmentKeys":["TOKEN"]`, `"memoryLimit":"192Mi"`, `"cpuQuota":0.5`, `"tasksLimit":24`} {
 		if !strings.Contains(body, required) {
 			t.Errorf("configure response missing %s: %s", required, body)
 		}
@@ -74,8 +74,8 @@ func TestSettingsAndConfigureMetadataAPI(t *testing.T) {
 	server.http.Handler.ServeHTTP(duplicate, httptest.NewRequest(http.MethodPost, "/configure", strings.NewReader(
 		`{"Name":"other","Domains":["app.example.com"]}`,
 	)))
-	if duplicate.Code != http.StatusConflict {
-		t.Fatalf("duplicate domain status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	if duplicate.Code != http.StatusBadRequest {
+		t.Fatalf("removed custom domain field status=%d body=%s", duplicate.Code, duplicate.Body.String())
 	}
 	if _, err := os.Stat(filepath.Join(root, "data", "environment.key")); err != nil {
 		t.Fatal(err)

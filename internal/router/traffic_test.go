@@ -20,22 +20,17 @@ func TestTrafficPoliciesMetricsAndUnknownHosts(t *testing.T) {
 		router.ServeHTTP(w, request)
 		return w
 	}
-	router.SetTrafficPolicy("alias.example.com", TrafficPolicy{PrimaryDomain: "primary.example.com"})
-	response := call("alias.example.com", "/a%2Fb?q=1")
-	if response.Code != 308 || response.Header().Get("Location") != "https://primary.example.com/a%2Fb?q=1" {
-		t.Fatalf("redirect=%d %s", response.Code, response.Header().Get("Location"))
-	}
 	router.SetTrafficPolicy("alias.example.com", TrafficPolicy{Maintenance: true, Message: "Back soon"})
-	if response = call("alias.example.com", "/"); response.Code != 503 || response.Header().Get("Retry-After") != "60" {
+	if response := call("alias.example.com", "/"); response.Code != 503 || response.Header().Get("Retry-After") != "60" {
 		t.Fatalf("maintenance=%+v", response)
 	}
 	router.SetTrafficPolicy("alias.example.com", TrafficPolicy{})
-	if response = call("alias.example.com", "/"); response.Code != 201 || response.Body.String() != "hello" {
+	if response := call("alias.example.com", "/"); response.Code != 201 || response.Body.String() != "hello" {
 		t.Fatalf("proxy=%+v", response)
 	}
 	call("unknown.example.com", "/")
 	stats := router.Traffic()
-	if len(stats) != 1 || stats[0].Requests != 3 || stats[0].StatusCodes[201] != 1 || stats[0].StatusCodes[503] != 1 || stats[0].StatusCodes[308] != 1 || stats[0].Bytes < 5 {
+	if len(stats) != 1 || stats[0].Requests != 2 || stats[0].StatusCodes[201] != 1 || stats[0].StatusCodes[503] != 1 || stats[0].Bytes < 5 {
 		t.Fatalf("stats=%+v", stats)
 	}
 	stats[0].StatusCodes[201] = 100

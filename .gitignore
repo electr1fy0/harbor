@@ -7,6 +7,7 @@
 *.md
 !/web/README.md
 !/deploy/README.md
+!/docs/classroom-demo.md
 
 # Go tooling
 *.test

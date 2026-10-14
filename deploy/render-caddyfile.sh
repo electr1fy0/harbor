@@ -51,20 +51,7 @@ PY
 )
 
 cat <<CADDY
-{
-	on_demand_tls {
-		ask http://127.0.0.1:8081/tls/ask
-	}
-}
-
 ${dashboard_host} {
 	reverse_proxy 127.0.0.1:3000
-}
-
-https:// {
-	tls {
-		on_demand
-	}
-	reverse_proxy 127.0.0.1:8080
 }
 CADDY

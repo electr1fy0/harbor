@@ -41,12 +41,10 @@ type AppSettings struct {
 	TasksLimit                int
 	EncryptedEnvironment      []byte
 	EncryptedRedactionHistory []byte
-	Domains                   []string
 }
 
 // Settings is the safe, user-facing application configuration view.
 type Settings struct {
-	Domains         []string `json:"domains"`
 	EnvironmentKeys []string `json:"environmentKeys"`
 	MemoryLimit     string   `json:"memoryLimit"`
 	CPUQuota        float64  `json:"cpuQuota"`

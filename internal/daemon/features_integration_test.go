@@ -124,15 +124,12 @@ func TestFeatureGatewaySettingsOperationsAndObservability(t *testing.T) {
 	if err := f.routes.SetRoute("demo.localhost", backend.URL); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.routes.SetRoute("app.example.test", backend.URL); err != nil {
-		t.Fatal(err)
-	}
 
-	status, body := f.dashboardCall(t, "configureApp", `{"name":"demo","environment":{"TOKEN":"runtime-secret"},"domains":["app.example.test"],"memoryLimit":"256Mi","cpuQuota":1.25,"tasksLimit":42}`)
+	status, body := f.dashboardCall(t, "configureApp", `{"name":"demo","environment":{"TOKEN":"runtime-secret"},"memoryLimit":"256Mi","cpuQuota":1.25,"tasksLimit":42}`)
 	if status != http.StatusOK {
 		t.Fatalf("configureApp status=%d body=%s", status, body)
 	}
-	if strings.Contains(string(body), "runtime-secret") || !strings.Contains(string(body), `"environmentKeys":["TOKEN"]`) || !strings.Contains(string(body), `"domains":["app.example.test"]`) {
+	if strings.Contains(string(body), "runtime-secret") || !strings.Contains(string(body), `"environmentKeys":["TOKEN"]`) {
 		t.Fatalf("configureApp response leaked or omitted safe metadata: %s", body)
 	}
 
@@ -245,26 +242,13 @@ func TestFeatureGatewaySettingsOperationsAndObservability(t *testing.T) {
 		t.Fatalf("malformed cursor did not safely reset logs: %s", body)
 	}
 
-	observeSettings := `{"name":"demo","maintenance":false,"maintenanceMessage":"Scheduled maintenance","primaryDomain":"app.example.test","memoryPercent":0,"diskPercent":0,"cooldownSeconds":300,"events":[]}`
-	status, body = f.dashboardCall(t, "observe", `{"action":"configure","name":"demo","settings":`+observeSettings+`}`)
-	if status != http.StatusOK {
-		t.Fatalf("observe configure redirect status=%d body=%s", status, body)
-	}
-	redirectRequest := httptest.NewRequest(http.MethodGet, "http://demo.localhost/docs/guide?lang=en", nil)
-	redirectRequest.Host = "demo.localhost"
-	redirect := httptest.NewRecorder()
-	f.routes.ServeHTTP(redirect, redirectRequest)
-	if redirect.Code != http.StatusPermanentRedirect || redirect.Header().Get("Location") != "https://app.example.test/docs/guide?lang=en" {
-		t.Fatalf("primary-domain redirect status=%d location=%q", redirect.Code, redirect.Header().Get("Location"))
-	}
-
-	observeSettings = `{"name":"demo","maintenance":true,"maintenanceMessage":"Deploy in progress","primaryDomain":"app.example.test","memoryPercent":0,"diskPercent":0,"cooldownSeconds":300,"events":[]}`
+	observeSettings := `{"name":"demo","maintenance":true,"maintenanceMessage":"Deploy in progress","memoryPercent":0,"diskPercent":0,"cooldownSeconds":300,"events":[]}`
 	status, body = f.dashboardCall(t, "observe", `{"action":"configure","name":"demo","settings":`+observeSettings+`}`)
 	if status != http.StatusOK {
 		t.Fatalf("observe configure maintenance status=%d body=%s", status, body)
 	}
-	maintenanceRequest := httptest.NewRequest(http.MethodGet, "http://app.example.test/health", nil)
-	maintenanceRequest.Host = "app.example.test"
+	maintenanceRequest := httptest.NewRequest(http.MethodGet, "http://demo.localhost/health", nil)
+	maintenanceRequest.Host = "demo.localhost"
 	maintenance := httptest.NewRecorder()
 	f.routes.ServeHTTP(maintenance, maintenanceRequest)
 	if maintenance.Code != http.StatusServiceUnavailable || !strings.Contains(maintenance.Body.String(), "Deploy in progress") || maintenance.Header().Get("Retry-After") == "" {
@@ -285,8 +269,8 @@ func TestFeatureGatewaySettingsOperationsAndObservability(t *testing.T) {
 	if status != http.StatusOK || !strings.Contains(string(body), `"forgotten":true`) {
 		t.Fatalf("observe forget status=%d body=%s", status, body)
 	}
-	requestAfterForget := httptest.NewRequest(http.MethodGet, "http://app.example.test/health", nil)
-	requestAfterForget.Host = "app.example.test"
+	requestAfterForget := httptest.NewRequest(http.MethodGet, "http://demo.localhost/health", nil)
+	requestAfterForget.Host = "demo.localhost"
 	afterForget := httptest.NewRecorder()
 	f.routes.ServeHTTP(afterForget, requestAfterForget)
 	if afterForget.Code != http.StatusOK || afterForget.Body.String() != "backend response" {

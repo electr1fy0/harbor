@@ -38,7 +38,6 @@ export interface ObserveSettings {
   name: string
   maintenance: boolean
   maintenanceMessage: string
-  primaryDomain: string
   memoryPercent: number
   diskPercent: number
   cooldownSeconds: number

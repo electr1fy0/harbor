@@ -18,9 +18,8 @@ import (
 )
 
 var ErrNotFound = errors.New("store: not found")
-var ErrDomainInUse = errors.New("store: domain is already assigned to another application")
 
-const schemaVersion = 8
+const schemaVersion = 9
 
 const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
@@ -322,22 +321,6 @@ func (s *Store) AppSettings(name string) (*model.AppSettings, error) {
 		return nil, fmt.Errorf("store: read application settings: %w", err)
 	}
 	settings.DesiredRunning = desired != 0
-	settings.Domains = make([]string, 0)
-	rows, err := s.db.Query(`SELECT hostname FROM domains WHERE app_id = ? ORDER BY hostname COLLATE NOCASE`, settings.AppID)
-	if err != nil {
-		return nil, fmt.Errorf("store: list application domains: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var hostname string
-		if err := rows.Scan(&hostname); err != nil {
-			return nil, fmt.Errorf("store: scan application domain: %w", err)
-		}
-		settings.Domains = append(settings.Domains, hostname)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: list application domains: %w", err)
-	}
 	return &settings, nil
 }
 
@@ -352,86 +335,21 @@ func (s *Store) AppSettingsByID(appID string) (*model.AppSettings, error) {
 	return s.AppSettings(name)
 }
 
-// UpdateAppSettings atomically replaces mutable app configuration and keeps
-// configured aliases mapped to the application's active deployment.
-func (s *Store) UpdateAppSettings(name string, settings model.AppSettings, domains []string) (oldDomains []string, activeDeploymentID string, err error) {
-	tx, err := s.db.Begin()
+// UpdateAppSettings atomically replaces mutable runtime configuration.
+func (s *Store) UpdateAppSettings(name string, settings model.AppSettings) error {
+	result, err := s.db.Exec(`UPDATE app_settings SET memory_limit = ?, cpu_quota = ?, tasks_limit = ?, environment = ?, redaction_history = ?, updated_at = ? WHERE app_id = (SELECT id FROM apps WHERE name = ?)`,
+		settings.MemoryLimit, settings.CPUQuota, settings.TasksLimit, settings.EncryptedEnvironment, settings.EncryptedRedactionHistory, encodeTime(time.Now().UTC()), name)
 	if err != nil {
-		return nil, "", fmt.Errorf("store: begin settings update: %w", err)
+		return fmt.Errorf("store: update application settings: %w", err)
 	}
-	defer tx.Rollback()
-
-	var appID string
-	if err := tx.QueryRow(`SELECT id FROM apps WHERE name = ?`, name).Scan(&appID); errors.Is(err, sql.ErrNoRows) {
-		return nil, "", fmt.Errorf("%w: application %q", ErrNotFound, name)
-	} else if err != nil {
-		return nil, "", fmt.Errorf("store: read application for settings: %w", err)
-	}
-	oldDomains = make([]string, 0)
-	rows, err := tx.Query(`SELECT hostname FROM domains WHERE app_id = ? ORDER BY hostname COLLATE NOCASE`, appID)
+	count, err := result.RowsAffected()
 	if err != nil {
-		return nil, "", fmt.Errorf("store: read previous domains: %w", err)
+		return fmt.Errorf("store: count updated application settings: %w", err)
 	}
-	for rows.Next() {
-		var hostname string
-		if err := rows.Scan(&hostname); err != nil {
-			rows.Close()
-			return nil, "", fmt.Errorf("store: scan previous domain: %w", err)
-		}
-		oldDomains = append(oldDomains, hostname)
+	if count == 0 {
+		return fmt.Errorf("%w: application %q", ErrNotFound, name)
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, "", fmt.Errorf("store: read previous domains: %w", err)
-	}
-	rows.Close()
-	activeErr := tx.QueryRow(`SELECT r.deployment_id FROM routes r JOIN deployments d ON d.id = r.deployment_id
-		WHERE r.hostname = ? AND d.app_id = ? AND d.state = ?`, name+".localhost", appID, string(model.Running)).Scan(&activeDeploymentID)
-	if activeErr != nil && !errors.Is(activeErr, sql.ErrNoRows) {
-		return nil, "", fmt.Errorf("store: read active deployment for settings: %w", activeErr)
-	}
-
-	if _, err := tx.Exec(`UPDATE app_settings SET memory_limit = ?, cpu_quota = ?, tasks_limit = ?, environment = ?, redaction_history = ?, updated_at = ? WHERE app_id = ?`,
-		settings.MemoryLimit, settings.CPUQuota, settings.TasksLimit, settings.EncryptedEnvironment, settings.EncryptedRedactionHistory, encodeTime(time.Now().UTC()), appID); err != nil {
-		return nil, "", fmt.Errorf("store: update application settings: %w", err)
-	}
-	// Remove only routes owned by a deployment of this application. This keeps
-	// stale or corrupt mappings for another application's domain untouched.
-	if _, err := tx.Exec(`DELETE FROM routes WHERE hostname IN (SELECT hostname FROM domains WHERE app_id = ?)
-		AND deployment_id IN (SELECT id FROM deployments WHERE app_id = ?)`, appID, appID); err != nil {
-		return nil, "", fmt.Errorf("store: remove previous domain routes: %w", err)
-	}
-	if _, err := tx.Exec(`DELETE FROM domains WHERE app_id = ?`, appID); err != nil {
-		return nil, "", fmt.Errorf("store: replace application domains: %w", err)
-	}
-	for _, hostname := range domains {
-		if _, err := tx.Exec(`INSERT INTO domains (hostname, app_id) VALUES (?, ?)`, hostname, appID); err != nil {
-			if strings.Contains(err.Error(), "domains.hostname") || strings.Contains(err.Error(), "UNIQUE constraint failed") {
-				return nil, "", ErrDomainInUse
-			}
-			return nil, "", fmt.Errorf("store: save application domain: %w", err)
-		}
-	}
-	if activeDeploymentID != "" {
-		for _, hostname := range domains {
-			var ownerAppID string
-			checkErr := tx.QueryRow(`SELECT d.app_id FROM routes r JOIN deployments d ON d.id = r.deployment_id WHERE r.hostname = ?`, hostname).Scan(&ownerAppID)
-			if checkErr == nil && ownerAppID != appID {
-				return nil, "", ErrDomainInUse
-			}
-			if checkErr != nil && !errors.Is(checkErr, sql.ErrNoRows) {
-				return nil, "", fmt.Errorf("store: check active domain route: %w", checkErr)
-			}
-			if _, err := tx.Exec(`INSERT INTO routes (hostname, deployment_id) VALUES (?, ?)
-				ON CONFLICT(hostname) DO UPDATE SET deployment_id = excluded.deployment_id`, hostname, activeDeploymentID); err != nil {
-				return nil, "", fmt.Errorf("store: activate application domain: %w", err)
-			}
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, "", fmt.Errorf("store: commit application settings: %w", err)
-	}
-	return oldDomains, activeDeploymentID, nil
+	return nil
 }
 
 // SetDesiredRunning persists whether an application should be running across
@@ -498,13 +416,6 @@ func (s *Store) LatestPromotedDeployment(name string) (*model.Deployment, error)
 	return d, nil
 }
 
-// IsDomainConfigured reports whether a custom hostname has an explicit owner.
-func (s *Store) IsDomainConfigured(hostname string) bool {
-	var exists int
-	err := s.db.QueryRow(`SELECT 1 FROM domains WHERE hostname = ? COLLATE NOCASE`, hostname).Scan(&exists)
-	return err == nil
-}
-
 // Publish marks d as running and switches hostname to it in one transaction.
 func (s *Store) Publish(d model.Deployment, hostname string) error {
 	_, err := s.Promote(d, hostname)
@@ -561,38 +472,6 @@ func (s *Store) Promote(d model.Deployment, hostname string) (string, error) {
 		ON CONFLICT(hostname) DO UPDATE SET deployment_id = excluded.deployment_id`, hostname, d.ID)
 	if err != nil {
 		return "", fmt.Errorf("store: promote route: %w", err)
-	}
-	rows, err := tx.Query(`SELECT hostname FROM domains WHERE app_id = ?`, d.AppID)
-	if err != nil {
-		return "", fmt.Errorf("store: read application domains: %w", err)
-	}
-	var domains []string
-	for rows.Next() {
-		var domain string
-		if err := rows.Scan(&domain); err != nil {
-			rows.Close()
-			return "", fmt.Errorf("store: scan application domain: %w", err)
-		}
-		domains = append(domains, domain)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return "", fmt.Errorf("store: read application domains: %w", err)
-	}
-	rows.Close()
-	for _, domain := range domains {
-		var ownerAppID string
-		checkErr := tx.QueryRow(`SELECT d.app_id FROM routes r JOIN deployments d ON d.id = r.deployment_id WHERE r.hostname = ?`, domain).Scan(&ownerAppID)
-		if checkErr == nil && ownerAppID != d.AppID {
-			return "", ErrDomainInUse
-		}
-		if checkErr != nil && !errors.Is(checkErr, sql.ErrNoRows) {
-			return "", fmt.Errorf("store: check domain route ownership: %w", checkErr)
-		}
-		if _, err := tx.Exec(`INSERT INTO routes (hostname, deployment_id) VALUES (?, ?)
-			ON CONFLICT(hostname) DO UPDATE SET deployment_id = excluded.deployment_id`, domain, d.ID); err != nil {
-			return "", fmt.Errorf("store: promote domain route: %w", err)
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("store: commit promote: %w", err)
@@ -1091,6 +970,21 @@ func migrate(db *sql.DB) error {
 			}
 		}
 		version = 8
+	}
+	if version < 9 {
+		// Retire custom routes while preserving each app's generated local route.
+		statements := []string{
+			`DELETE FROM routes WHERE hostname NOT IN (SELECT name || '.localhost' FROM apps)`,
+			`DROP TRIGGER IF EXISTS app_operations_domain_insert`,
+			`DROP TRIGGER IF EXISTS app_operations_domain_delete`,
+			`DROP TABLE IF EXISTS domains`,
+			`PRAGMA user_version = 9`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(statement); err != nil {
+				return fmt.Errorf("store: retire custom domains: %w", err)
+			}
+		}
 	}
 	return tx.Commit()
 }

@@ -1,6 +1,6 @@
 # Harbor operations and automation
 
-The first 50 requested features extend Harbor's existing single-machine Go,
+These operational features extend Harbor's existing single-machine Go,
 SQLite, immutable-release, systemd/Bubblewrap, and hostname-router design.
 
 ## Controls and deployment history
@@ -84,15 +84,14 @@ current daemon lifetime; hijacked stream bytes are excluded.
 
 HTTPS notification URLs are encrypted and write-only. Select lifecycle events,
 host memory/disk thresholds, and cooldowns. Delivery outcomes are recorded with
-bounded retention. Outbound notification/probe connections resolve and pin
+bounded retention. Outbound notification connections resolve and pin
 public addresses and reject private targets. Diagnostic bundles include safe
 settings, redacted logs/summary, and recent capacity history.
 
-Maintenance serves HTTP 503 with Retry-After for configured routes. Primary
-domain redirects use HTTP 308 and preserve path/query. DNS and HTTPS checks
-show observed addresses, reachability, and certificate expiry. DNS guidance
-requires the server's public IP; Harbor cannot reliably infer it from the
-loopback listener. Project deletion clears stored routing/notification settings.
+Maintenance serves HTTP 503 with Retry-After for each application's local route.
+Project deletion clears stored routing/notification settings. Applications use
+generated `.localhost` hostnames; custom domains, DNS/HTTPS diagnostics, and
+primary-domain redirects have been removed.
 
 ## Feature coverage
 
@@ -111,7 +110,8 @@ loopback listener. Project deletion clears stored routing/notification settings.
 | 34–37 | Manual/scheduled snapshots, clone restore, encrypted export |
 | 38–40 | Release retention, cache pruning, backup integrity/staleness |
 | 41–43 | Dotenv import, required keys, resource presets |
-| 44–46 | DNS/HTTPS diagnostics, primary redirects, maintenance |
+| 44–45 | Removed: custom-domain diagnostics and primary redirects |
+| 46 | Maintenance mode on the generated local route |
 | 47–49 | Ongoing probes, opt-in crash recovery, capacity preflight |
 | 50 | Project tags/favorites and archive/search filters |
 

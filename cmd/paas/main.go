@@ -17,7 +17,7 @@ import (
 	"paas/internal/model"
 )
 
-const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]|settings NAME|configure NAME [--env-stdin] [--remove-env KEY] [--domain HOST|--clear-domains] [--memory LIMIT] [--cpu N] [--tasks N]|add TYPE --name NAME|link APP SERVICE|services|export-decrypt INPUT OUTPUT --passphrase-stdin}"
+const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]|settings NAME|configure NAME [--env-stdin] [--remove-env KEY] [--memory LIMIT] [--cpu N] [--tasks N]|add TYPE --name NAME|link APP SERVICE|services|export-decrypt INPUT OUTPUT --passphrase-stdin}"
 
 func main() {
 	os.Exit(runWithInput(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -294,8 +294,8 @@ func printSettings(stdout io.Writer, settings *model.Settings) error {
 	if settings == nil {
 		return fmt.Errorf("daemon returned no settings")
 	}
-	if _, err := fmt.Fprintf(stdout, "Domains: %s\nEnvironment keys: %s\nMemory limit: %s\nCPU quota: %s\nTasks limit: %d\n",
-		listValue(settings.Domains), listValue(settings.EnvironmentKeys), settings.MemoryLimit,
+	if _, err := fmt.Fprintf(stdout, "Environment keys: %s\nMemory limit: %s\nCPU quota: %s\nTasks limit: %d\n",
+		listValue(settings.EnvironmentKeys), settings.MemoryLimit,
 		strconv.FormatFloat(settings.CPUQuota, 'f', -1, 64), settings.TasksLimit); err != nil {
 		return err
 	}
@@ -454,9 +454,6 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 			return request, fmt.Errorf("configure requires NAME")
 		}
 		request.Name = args[0]
-		domainSeen := false
-		clearDomains := false
-		var domains []string
 		for i := 1; i < len(args); i++ {
 			arg := args[i]
 			switch arg {
@@ -471,15 +468,6 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 				}
 				request.RemoveEnvironment = append(request.RemoveEnvironment, args[i+1])
 				i++
-			case "--domain":
-				if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
-					return request, fmt.Errorf("--domain requires a hostname")
-				}
-				domainSeen = true
-				domains = append(domains, args[i+1])
-				i++
-			case "--clear-domains":
-				clearDomains = true
 			case "--memory":
 				if i+1 >= len(args) || args[i+1] == "" || strings.HasPrefix(args[i+1], "-") {
 					return request, fmt.Errorf("--memory requires a limit")
@@ -510,15 +498,6 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 			default:
 				return request, commandArgumentError(command, arg)
 			}
-		}
-		if domainSeen && clearDomains {
-			return request, fmt.Errorf("--domain and --clear-domains cannot be combined")
-		}
-		if domainSeen {
-			request.Domains = &domains
-		} else if clearDomains {
-			empty := []string{}
-			request.Domains = &empty
 		}
 	case "rollback":
 		if len(args) == 0 || args[0] == "" || strings.HasPrefix(args[0], "-") {

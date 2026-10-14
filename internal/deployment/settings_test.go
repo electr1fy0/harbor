@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"paas/internal/model"
-	"paas/internal/store"
 )
 
 func TestConfigureEncryptsSecretsAndRedactsRotationHistory(t *testing.T) {
@@ -85,50 +84,6 @@ func TestConfigureEncryptsSecretsAndRedactsRotationHistory(t *testing.T) {
 	failed, deployErr := h.service.Deploy(context.Background(), h.source, "demo")
 	if deployErr == nil || strings.Contains(deployErr.Error(), first) || failed == nil || strings.Contains(failed.Error, first) {
 		t.Fatalf("failure diagnostics leaked a rotated secret: deployment=%+v error=%v", failed, deployErr)
-	}
-}
-
-func TestConfigureValidatesDomainsAndUpdatesLiveAliases(t *testing.T) {
-	h := newServiceHarness(t, testConfig)
-	if _, err := h.service.Deploy(context.Background(), h.source, "demo"); err != nil {
-		t.Fatal(err)
-	}
-	for _, domains := range [][]string{{"bad/path.example"}, {"same.example", "SAME.EXAMPLE"}, {"localhost"}, {"demo.localhost"}} {
-		if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Domains: &domains}); err == nil {
-			t.Errorf("Configure(%v) unexpectedly succeeded", domains)
-		}
-	}
-	domains := []string{"WWW.Example.com."}
-	settings, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Domains: &domains})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(settings.Domains) != 1 || settings.Domains[0] != "www.example.com" {
-		t.Fatalf("normalized domains = %v", settings.Domains)
-	}
-	if !h.service.IsDomainAllowed("WWW.EXAMPLE.COM:443") || h.service.IsDomainAllowed("demo.localhost") {
-		t.Fatal("TLS hostname allow-list does not match explicit domains")
-	}
-	if response := routerRequest(h.router, "www.example.com", "/"); response.Code != 200 {
-		t.Fatalf("custom alias returned %d, want 200", response.Code)
-	}
-
-	if _, err := h.service.Deploy(context.Background(), h.source, "other"); err != nil {
-		t.Fatal(err)
-	}
-	duplicate := []string{"WWW.EXAMPLE.COM"}
-	if _, err := h.service.Configure(context.Background(), "other", ConfigureOptions{Domains: &duplicate}); !errors.Is(err, store.ErrDomainInUse) {
-		t.Fatalf("duplicate global domain error = %v", err)
-	}
-	cleared := []string{}
-	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Domains: &cleared}); err != nil {
-		t.Fatal(err)
-	}
-	if response := routerRequest(h.router, "www.example.com", "/"); response.Code != 404 {
-		t.Fatalf("removed alias returned %d, want 404", response.Code)
-	}
-	if h.service.IsDomainAllowed("www.example.com") {
-		t.Fatal("removed domain remained allowed for TLS")
 	}
 }
 
@@ -222,12 +177,8 @@ func envValue(entries []string, key string) string {
 	return "<missing>"
 }
 
-func TestCustomAliasesSurviveCandidateFailureAndWithdrawOnStop(t *testing.T) {
+func TestLocalRouteSurvivesCandidateFailureAndWithdrawsOnStop(t *testing.T) {
 	h := newServiceHarness(t, testConfig)
-	domains := []string{"api.example.com", "www.example.com"}
-	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Domains: &domains}); err != nil {
-		t.Fatal(err)
-	}
 	active, err := h.service.Deploy(context.Background(), h.source, "demo")
 	if err != nil {
 		t.Fatal(err)
@@ -241,7 +192,7 @@ func TestCustomAliasesSurviveCandidateFailureAndWithdrawOnStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, host := range append(domains, "demo.localhost") {
+	for _, host := range []string{"demo.localhost"} {
 		if routes[host] != active.ID || routerRequest(h.router, host, "/").Code != 200 {
 			t.Fatalf("candidate failure changed active alias %s", host)
 		}
@@ -253,14 +204,14 @@ func TestCustomAliasesSurviveCandidateFailureAndWithdrawOnStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, host := range append(domains, "demo.localhost") {
+	for _, host := range []string{"demo.localhost"} {
 		if routes[host] != "" || routerRequest(h.router, host, "/").Code != 404 {
 			t.Fatalf("stopped app still has alias %s", host)
 		}
 	}
 }
 
-func TestDomainOnlyAndNoopSettingsDoNotInventPendingRuntimeChanges(t *testing.T) {
+func TestNoopSettingsDoNotInventPendingRuntimeChanges(t *testing.T) {
 	h := newServiceHarness(t, testConfig)
 	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Environment: map[string]string{"TOKEN": "retained-secret"}}); err != nil {
 		t.Fatal(err)
@@ -272,10 +223,6 @@ func TestDomainOnlyAndNoopSettingsDoNotInventPendingRuntimeChanges(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	domains := []string{"demo.example.com"}
-	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Domains: &domains}); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Environment: map[string]string{"TOKEN": "retained-secret"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +231,7 @@ func TestDomainOnlyAndNoopSettingsDoNotInventPendingRuntimeChanges(t *testing.T)
 		t.Fatal(err)
 	}
 	if after.PendingSettings || after.SettingsRevision != before.SettingsRevision {
-		t.Fatalf("domain/noop change advanced runtime revision: before=%+v after=%+v", before, after)
+		t.Fatalf("noop change advanced runtime revision: before=%+v after=%+v", before, after)
 	}
 	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Environment: map[string]string{"TOKEN": "new-secret"}}); err != nil {
 		t.Fatal(err)

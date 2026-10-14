@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"maps"
 	"math"
-	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,19 +20,16 @@ import (
 	"paas/internal/config"
 	"paas/internal/model"
 	managedservice "paas/internal/service"
-	"paas/internal/store"
 )
 
 var environmentKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 const maxRedactionHistoryBytes = 1 << 20
 
-// ConfigureOptions contains optional changes. A nil Domains pointer preserves
-// the current domain list; a pointer to an empty slice clears it.
+// ConfigureOptions contains optional runtime settings changes.
 type ConfigureOptions struct {
 	Environment       map[string]string
 	RemoveEnvironment []string
-	Domains           *[]string
 	MemoryLimit       *string
 	CPUQuota          *float64
 	TasksLimit        *int
@@ -59,7 +55,6 @@ func (s *Service) Settings(name string) (*model.Settings, error) {
 		return nil, err
 	}
 	result := &model.Settings{
-		Domains:         append([]string{}, stored.Domains...),
 		EnvironmentKeys: sortedKeys(environment),
 		MemoryLimit:     stored.MemoryLimit,
 		CPUQuota:        stored.CPUQuota,
@@ -167,24 +162,6 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 		delete(environment, key)
 	}
 
-	domains := append([]string{}, stored.Domains...)
-	if change.Domains != nil {
-		domains = make([]string, 0, len(*change.Domains))
-		seen := make(map[string]bool, len(*change.Domains))
-		for _, domain := range *change.Domains {
-			normalized, err := normalizeDomain(domain)
-			if err != nil {
-				return nil, err
-			}
-			if seen[normalized] {
-				return nil, fmt.Errorf("domain %q is listed more than once", normalized)
-			}
-			seen[normalized] = true
-			domains = append(domains, normalized)
-		}
-		sort.Strings(domains)
-	}
-
 	if change.MemoryLimit != nil {
 		if _, err := config.ParseMemoryBytes(*change.MemoryLimit); err != nil {
 			return nil, fmt.Errorf("invalid memory limit: %w", err)
@@ -227,75 +204,10 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 			return nil, err
 		}
 	}
-	oldDomains := append([]string{}, stored.Domains...)
-	active, activeErr := s.db.ActiveDeployment(name)
-	if activeErr != nil && !errors.Is(activeErr, store.ErrNotFound) {
-		return nil, activeErr
-	}
-	upstream := ""
-	routesToSet := []string{}
-	if active != nil {
-		upstream = fmt.Sprintf("http://127.0.0.1:%d", active.Port)
-		routesToSet = domains
-	}
-	var updateErr error
-	if err := s.router.UpdateRoutes(routesToSet, oldDomains, upstream, func() error {
-		oldDomains, _, updateErr = s.db.UpdateAppSettings(name, *stored, domains)
-		if updateErr != nil {
-			return updateErr
-		}
-		return nil
-	}); err != nil {
+	if err := s.db.UpdateAppSettings(name, *stored); err != nil {
 		return nil, err
 	}
 	return s.Settings(name)
-}
-
-// IsDomainAllowed reports whether a hostname was explicitly configured for an
-// application. The default .localhost routes never authorize TLS.
-func (s *Service) IsDomainAllowed(hostname string) bool {
-	hostname = strings.TrimSpace(strings.ToLower(hostname))
-	if parsed, _, err := net.SplitHostPort(hostname); err == nil {
-		hostname = parsed
-	}
-	hostname = strings.Trim(hostname, "[]")
-	domain, err := normalizeDomain(hostname)
-	return err == nil && s.db.IsDomainConfigured(domain)
-}
-
-// PublicURL returns the canonical HTTPS URL when the app has an explicitly
-// configured custom domain. The caller may supply its local URL as a fallback.
-func (s *Service) PublicURL(name string) string {
-	settings, err := s.Settings(name)
-	if err != nil || len(settings.Domains) == 0 {
-		return ""
-	}
-	return "https://" + settings.Domains[0]
-}
-
-func normalizeDomain(hostname string) (string, error) {
-	hostname = strings.TrimSpace(strings.ToLower(hostname))
-	if strings.HasSuffix(hostname, ".") {
-		hostname = strings.TrimSuffix(hostname, ".")
-	}
-	if len(hostname) == 0 || len(hostname) > 253 || strings.ContainsAny(hostname, ":/@*\\") || strings.HasSuffix(hostname, ".localhost") || hostname == "localhost" || net.ParseIP(hostname) != nil {
-		return "", fmt.Errorf("invalid custom domain %q", hostname)
-	}
-	labels := strings.Split(hostname, ".")
-	if len(labels) < 2 {
-		return "", fmt.Errorf("custom domain %q must be a fully qualified hostname", hostname)
-	}
-	for _, label := range labels {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return "", fmt.Errorf("invalid custom domain %q", hostname)
-		}
-		for _, r := range label {
-			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
-				return "", fmt.Errorf("invalid custom domain %q", hostname)
-			}
-		}
-	}
-	return hostname, nil
 }
 
 func (s *Service) runtimeEnvironment(appID string) (map[string]string, error) {
@@ -591,6 +503,6 @@ func (s *Service) registerBuildRedactions(appID string, environment map[string]s
 	if err != nil {
 		return err
 	}
-	_, _, err = s.db.UpdateAppSettings(settings.AppName, *settings, settings.Domains)
+	err = s.db.UpdateAppSettings(settings.AppName, *settings)
 	return err
 }

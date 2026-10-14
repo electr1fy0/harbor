@@ -89,7 +89,7 @@ func TestIncrementalLogCursorRedactsAndResets(t *testing.T) {
 		t.Fatal("invalid cursor wasn't reset")
 	}
 }
-func TestObservationSettingsEncryptWebhookAndValidatePrimary(t *testing.T) {
+func TestObservationSettingsEncryptWebhookAndValidateEvents(t *testing.T) {
 	o, _, _, _ := observeFixture(t)
 	secretURL := "https://hooks.example.com/opaque-secret"
 	cfg := observeSettings{Name: "demo", CooldownSeconds: 60, Events: []string{"CRASHED"}, Maintenance: true}
@@ -108,11 +108,6 @@ func TestObservationSettingsEncryptWebhookAndValidatePrimary(t *testing.T) {
 	if strings.Contains(string(persisted), "opaque-secret") {
 		t.Fatal("webhook stored in plaintext")
 	}
-	cfg.PrimaryDomain = "external.example.com"
-	if _, err = o.dispatch(context.Background(), observeRequest{Action: "configure", Name: "demo", Settings: &cfg}); err == nil {
-		t.Fatal("unconfigured redirect accepted")
-	}
-	cfg.PrimaryDomain = ""
 	cfg.Events = []string{"unknown"}
 	if _, err = o.dispatch(context.Background(), observeRequest{Action: "configure", Name: "demo", Settings: &cfg}); err == nil {
 		t.Fatal("unknown event accepted")
@@ -123,7 +118,7 @@ func TestObserveRouteRejectsMalformedAndUnknownFields(t *testing.T) {
 	_ = o
 	mux := http.NewServeMux()
 	registerObservabilityRoutes(mux, svc)
-	for _, body := range []string{`null`, `{"action":"logs","name":"../bad"}`, `{"action":"get","name":"demo","unexpected":1}`} {
+	for _, body := range []string{`{"action":"domains","name":"demo"}`, `{"action":"configure","name":"demo","settings":{"name":"demo","primaryDomain":"example.com","cooldownSeconds":60}}`, `null`, `{"action":"logs","name":"../bad"}`, `{"action":"get","name":"demo","unexpected":1}`} {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("POST", "/observe", strings.NewReader(body)))
 		if w.Code != 400 {

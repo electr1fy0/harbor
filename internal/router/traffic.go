@@ -10,9 +10,8 @@ import (
 
 // TrafficPolicy applies only to a configured route, never to an unknown host.
 type TrafficPolicy struct {
-	Maintenance   bool   `json:"maintenance"`
-	Message       string `json:"message"`
-	PrimaryDomain string `json:"primaryDomain"`
+	Maintenance bool   `json:"maintenance"`
+	Message     string `json:"message"`
 }
 
 // Called under r.mu. The stable app hostname owns routing policy so fresh
@@ -23,18 +22,6 @@ func (r *HostRouter) inheritTrafficPolicy(hosts []string) {
 			continue
 		}
 		policy := r.policies[anchor]
-		if policy.PrimaryDomain != "" {
-			found := false
-			for _, host := range hosts {
-				if host == policy.PrimaryDomain {
-					found = true
-					break
-				}
-			}
-			if !found {
-				policy.PrimaryDomain = ""
-			}
-		}
 		for _, host := range hosts {
 			if policy == (TrafficPolicy{}) {
 				delete(r.policies, host)

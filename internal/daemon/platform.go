@@ -163,8 +163,8 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 				if service != nil {
 					output.Settings, err = service.Configure(r.Context(), input.Name, deployment.ConfigureOptions{
 						Environment: input.Environment, RemoveEnvironment: input.RemoveEnvironment,
-						Domains: input.Domains, MemoryLimit: input.MemoryLimit,
-						CPUQuota: input.CPUQuota, TasksLimit: input.TasksLimit,
+						MemoryLimit: input.MemoryLimit,
+						CPUQuota:    input.CPUQuota, TasksLimit: input.TasksLimit,
 					})
 				} else {
 					err = errors.New("application settings are unavailable")
@@ -210,18 +210,11 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 				status := 400
 				if errors.Is(err, store.ErrNotFound) {
 					status = 404
-				} else if errors.Is(err, store.ErrDomainInUse) {
-					status = 409
 				}
 				w.WriteHeader(status)
 			}
 			if output.Deployment != nil {
 				output.URL = "http://" + output.Deployment.AppName + ".localhost:" + port
-				if service != nil {
-					if publicURL := service.PublicURL(output.Deployment.AppName); publicURL != "" {
-						output.URL = publicURL
-					}
-				}
 			}
 			writeResponse(w, command, output)
 		})

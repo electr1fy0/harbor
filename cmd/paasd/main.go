@@ -30,7 +30,6 @@ func main() {
 	socketGroup := flag.String("socket-group", "", "existing group granted access to the daemon socket")
 	data := flag.String("data-dir", "/var/lib/paas", "persistent data directory")
 	listen := flag.String("listen", "127.0.0.1:8080", "loopback router address")
-	tlsAskListen := flag.String("tls-ask-listen", "", "optional numeric loopback TLS authorization address")
 	webListen := flag.String("web-listen", "127.0.0.1:3000", "numeric loopback dashboard address; empty disables the dashboard")
 	hashPassword := flag.Bool("hash-password", false, "generate a dashboard password hash using a hidden terminal prompt, then exit")
 	buildUser := flag.String("build-user", "paas-build", "build user when daemon runs as root")
@@ -128,15 +127,6 @@ func main() {
 		_ = deploySvc.Close()
 		log.Fatal(err)
 	}
-	askServer, askListener, err := listenTLSAsk(*tlsAskListen, deploySvc)
-	if err != nil {
-		_ = routerListener.Close()
-		_ = deploySvc.Close()
-		log.Fatal(err)
-	}
-	if askListener != nil {
-		defer askListener.Close()
-	}
 	svcManager := service.NewManager(db, dataDir)
 	server = daemon.NewPlatformServerWithServicesAndBuildUser(*socket, deploySvc, svcManager, *buildUser, routerListener.Addr().String())
 	webServer, webListener, err := listenDashboard(*webListen, server.Handler(), server.PublicHooks())
@@ -172,11 +162,6 @@ func main() {
 	defer signal.Stop(signals)
 	routerDone := make(chan error, 1)
 	go func() { routerDone <- routerServer.Serve(routerListener) }()
-	var askDone chan error
-	if askServer != nil {
-		askDone = make(chan error, 1)
-		go func() { askDone <- askServer.Serve(askListener) }()
-	}
 	var webDone chan error
 	if webServer != nil {
 		webDone = make(chan error, 1)
@@ -192,8 +177,6 @@ func main() {
 		}
 	case err := <-routerDone:
 		log.Printf("router: %v", err)
-	case err := <-askDone:
-		log.Printf("TLS authorization: %v", err)
 	case err := <-webDone:
 		log.Printf("dashboard: %v", err)
 	case sig := <-signals:
@@ -218,7 +201,4 @@ func main() {
 		fmt.Fprintf(os.Stderr, "shutdown daemon: %v\n", err)
 	}
 	_ = routerServer.Shutdown(ctx)
-	if askServer != nil {
-		_ = askServer.Shutdown(ctx)
-	}
 }

@@ -1,11 +1,6 @@
 import { useState, type FormEvent } from "react"
 import { useMutation } from "@tanstack/react-query"
-import {
-  IconCirclePlus,
-  IconKey,
-  IconTrash,
-  IconWorld,
-} from "@tabler/icons-react"
+import { IconKey, IconTrash } from "@tabler/icons-react"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -32,7 +27,6 @@ export function ProjectSettings({
   onSaved,
 }: ProjectSettingsProps) {
   const [current, setCurrent] = useState(settings)
-  const [domainDraft, setDomainDraft] = useState("")
   const [environmentKey, setEnvironmentKey] = useState("")
   const [environmentValue, setEnvironmentValue] = useState("")
   const [memoryLimit, setMemoryLimit] = useState(settings.memoryLimit)
@@ -58,25 +52,6 @@ export function ProjectSettings({
   })
 
   const pending = updateMutation.isPending
-
-  function addDomain(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const domain = domainDraft.trim().toLowerCase()
-    if (
-      !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(
-        domain
-      )
-    ) {
-      setMessage("Enter a domain name without a scheme or path.")
-      return
-    }
-    if (current.domains.includes(domain)) {
-      setMessage("That domain is already configured.")
-      return
-    }
-    setDomainDraft("")
-    updateMutation.mutate({ domains: [...current.domains, domain] })
-  }
 
   function saveEnvironment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -119,70 +94,6 @@ export function ProjectSettings({
 
   return (
     <div className="grid gap-4">
-      <Card className="border-border/80 bg-white">
-        <CardHeader className="flex-row items-start gap-3 border-b border-border/60 pb-4">
-          <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[#f5f6f4] text-muted-foreground">
-            <IconWorld size={18} />
-          </span>
-          <div>
-            <CardTitle className="text-sm">Custom domains</CardTitle>
-            <CardDescription className="mt-1 leading-5">
-              Add the hostnames that should route to this application. Caddy
-              requests HTTPS certificates only for domains Harbor has allowed.
-            </CardDescription>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-4 pt-4">
-          {current.domains.length > 0 ? (
-            <ul className="space-y-2" aria-label="Configured domains">
-              {current.domains.map((domain) => (
-                <li
-                  key={domain}
-                  className="flex items-center justify-between gap-3 rounded-lg border border-border/70 px-3 py-2"
-                >
-                  <code className="truncate text-xs">{domain}</code>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    disabled={pending}
-                    onClick={() =>
-                      updateMutation.mutate({
-                        domains: current.domains.filter(
-                          (configured) => configured !== domain
-                        ),
-                      })
-                    }
-                    aria-label={`Remove ${domain}`}
-                  >
-                    <IconTrash size={15} />
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              No custom domains are configured.
-            </p>
-          )}
-          <form
-            className="flex flex-col gap-2 sm:flex-row"
-            onSubmit={addDomain}
-          >
-            <Input
-              aria-label="Domain name"
-              placeholder="app.example.com"
-              value={domainDraft}
-              onChange={(event) => setDomainDraft(event.target.value)}
-              disabled={pending}
-            />
-            <Button type="submit" variant="outline" disabled={pending}>
-              <IconCirclePlus data-icon="inline-start" /> Add domain
-            </Button>
-          </form>
-        </CardContent>
-      </Card>
-
       <Card className="border-border/80 bg-white">
         <CardHeader className="flex-row items-start gap-3 border-b border-border/60 pb-4">
           <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[#f5f6f4] text-muted-foreground">

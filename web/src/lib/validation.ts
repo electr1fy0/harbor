@@ -8,16 +8,6 @@ const environmentKey = z
   .string()
   .regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/, "Invalid request data.")
 
-const domainName = z
-  .string()
-  .trim()
-  .toLowerCase()
-  .max(253)
-  .regex(
-    /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/,
-    "Invalid request data."
-  )
-
 const githubOwner = z
   .string()
   .trim()
@@ -155,7 +145,6 @@ export const configureAppInputSchema = z
     name: appName,
     environment: z.record(environmentKey, z.string().max(65_536)).optional(),
     removeEnvironment: z.array(environmentKey).max(100).optional(),
-    domains: z.array(domainName).max(50).optional(),
     memoryLimit: z
       .string()
       .trim()
@@ -169,15 +158,9 @@ export const configureAppInputSchema = z
     (input) =>
       input.environment !== undefined ||
       input.removeEnvironment !== undefined ||
-      input.domains !== undefined ||
       input.memoryLimit !== undefined ||
       input.cpuQuota !== undefined ||
       input.tasksLimit !== undefined,
-    "Invalid request data."
-  )
-  .refine(
-    (input) =>
-      !input.domains || new Set(input.domains).size === input.domains.length,
     "Invalid request data."
   )
 

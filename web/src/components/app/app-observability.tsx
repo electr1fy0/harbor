@@ -11,37 +11,13 @@ import {
 } from "@/lib/features"
 import { formatDate } from "./format"
 
-export function AppObservability({
-  name,
-  domains,
-}: {
-  name: string
-  domains: string[]
-}) {
+export function AppObservability({ name }: { name: string }) {
   const [historyWindow, setHistoryWindow] = useState("hour")
   const query = useQuery({
     queryKey: ["harbor", "observe", name, historyWindow],
     queryFn: () =>
       featureCall<ObserveView>("observe", { action: "get", name, limit: 120 }),
     refetchInterval: 15000,
-  })
-  const domainsQuery = useQuery({
-    queryKey: ["harbor", "domain-checks", name],
-    queryFn: () =>
-      featureCall<{
-        domains: Array<{
-          domain: string
-          addresses: string[]
-          dnsResolved: boolean
-          httpsReachable: boolean
-          statusCode?: number
-          certificateExpiresAt?: string
-          error?: string
-          expected: string
-        }>
-      }>("observe", { action: "domains", name }),
-    enabled: false,
-    retry: false,
   })
   const bundle = useFeatureAction<Record<string, unknown>>("observe", (data) =>
     downloadText(
@@ -149,36 +125,7 @@ export function AppObservability({
           </p>
         ) : null}
       </FeatureCard>
-      <ObserveForm key={name} initial={view.settings} domains={domains} />
-      <FeatureCard
-        title="Domain diagnostics"
-        description="Point A/AAAA records at your server’s public IP. CNAME aliases must resolve to that server."
-      >
-        <Button
-          variant="outline"
-          disabled={domainsQuery.isFetching || !domains.length}
-          onClick={() => void domainsQuery.refetch()}
-        >
-          {domainsQuery.isFetching ? "Checking…" : "Check DNS and HTTPS"}
-        </Button>
-        {domainsQuery.isError ? (
-          <p role="alert">{domainsQuery.error.message}</p>
-        ) : null}
-        {domainsQuery.data?.domains.map((d) => (
-          <div className="rounded-lg border p-3 text-xs" key={d.domain}>
-            <p className="font-medium">{d.domain}</p>
-            <p className="mt-1">
-              DNS: {d.dnsResolved ? d.addresses.join(", ") : "unresolved"} ·
-              HTTPS:{" "}
-              {d.httpsReachable ? `reachable (${d.statusCode})` : "unverified"}
-            </p>
-            {d.certificateExpiresAt ? (
-              <p>Certificate expires {formatDate(d.certificateExpiresAt)}</p>
-            ) : null}
-            {d.error ? <p className="mt-1 text-red-700">{d.error}</p> : null}
-          </div>
-        ))}
-      </FeatureCard>
+      <ObserveForm key={name} initial={view.settings} />
       <FeatureCard title="Notifications and diagnostics">
         {view.notifications.map((n, i) => (
           <p key={i} className="text-xs">
@@ -202,13 +149,7 @@ export function AppObservability({
     </div>
   )
 }
-function ObserveForm({
-  initial,
-  domains,
-}: {
-  initial: ObserveSettings
-  domains: string[]
-}) {
+function ObserveForm({ initial }: { initial: ObserveSettings }) {
   const [settings, setSettings] = useState(initial)
   const [webhook, setWebhook] = useState("")
   const [changeWebhook, setChangeWebhook] = useState(false)
@@ -227,7 +168,7 @@ function ObserveForm({
   return (
     <FeatureCard
       title="Routing and notifications"
-      description="Maintenance returns HTTP 503. A primary domain redirects aliases while preserving paths and queries."
+      description="Maintenance returns HTTP 503 with your message."
     >
       <form
         className="grid gap-4"
@@ -236,12 +177,7 @@ function ObserveForm({
           save.mutate({
             action: "configure",
             name: settings.name,
-            settings: {
-              ...settings,
-              primaryDomain: domains.includes(settings.primaryDomain)
-                ? settings.primaryDomain
-                : "",
-            },
+            settings,
             ...(changeWebhook ? { webhookURL: webhook } : {}),
           })
         }}
@@ -261,23 +197,6 @@ function ObserveForm({
             maxLength={1024}
             onChange={(e) => update("maintenanceMessage", e.target.value)}
           />
-        </label>
-        <label className={fieldClass}>
-          Primary domain
-          <select
-            className="h-9 rounded-md border px-2"
-            value={
-              domains.includes(settings.primaryDomain)
-                ? settings.primaryDomain
-                : ""
-            }
-            onChange={(e) => update("primaryDomain", e.target.value)}
-          >
-            <option value="">Serve all domains directly</option>
-            {domains.map((d) => (
-              <option key={d}>{d}</option>
-            ))}
-          </select>
         </label>
         <div className="grid gap-4 sm:grid-cols-3">
           <label className={fieldClass}>

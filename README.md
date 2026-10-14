@@ -8,8 +8,8 @@ The target is Ubuntu/Debian Linux with Go, a C compiler (SQLite), Git, systemd,
 cgroup v2, Bubblewrap, and curl. Linux runtimes use namespace isolation and
 systemd resource limits. Go and Node runtimes, managed SQLite services, and
 GitHub HTTPS source deployments are supported. Caddy provides public HTTPS for
-configured custom domains and an authenticated dashboard. Apps and operators
-must be trusted; applications share the host network and runtime account.
+the authenticated dashboard. Application URLs use generated `.localhost`
+hostnames. Apps and operators must be trusted; applications share the host network and runtime account.
 
 ## Web dashboard
 
@@ -52,9 +52,8 @@ Generate the compatible scrypt hash with `paasd -hash-password`. See
 The dashboard API executes within the privileged daemon process and retains
 strict Host/Origin validation, signed sessions and bounded login attempts.
 
-Project settings support globally unique custom domains, write-only runtime
-environment values, and resource limits. Domain changes update routing
-immediately. Environment and resource changes apply on the next deployment,
+Project settings support write-only runtime environment values and resource
+limits. Environment and resource changes apply on the next deployment,
 rollback, or daemon recovery. Values and their redaction history are encrypted
 with a daemon-owned `environment.key` (mode `0600`); keep that key with secure
 backups of the data directory. Settings responses contain environment key names
@@ -78,6 +77,8 @@ See [docs/features.md](docs/features.md) for app start/restart and cancellation,
 deployment history and events, GitHub/CI automation, build settings, SQLite
 backups and clone restore, encrypted exports, historical metrics, routing
 policies, notifications, health recovery, retention, and dashboard workflows.
+
+For a 10–15 minute classroom walkthrough, see [docs/classroom-demo.md](docs/classroom-demo.md).
 
 ## Linux setup and demo
 

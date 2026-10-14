@@ -19,7 +19,6 @@ type Request struct {
 	ServiceName       string            `json:"ServiceName,omitempty"`
 	Environment       map[string]string `json:"Environment,omitempty"`
 	RemoveEnvironment []string          `json:"RemoveEnvironment,omitempty"`
-	Domains           *[]string         `json:"Domains,omitempty"`
 	MemoryLimit       *string           `json:"MemoryLimit,omitempty"`
 	CPUQuota          *float64          `json:"CPUQuota,omitempty"`
 	TasksLimit        *int              `json:"TasksLimit,omitempty"`

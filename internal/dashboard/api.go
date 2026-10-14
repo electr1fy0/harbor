@@ -30,7 +30,6 @@ var (
 	githubRepoPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
 	gitRefPattern          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
 	environmentKeyPattern  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
-	domainPattern          = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	releaseIDPattern       = regexp.MustCompile(`^(?:[A-Za-z0-9_-]{1,128})?$`)
 	jobIDPattern           = regexp.MustCompile(`^job_[a-f0-9]{32}$`)
 	deploymentJobIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -298,14 +297,13 @@ type configureInput struct {
 	Name              string             `json:"name"`
 	Environment       *map[string]string `json:"environment,omitempty"`
 	RemoveEnvironment *[]string          `json:"removeEnvironment,omitempty"`
-	Domains           *[]string          `json:"domains,omitempty"`
 	MemoryLimit       *string            `json:"memoryLimit,omitempty"`
 	CPUQuota          *float64           `json:"cpuQuota,omitempty"`
 	TasksLimit        *int               `json:"tasksLimit,omitempty"`
 }
 
 func validateConfigure(input configureInput, fields map[string]json.RawMessage) bool {
-	if !validAppName(input.Name) || rejectNullOptional(fields, "environment", "removeEnvironment", "domains", "memoryLimit", "cpuQuota", "tasksLimit") {
+	if !validAppName(input.Name) || rejectNullOptional(fields, "environment", "removeEnvironment", "memoryLimit", "cpuQuota", "tasksLimit") {
 		return false
 	}
 	if rejectNullMapValues(fields, "environment") || input.Environment != nil && !validateEnvironment(*input.Environment) {
@@ -321,20 +319,6 @@ func validateConfigure(input configureInput, fields map[string]json.RawMessage) 
 			}
 		}
 	}
-	if input.Domains != nil {
-		if len(*input.Domains) > 50 {
-			return false
-		}
-		seen := make(map[string]bool, len(*input.Domains))
-		for i, domain := range *input.Domains {
-			domain = strings.ToLower(strings.TrimSpace(domain))
-			if len(domain) == 0 || len(domain) > 253 || !domainPattern.MatchString(domain) || seen[domain] {
-				return false
-			}
-			(*input.Domains)[i] = domain
-			seen[domain] = true
-		}
-	}
 	if input.MemoryLimit != nil {
 		*input.MemoryLimit = strings.TrimSpace(*input.MemoryLimit)
 		if !memoryLimitPattern.MatchString(*input.MemoryLimit) {
@@ -347,7 +331,7 @@ func validateConfigure(input configureInput, fields map[string]json.RawMessage) 
 	if input.TasksLimit != nil && (*input.TasksLimit <= 0 || *input.TasksLimit > 65_536) {
 		return false
 	}
-	return input.Environment != nil || input.RemoveEnvironment != nil || input.Domains != nil || input.MemoryLimit != nil || input.CPUQuota != nil || input.TasksLimit != nil
+	return input.Environment != nil || input.RemoveEnvironment != nil || input.MemoryLimit != nil || input.CPUQuota != nil || input.TasksLimit != nil
 }
 
 type nameInput struct {
@@ -515,9 +499,6 @@ func dispatchDashboard(ctx context.Context, control http.Handler, name string, b
 		if input.RemoveEnvironment != nil {
 			payload["RemoveEnvironment"] = *input.RemoveEnvironment
 		}
-		if input.Domains != nil {
-			payload["Domains"] = *input.Domains
-		}
 		if input.MemoryLimit != nil {
 			payload["MemoryLimit"] = *input.MemoryLimit
 		}
@@ -574,7 +555,7 @@ func dispatchDashboard(ctx context.Context, control http.Handler, name string, b
 		if deployment == nil {
 			return nil, operationFailure("Harbor did not return a deployment result.")
 		}
-		return map[string]any{"deployment": deployment, "url": getPublicOrLocalRouteURL(ctx, control, input.Name, response["URL"], deployment)}, nil
+		return map[string]any{"deployment": deployment, "url": getLocalRouteURL(ctx, control, input.Name, response["URL"], deployment)}, nil
 	case "retryGitHubDeployment":
 		input, ok := decodeDashboardInput[nameInput](body)
 		if !ok || !validAppName(input.Name) {
@@ -600,7 +581,7 @@ func dispatchDashboard(ctx context.Context, control http.Handler, name string, b
 		if deployment == nil {
 			return nil, operationFailure("Harbor did not return a deployment result.")
 		}
-		return map[string]any{"deployment": deployment, "url": getPublicOrLocalRouteURL(ctx, control, input.Name, response["URL"], deployment)}, nil
+		return map[string]any{"deployment": deployment, "url": getLocalRouteURL(ctx, control, input.Name, response["URL"], deployment)}, nil
 	case "rollbackApp":
 		input, ok := decodeDashboardInput[rollbackInput](body)
 		if !ok || fields["releaseID"] == nil || rejectNullOptional(fields, "releaseID") || !validAppName(input.Name) || !releaseIDPattern.MatchString(input.ReleaseID) {
@@ -614,7 +595,7 @@ func dispatchDashboard(ctx context.Context, control http.Handler, name string, b
 		if deployment == nil {
 			return nil, operationFailure("Harbor did not return a deployment result.")
 		}
-		return map[string]any{"deployment": deployment, "url": getPublicOrLocalRouteURL(ctx, control, input.Name, response["URL"], deployment)}, nil
+		return map[string]any{"deployment": deployment, "url": getLocalRouteURL(ctx, control, input.Name, response["URL"], deployment)}, nil
 	case "listGitHubRepos":
 		input, ok := decodeDashboardInput[ownerInput](body)
 		if !ok || rejectNullOptional(fields, "owner") {
@@ -1111,7 +1092,6 @@ func getApp(ctx context.Context, control http.Handler, name string) (any, *apiFa
 			diagnostics = diagnosticsResponse["Diagnostics"]
 		}
 	}
-	settingsMap, _ := object(settings)
 	deployment := mapDeployment(nil)
 	if inspectData != nil {
 		deployment = mapDeployment(inspectData["Deployment"])
@@ -1162,37 +1142,17 @@ func getApp(ctx context.Context, control http.Handler, name string) (any, *apiFa
 	}
 	urlValue := ""
 	if routeDeployment != nil && inspectData != nil {
-		urlValue = configuredHTTPSURL(routeDeployment, settingsMap["domains"])
-		if urlValue == "" {
-			urlValue = routeURL(inspectData["URL"], routeDeployment, settingsMap["domains"])
-		}
+		urlValue = routeURL(inspectData["URL"], routeDeployment)
 	}
 	return map[string]any{"deployment": deployment, "diagnostics": mappedDiagnostics, "releases": releaseViews, "logs": logText, "url": urlValue, "settings": settings}, nil
 }
 
-func getPublicOrLocalRouteURL(ctx context.Context, control http.Handler, name string, value any, deployment map[string]any) string {
-	settings := emptySettings()
-	if response, fail := daemonPost(ctx, control, "/settings", map[string]any{"Name": name}, defaultControlWait, "Could not load app settings.", false); fail == nil {
-		settings = mapSettings(response)
-	}
-	settingsMap, _ := object(settings)
-	if result := configuredHTTPSURL(deployment, settingsMap["domains"]); result != "" {
-		return result
-	}
-	if result := routeURL(value, deployment, settingsMap["domains"]); result != "" {
+func getLocalRouteURL(ctx context.Context, control http.Handler, name string, value any, deployment map[string]any) string {
+	if result := routeURL(value, deployment); result != "" {
 		return result
 	}
 	if inspect, fail := daemonPost(ctx, control, "/inspect", map[string]any{"Name": name}, defaultControlWait, "Could not inspect the active app route.", false); fail == nil {
-		activeDeployment := mapDeployment(inspect["Deployment"])
-		activeSettings := settings
-		if response, settingsFail := daemonPost(ctx, control, "/settings", map[string]any{"Name": name}, defaultControlWait, "Could not load app settings.", false); settingsFail == nil {
-			activeSettings = mapSettings(response)
-		}
-		activeSettingsMap, _ := object(activeSettings)
-		if result := configuredHTTPSURL(activeDeployment, activeSettingsMap["domains"]); result != "" {
-			return result
-		}
-		return routeURL(inspect["URL"], activeDeployment, activeSettingsMap["domains"])
+		return routeURL(inspect["URL"], mapDeployment(inspect["Deployment"]))
 	}
 	return ""
 }

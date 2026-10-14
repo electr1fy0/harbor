@@ -59,8 +59,8 @@ func TestAPIProjectsSafeAppResponse(t *testing.T) {
 			}}})
 		case "/settings":
 			dashboardJSON(w, http.StatusOK, map[string]any{"settings": map[string]any{
-				"domains": []string{"example.com"}, "environmentKeys": []string{"DATABASE_URL", "TOKEN"},
-				"memoryLimit": "256Mi", "cpuQuota": 1, "tasksLimit": 64,
+				"environmentKeys": []string{"DATABASE_URL", "TOKEN"},
+				"memoryLimit":     "256Mi", "cpuQuota": 1, "tasksLimit": 64,
 				"environment": map[string]string{"TOKEN": "never return this"},
 			}})
 		case "/diagnostics":
@@ -84,8 +84,8 @@ func TestAPIProjectsSafeAppResponse(t *testing.T) {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body)
 	}
 	result := decodeDashboardResponse(t, response.Body.Bytes())
-	if result["url"] != "https://example.com" {
-		t.Fatalf("configured production URL was not preferred: %v", result["url"])
+	if result["url"] != "http://demo.localhost:8080" {
+		t.Fatalf("local production URL was not returned: %v", result["url"])
 	}
 	deployment, ok := result["deployment"].(map[string]any)
 	if !ok || deployment["Error"] != "" || deployment["PID"] != nil || deployment["State"] != "RUNNING" {
@@ -125,19 +125,19 @@ func TestAPIConfigureValidationAndNormalization(t *testing.T) {
 			t.Errorf("decode daemon input: %v", err)
 		}
 		dashboardJSON(w, http.StatusOK, map[string]any{"settings": map[string]any{
-			"domains": daemonInput["Domains"], "environmentKeys": []string{"TOKEN"},
-			"memoryLimit": daemonInput["MemoryLimit"], "cpuQuota": daemonInput["CPUQuota"], "tasksLimit": daemonInput["TasksLimit"],
+			"environmentKeys": []string{"TOKEN"},
+			"memoryLimit":     daemonInput["MemoryLimit"], "cpuQuota": daemonInput["CPUQuota"], "tasksLimit": daemonInput["TasksLimit"],
 		}})
 	})
-	response := dashboardRequest(NewAPI(control), http.MethodPost, "configureApp", `{"name":"demo","domains":[" Example.COM "],"memoryLimit":" 512Mi ","cpuQuota":0.5,"environment":{"TOKEN":"value"}}`)
+	response := dashboardRequest(NewAPI(control), http.MethodPost, "configureApp", `{"name":"demo","memoryLimit":" 512Mi ","cpuQuota":0.5,"environment":{"TOKEN":"value"}}`)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body)
 	}
-	if daemonInput["Domains"].([]any)[0] != "example.com" || daemonInput["MemoryLimit"] != "512Mi" {
+	if daemonInput["MemoryLimit"] != "512Mi" {
 		t.Fatalf("configuration was not normalized before daemon call: %#v", daemonInput)
 	}
 	result := decodeDashboardResponse(t, response.Body.Bytes())
-	if result["domains"].([]any)[0] != "example.com" {
+	if result["memoryLimit"] != "512Mi" {
 		t.Fatalf("unexpected normalized settings: %#v", result)
 	}
 }
@@ -235,20 +235,18 @@ func TestAPIGitHubRepositoryDetailsIncludeSafeBranches(t *testing.T) {
 
 func TestAPISafeRouteURLProjection(t *testing.T) {
 	deployment := map[string]any{"AppName": "demo", "State": "RUNNING"}
-	if got := routeURL("http://demo.localhost:8080", deployment, []any{}); got != "http://demo.localhost:8080" {
+	if got := routeURL("http://demo.localhost:8080", deployment); got != "http://demo.localhost:8080" {
 		t.Fatalf("safe local route was rejected: %q", got)
-	}
-	if got := routeURL("https://example.com", deployment, []any{"example.com"}); got != "https://example.com" {
-		t.Fatalf("safe configured route was rejected: %q", got)
 	}
 	for _, candidate := range []string{
 		"http://other.localhost:8080",
 		"http://demo.localhost:8080/private",
 		"http://user:pass@demo.localhost:8080",
 		"https://unconfigured.example",
+		"https://example.com",
 		"http://demo.localhost:70000",
 	} {
-		if got := routeURL(candidate, deployment, []any{"example.com"}); got != "" {
+		if got := routeURL(candidate, deployment); got != "" {
 			t.Errorf("unsafe route %q was exposed as %q", candidate, got)
 		}
 	}

@@ -34,7 +34,6 @@ type observeSettings struct {
 	Name               string   `json:"name"`
 	Maintenance        bool     `json:"maintenance"`
 	MaintenanceMessage string   `json:"maintenanceMessage"`
-	PrimaryDomain      string   `json:"primaryDomain"`
 	MemoryPercent      float64  `json:"memoryPercent"`
 	DiskPercent        float64  `json:"diskPercent"`
 	CooldownSeconds    int      `json:"cooldownSeconds"`
@@ -212,19 +211,15 @@ func (o *Observatory) applyTraffic(s observeSettings) {
 	if r == nil {
 		return
 	}
-	settings, err := o.service.Settings(s.Name)
-	if err != nil {
+	if _, err := o.service.Settings(s.Name); err != nil {
 		return
 	}
-	if s.PrimaryDomain != "" && !containsObserve(settings.Domains, s.PrimaryDomain) {
-		s.PrimaryDomain = ""
-	}
-	hosts := append([]string{s.Name + ".localhost"}, settings.Domains...)
+	hosts := []string{s.Name + ".localhost"}
 	o.mu.Lock()
 	old := o.applied[s.Name]
 	o.applied[s.Name] = hosts
 	o.mu.Unlock()
-	r.UpdateTrafficPolicies(s.Name+".localhost", hosts, old, router.TrafficPolicy{Maintenance: s.Maintenance, Message: s.MaintenanceMessage, PrimaryDomain: s.PrimaryDomain})
+	r.UpdateTrafficPolicies(s.Name+".localhost", hosts, old, router.TrafficPolicy{Maintenance: s.Maintenance, Message: s.MaintenanceMessage})
 }
 func (o *Observatory) sample(ctx context.Context) {
 	o.sampleMu.Lock()
@@ -346,7 +341,6 @@ type observeRequest struct {
 	Window       string           `json:"window"`
 	Settings     *observeSettings `json:"settings"`
 	WebhookURL   *string          `json:"webhookURL"`
-	Domain       string           `json:"domain"`
 }
 
 func registerObservabilityRoutes(mux *http.ServeMux, service *deployment.Service) {
@@ -399,8 +393,7 @@ func (o *Observatory) dispatch(ctx context.Context, request observeRequest) (any
 		}
 		traffic := []router.TrafficStats{}
 		if r := o.trafficRouter(); r != nil {
-			settings, _ := o.service.Settings(request.Name)
-			hosts := append([]string{request.Name + ".localhost"}, settings.Domains...)
+			hosts := []string{request.Name + ".localhost"}
 			for _, stat := range r.Traffic() {
 				if containsObserve(hosts, stat.Host) {
 					traffic = append(traffic, stat)
@@ -431,16 +424,13 @@ func (o *Observatory) dispatch(ctx context.Context, request observeRequest) (any
 		if request.Settings == nil || request.Settings.Name != request.Name {
 			return nil, errors.New("settings must identify the application")
 		}
-		app, err := o.service.Settings(request.Name)
+		_, err := o.service.Settings(request.Name)
 		if err != nil {
 			return nil, errors.New("application unavailable")
 		}
 		s := *request.Settings
 		if len(s.MaintenanceMessage) > 1024 || s.MemoryPercent < 0 || s.MemoryPercent > 100 || s.DiskPercent < 0 || s.DiskPercent > 100 || s.CooldownSeconds < 30 || s.CooldownSeconds > 86400 {
 			return nil, errors.New("invalid maintenance, threshold, or cooldown settings")
-		}
-		if s.PrimaryDomain != "" && !containsObserve(app.Domains, s.PrimaryDomain) {
-			return nil, errors.New("primary domain must be a configured custom domain")
 		}
 		if len(s.Events) > 10 {
 			return nil, errors.New("too many notification events")
@@ -483,11 +473,7 @@ func (o *Observatory) dispatch(ctx context.Context, request observeRequest) (any
 		}
 		o.sampleMu.Lock()
 		defer o.sampleMu.Unlock()
-		settings, _ := o.service.Settings(request.Name)
 		hosts := []string{request.Name + ".localhost"}
-		if settings != nil {
-			hosts = append(hosts, settings.Domains...)
-		}
 		tx, err := o.db.BeginTx(ctx, nil)
 		if err != nil {
 			return nil, errors.New("observability cleanup unavailable")
@@ -517,8 +503,6 @@ func (o *Observatory) dispatch(ctx context.Context, request observeRequest) (any
 		return map[string]any{"forgotten": true}, nil
 	case "logs":
 		return o.logDelta(request)
-	case "domains":
-		return o.domainChecks(ctx, request.Name)
 	case "bundle":
 		settings, err := o.service.Settings(request.Name)
 		if err != nil {
@@ -634,47 +618,6 @@ func (o *Observatory) logDelta(request observeRequest) (any, error) {
 	digest := sha256.Sum256([]byte(logs))
 	data, _ := json.Marshal(logCursor{Length: len(logs), Digest: hex.EncodeToString(digest[:]), Identity: identity})
 	return map[string]any{"text": delta, "reset": reset, "cursor": base64.RawURLEncoding.EncodeToString(data), "source": request.Source}, nil
-}
-func (o *Observatory) domainChecks(ctx context.Context, name string) (any, error) {
-	ctx, cancelAll := context.WithTimeout(ctx, 15*time.Second)
-	defer cancelAll()
-	settings, err := o.service.Settings(name)
-	if err != nil {
-		return nil, errors.New("application unavailable")
-	}
-	result := []map[string]any{}
-	resolver := net.DefaultResolver
-	// DNS targets are user configured; prohibit HTTPS probes to private addresses.
-	client := &http.Client{Timeout: 5 * time.Second, Transport: publicObserveTransport(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	defer client.CloseIdleConnections()
-	for _, domain := range settings.Domains {
-		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		ips, lookupErr := resolver.LookupIPAddr(probeCtx, domain)
-		addresses := []string{}
-		for _, ip := range ips {
-			addresses = append(addresses, ip.IP.String())
-		}
-		item := map[string]any{"domain": domain, "addresses": addresses, "dnsResolved": lookupErr == nil && len(ips) > 0, "expected": "Point A/AAAA records to this Harbor server's public IP; for aliases use a CNAME to a hostname that resolves to it.", "httpsReachable": false}
-		if lookupErr == nil {
-			request, _ := http.NewRequestWithContext(probeCtx, http.MethodHead, "https://"+domain+"/", nil)
-			response, probeErr := client.Do(request)
-			if probeErr == nil {
-				item["httpsReachable"] = true
-				item["statusCode"] = response.StatusCode
-				if response.TLS != nil && len(response.TLS.PeerCertificates) > 0 {
-					item["certificateExpiresAt"] = response.TLS.PeerCertificates[0].NotAfter
-				}
-				response.Body.Close()
-			} else {
-				item["error"] = "HTTPS could not be verified from the Harbor host."
-			}
-		} else {
-			item["error"] = "DNS resolution failed."
-		}
-		cancel()
-		result = append(result, item)
-	}
-	return map[string]any{"domains": result}, nil
 }
 func publicObserveIP(ip net.IP) bool {
 	address, ok := netip.AddrFromSlice(ip)

@@ -2,14 +2,13 @@
 
 This guide runs the complete Harbor control plane and dashboard in one
 `paasd` binary and process behind Caddy. Caddy terminates public HTTPS; the
-embedded dashboard, application router, and TLS authorization listener bind to
-loopback. The dashboard API executes inside the root-owned deployment daemon.
+embedded dashboard and application router bind to loopback. The dashboard API executes inside the root-owned deployment daemon.
 The Unix socket remains private for CLI administration.
 
 ## Prerequisites
 
 - A Linux host with systemd, Python 3, and Caddy 2.11 or newer.
-- A public DNS name for the dashboard and DNS names for each application.
+- A public DNS name for the dashboard.
 - Ports 80 and 443 reachable on the host.
 - A release `paasd` binary installed at `/usr/local/bin/paasd`, plus Harbor's
   runtime prerequisites from the root README. No Bun/Node runtime or frontend
@@ -69,11 +68,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now paasd
 ```
 
-The daemon service listens on `127.0.0.1:8080`, serves the TLS authorization
-check on `127.0.0.1:8081`, and creates `/run/paas/paasd.sock` with mode `0660`
-for `paas-admins`. The same daemon serves the dashboard on
-`127.0.0.1:3000`. Keep all three TCP listeners private; do not expose their ports through
-a firewall or a second proxy. The daemon's TLS ask listener is loopback-only.
+The daemon service listens on `127.0.0.1:8080` and creates
+`/run/paas/paasd.sock` with mode `0660` for `paas-admins`. The same daemon
+serves the dashboard on `127.0.0.1:3000`. Keep both TCP listeners private.
 
 Create a Caddyfile using the exact same origin as the web environment:
 
@@ -85,32 +82,24 @@ sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl reload caddy
 ```
 
-Caddy's first site serves the dashboard at the configured dashboard hostname.
-The HTTPS catch-all routes application traffic to the loopback app router and
-uses Caddy on-demand TLS. When Caddy needs a new certificate, it calls Harbor's
-`/tls/ask` endpoint with the requested hostname before issuance; cached
-certificates do not require a check on every handshake. The endpoint accepts
-requests only over loopback and approves only exact domains configured on an
-application. Unconfigured hostnames are denied before certificate issuance.
-Removing a domain prevents future certificate issuance and renewal, while an
-already issued certificate remains valid until it expires. Keep the ask listener
-and the app router loopback-only. Caddy's normal
-certificate storage must remain persistent and writable by its service user.
+Caddy serves the authenticated dashboard at the configured dashboard hostname.
+Applications use generated `http://APP.localhost:8080` URLs on the Harbor host.
+The generated Caddyfile publishes only the dashboard.
 
-## Configure domains and runtime settings
+## Configure runtime settings
 
-In a project's Settings tab, add exact DNS names that already resolve to this
-host. Harbor validates names and the TLS check authorizes those configured
-names only. Changes to environment keys/values, domains, and resource limits
-are sent through the daemon's configure API; secret values are write-only and
-are not returned to the browser. Environment and resource changes take effect
-on the next deployment. Domain changes update the TLS allowlist for future
-certificate authorization checks; Caddy can continue serving a cached
-certificate for a removed domain until that certificate expires.
+Use a project's Settings tab to update environment keys/values and resource
+limits. Secret values are write-only and are not returned to the browser.
+Changes take effect on the next deployment, rollback, or daemon recovery.
 
-A running application's project detail link uses HTTPS only when the daemon's
-settings response contains an exact configured domain. Otherwise it continues
-to use the loopback development URL.
+## Upgrade from custom-domain routing
+
+Regenerate and reload the Caddyfile and install the updated `paasd.service`
+before restarting the upgraded daemon. The `-tls-ask-listen` flag and TLS
+authorization endpoint have been removed. The database upgrade removes custom
+hostname mappings and retains each application's generated `.localhost` route,
+runtime settings, and deployment history. Existing application custom URLs
+will no longer serve through this configuration.
 
 ## Operations and recovery
 

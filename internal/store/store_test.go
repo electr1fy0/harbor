@@ -699,8 +699,8 @@ func TestStoreUpgradesV7WithUnfinishedIndexes(t *testing.T) {
 	}
 	defer upgraded.Close()
 	var version int
-	if err := upgraded.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 8 {
-		t.Fatalf("schema version=%d err=%v; want 8", version, err)
+	if err := upgraded.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != schemaVersion {
+		t.Fatalf("schema version=%d err=%v; want %d", version, err, schemaVersion)
 	}
 	for _, index := range []string{"deployments_unfinished_idx", "deployments_unfinished_app_idx"} {
 		var count int
@@ -1010,5 +1010,90 @@ func TestMigrationUsesRemotePromotionEvents(t *testing.T) {
 	canceled, err := upgraded.Deployment("dep-canceled")
 	if err != nil || canceled.PromotedAt != nil {
 		t.Fatalf("canceled candidate became rollback target: %+v %v", canceled, err)
+	}
+}
+
+func TestMigrationRemovesCustomDomainsAndPreservesLocalRuntimeState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.sqlite")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	app, err := db.CreateApp("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep := model.Deployment{ID: "dep_legacy", AppID: app.ID, AppName: app.Name, State: model.Running, CreatedAt: time.Now().UTC()}
+	if err := db.CreateDeployment(dep); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetDesiredRunning(app.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := db.AppSettings(app.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.MemoryLimit = "256Mi"
+	settings.EncryptedEnvironment = []byte("encrypted-secret")
+	if err := db.UpdateAppSettings(app.Name, *settings); err != nil {
+		t.Fatal(err)
+	}
+	// Recreate the retired schema to exercise an actual v8 upgrade.
+	if _, err := db.db.Exec(`CREATE TABLE domains (hostname TEXT PRIMARY KEY, app_id TEXT REFERENCES apps(id));
+ PRAGMA user_version = 8;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO domains VALUES ('app.example.com', ?)`, app.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, hostname := range []string{"demo.localhost", "app.example.com"} {
+		if _, err := db.db.Exec(`INSERT INTO routes VALUES (?, ?)`, hostname, dep.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	routes, err := upgraded.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes["demo.localhost"] != dep.ID {
+		t.Fatalf("routes after upgrade: %v", routes)
+	}
+	var domainTables int
+	if err := upgraded.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='domains'`).Scan(&domainTables); err != nil || domainTables != 0 {
+		t.Fatalf("retired domain tables=%d err=%v", domainTables, err)
+	}
+	saved, err := upgraded.AppSettings(app.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.DesiredRunning || saved.MemoryLimit != "256Mi" || string(saved.EncryptedEnvironment) != "encrypted-secret" {
+		t.Fatalf("runtime settings changed on upgrade: %+v", saved)
+	}
+	latest, err := upgraded.LatestDeployment(app.Name)
+	if err != nil || latest.ID != dep.ID {
+		t.Fatalf("deployment history changed: %+v err=%v", latest, err)
+	}
+	// Reopening an already upgraded DB must preserve the same route.
+	if err := upgraded.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	routes, err = reopened.Routes()
+	if err != nil || len(routes) != 1 || routes["demo.localhost"] != dep.ID {
+		t.Fatalf("routes after reopen: %v err=%v", routes, err)
 	}
 }

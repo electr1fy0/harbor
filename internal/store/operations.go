@@ -49,8 +49,7 @@ func (s *Store) InitOperations() error {
 			return fmt.Errorf("store: initialize operation metadata: %w", err)
 		}
 	}
-	// Domains affect route aliases immediately and do not require an app
-	// restart, so legacy revision triggers for them must be removed.
+	// Remove legacy custom-domain revision triggers from older databases.
 	for _, trigger := range []string{"app_operations_domain_insert", "app_operations_domain_delete"} {
 		if _, err := s.db.Exec(`DROP TRIGGER IF EXISTS ` + trigger); err != nil {
 			return fmt.Errorf("store: remove obsolete operation metadata trigger: %w", err)
@@ -710,7 +709,6 @@ func (s *Store) DeleteApp(name string) error {
 		`DELETE FROM events WHERE app_id = ?`,
 		`DELETE FROM deployments WHERE app_id = ?`,
 		`DELETE FROM releases WHERE app_id = ?`,
-		`DELETE FROM domains WHERE app_id = ?`,
 		`DELETE FROM app_settings WHERE app_id = ?`,
 		`DELETE FROM app_operations WHERE app_id = ?`,
 		`DELETE FROM apps WHERE id = ?`,

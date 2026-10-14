@@ -32,11 +32,11 @@ describe("browser API transport", () => {
   })
 
   it("keeps validation normalization and sends only the input object", async () => {
-    fetchMock.mockResolvedValue(Response.json({ domains: ["example.com"] }))
+    fetchMock.mockResolvedValue(Response.json({ memoryLimit: "128Mi" }))
     vi.stubGlobal("fetch", fetchMock)
 
     await configureApp({
-      data: { name: "demo", domains: [" EXAMPLE.COM "], cpuQuota: 1 },
+      data: { name: "demo", memoryLimit: " 128Mi ", cpuQuota: 1 },
     })
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -44,7 +44,7 @@ describe("browser API transport", () => {
       expect.objectContaining({
         body: JSON.stringify({
           name: "demo",
-          domains: ["example.com"],
+          memoryLimit: "128Mi",
           cpuQuota: 1,
         }),
       })

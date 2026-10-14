@@ -719,10 +719,7 @@ function ProjectDetailContent({ name }: { name: string }) {
             <AppAutomation name={name} />
           </TabsContent>
           <TabsContent value="observability">
-            <AppObservability
-              name={name}
-              domains={details.data.settings.domains}
-            />
+            <AppObservability name={name} />
           </TabsContent>
           <TabsContent value="operations">
             <OperationsPanel name={name} />

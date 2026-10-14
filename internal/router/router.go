@@ -258,14 +258,6 @@ func (r *HostRouter) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, message, http.StatusServiceUnavailable)
 		return
 	}
-	if policy.PrimaryDomain != "" && host != policy.PrimaryDomain {
-		target := "https://" + policy.PrimaryDomain + request.URL.EscapedPath()
-		if request.URL.RawQuery != "" {
-			target += "?" + request.URL.RawQuery
-		}
-		http.Redirect(w, request, target, http.StatusPermanentRedirect)
-		return
-	}
 	entry.proxy.ServeHTTP(w, request)
 }
 
