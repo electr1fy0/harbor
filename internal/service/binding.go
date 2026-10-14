@@ -106,7 +106,7 @@ func (m *BindingManager) Link(ctx context.Context, app *model.Application, svc *
 	if err != nil {
 		return nil, fmt.Errorf("prepare SQLite database path: %w", err)
 	}
-	createdDirectory, err := createSQLiteDatabase(ctx, path, m.initializeDatabase)
+	createdDirectory, err := prepareSQLiteDatabase(ctx, path, m.initializeDatabase)
 	if err != nil {
 		cleanupErr := m.cleanupUnboundDatabaseDirectory(path, createdDirectory, app.ID, svc.ID)
 		return nil, errors.Join(fmt.Errorf("create SQLite database for application %q: %w", app.Name, err), cleanupErr)
@@ -284,6 +284,32 @@ func createSQLiteDatabase(ctx context.Context, path string, initialize func(cont
 		return true, err
 	}
 	return true, nil
+}
+
+// prepareSQLiteDatabase reuses a complete, valid orphan database left by an
+// unlink operation. Unlink removes the control-plane binding while preserving
+// application data; a later link therefore reconnects to that same file.
+func prepareSQLiteDatabase(ctx context.Context, path string, initialize func(context.Context, string) error) (bool, error) {
+	directory := filepath.Dir(path)
+	info, err := os.Lstat(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return createSQLiteDatabase(ctx, path, initialize)
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect existing SQLite database directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return false, errors.New("existing SQLite database directory is unsafe")
+	}
+	if info.Mode().Perm() != 0700 {
+		if err := os.Chmod(directory, 0700); err != nil {
+			return false, errors.New("existing SQLite database directory permissions are unsafe")
+		}
+	}
+	if err := validateSQLiteDatabase(ctx, path); err != nil {
+		return false, fmt.Errorf("existing SQLite database cannot be safely re-linked: %w", err)
+	}
+	return false, nil
 }
 
 func initializeSQLiteDatabase(ctx context.Context, path string) error {

@@ -229,6 +229,10 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 	registerOnboardingRoutes(mux, server)
 	registerOperationsRoutes(mux, service)
 	registerAutomationRoutes(mux, server)
+	registerDataServicesRoutes(mux, services, service)
+	if scheduled, ok := services.(interface{ StartBackups(context.Context) }); ok && service != nil {
+		scheduled.StartBackups(service.LifetimeContext())
+	}
 	registerDiagnosticsRoute(mux, service, server.onboardingJobs.CanRedeploy)
 	server.http.Handler = mux
 	return server

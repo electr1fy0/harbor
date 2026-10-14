@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"paas/internal/contracts"
@@ -15,9 +16,13 @@ import (
 
 // Manager coordinates file-backed managed services and application bindings.
 type Manager struct {
-	store      *store.Store
-	provider   contracts.ServiceProvider
-	bindingMgr *BindingManager
+	store             *store.Store
+	provider          contracts.ServiceProvider
+	bindingMgr        *BindingManager
+	dataDir           string
+	backupLoopMu      sync.Mutex
+	backupLoopStarted bool
+	exportMu          sync.Mutex
 }
 
 // NewManager creates a manager for persistent SQLite services.
@@ -27,6 +32,7 @@ func NewManager(st *store.Store, dataDir string) *Manager {
 		store:      st,
 		provider:   provider,
 		bindingMgr: NewBindingManager(st),
+		dataDir:    dataDir,
 	}
 }
 
