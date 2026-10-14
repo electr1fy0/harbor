@@ -258,3 +258,41 @@ func TestCustomAliasesSurviveCandidateFailureAndWithdrawOnStop(t *testing.T) {
 		}
 	}
 }
+
+func TestDomainOnlyAndNoopSettingsDoNotInventPendingRuntimeChanges(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Environment: map[string]string{"TOKEN": "retained-secret"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.Deploy(context.Background(), h.source, "demo"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.service.OperationSettings("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	domains := []string{"demo.example.com"}
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Domains: &domains}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Environment: map[string]string{"TOKEN": "retained-secret"}}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := h.service.OperationSettings("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.PendingSettings || after.SettingsRevision != before.SettingsRevision {
+		t.Fatalf("domain/noop change advanced runtime revision: before=%+v after=%+v", before, after)
+	}
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Environment: map[string]string{"TOKEN": "new-secret"}}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := h.service.OperationSettings("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending.PendingSettings {
+		t.Fatal("real environment change was not pending")
+	}
+}

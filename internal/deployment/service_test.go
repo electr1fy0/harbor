@@ -1050,6 +1050,72 @@ func TestCancelCandidateLeavesProductionRouteUntouched(t *testing.T) {
 	}
 }
 
+func TestDeleteHonorsPreserveDataForBoundSQLiteDatabase(t *testing.T) {
+	for _, preserveData := range []bool{false, true} {
+		t.Run(fmt.Sprintf("preserveData=%v", preserveData), func(t *testing.T) {
+			h := newServiceHarness(t, testConfig)
+			app, err := h.db.CreateApp("demo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			logPath := filepath.Join(h.service.opts.DataDir, "logs", "dep_delete.log")
+			if err := os.MkdirAll(filepath.Dir(logPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(logPath, []byte("app log"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			artifactDir := filepath.Join(h.service.opts.DataDir, "releases", "rel_delete", "app")
+			if err := os.MkdirAll(artifactDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.db.SaveRelease(app.ID, &contracts.Release{ID: "rel_delete", Runtime: "go", ArtifactDir: artifactDir, Command: []string{"/app/server"}, CreatedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.db.CreateDeployment(model.Deployment{ID: "dep_delete", AppID: app.ID, AppName: "demo", ReleaseID: "rel_delete", State: model.Stopped, LogPath: logPath, CreatedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			volumeDir := filepath.Join(h.service.opts.DataDir, "volumes", "svc_delete")
+			if err := os.MkdirAll(volumeDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.db.CreateService(model.Service{
+				ID: "svc_delete", Name: "delete-db", Type: "sqlite", State: model.ServiceReady,
+				VolumeDir: volumeDir, CreatedAt: time.Now().UTC(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			binding := model.Binding{ID: "bind_delete", AppID: app.ID, ServiceID: "svc_delete", DatabaseName: "db_" + app.ID,
+				Username: "user", Password: "secret", EnvKey: "DATABASE_URL", CreatedAt: time.Now().UTC()}
+			if err := os.MkdirAll(filepath.Join(volumeDir, binding.DatabaseName), 0700); err != nil {
+				t.Fatal(err)
+			}
+			databasePath := filepath.Join(volumeDir, binding.DatabaseName, "database.sqlite")
+			if err := os.WriteFile(databasePath, []byte("sqlite database contents"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.db.CreateBinding(binding); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.service.Delete(context.Background(), "demo", preserveData); err != nil {
+				t.Fatalf("Delete() error = %v", err)
+			}
+			for _, path := range []string{logPath, artifactDir} {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("artifact survived deletion: %s %v", path, err)
+				}
+			}
+			_, statErr := os.Stat(databasePath)
+			if preserveData && statErr != nil {
+				t.Fatalf("preserved database is unavailable: %v", statErr)
+			}
+			if !preserveData && !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("database after destructive delete error = %v, want not found", statErr)
+			}
+		})
+	}
+}
+
 func TestStopRejectsDeployQueuedBehindCanceledBuild(t *testing.T) {
 	h := newServiceHarness(t, testConfig)
 	behavior := &buildBehavior{entered: make(chan struct{}), release: make(chan struct{})}

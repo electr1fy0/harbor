@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -120,10 +122,13 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 	if err != nil {
 		return nil, err
 	}
+	originalEnvironment := maps.Clone(environment)
 	history, err := s.decryptRedactionHistory(app.ID, stored.EncryptedRedactionHistory)
 	if err != nil {
 		return nil, err
 	}
+	originalHistory := append([]string{}, history...)
+	sort.Strings(originalHistory)
 	historySet := make(map[string]bool, len(history)+len(environment)+len(change.Environment))
 	for _, value := range history {
 		if value != "" {
@@ -198,9 +203,11 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 		}
 		stored.TasksLimit = *change.TasksLimit
 	}
-	stored.EncryptedEnvironment, err = s.encryptEnvironment(app.ID, environment)
-	if err != nil {
-		return nil, err
+	if !maps.Equal(originalEnvironment, environment) {
+		stored.EncryptedEnvironment, err = s.encryptEnvironment(app.ID, environment)
+		if err != nil {
+			return nil, err
+		}
 	}
 	history = make([]string, 0, len(historySet))
 	for value := range historySet {
@@ -214,9 +221,11 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 	if len(historyData) > maxRedactionHistoryBytes {
 		return nil, errors.New("environment redaction history limit reached")
 	}
-	stored.EncryptedRedactionHistory, err = s.encryptData(app.ID, "history", historyData)
-	if err != nil {
-		return nil, err
+	if !slices.Equal(originalHistory, history) {
+		stored.EncryptedRedactionHistory, err = s.encryptData(app.ID, "history", historyData)
+		if err != nil {
+			return nil, err
+		}
 	}
 	oldDomains := append([]string{}, stored.Domains...)
 	active, activeErr := s.db.ActiveDeployment(name)

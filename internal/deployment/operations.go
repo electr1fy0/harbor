@@ -18,6 +18,7 @@ import (
 	"paas/internal/health"
 	"paas/internal/model"
 	"paas/internal/sandbox"
+	managedservice "paas/internal/service"
 	"paas/internal/store"
 )
 
@@ -766,7 +767,8 @@ func (s *Service) Delete(ctx context.Context, name string, preserveData bool) er
 	if _, err := s.Stop(ctx, name); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("stop application before deletion: %w", err)
 	}
-	if _, err := s.db.AppSettings(name); err != nil {
+	appSettings, err := s.db.AppSettings(name)
+	if err != nil {
 		return err
 	}
 	deployments, _, err := s.db.DeploymentHistory(name, 1_000_000, 0)
@@ -774,19 +776,46 @@ func (s *Service) Delete(ctx context.Context, name string, preserveData bool) er
 		return err
 	}
 	if !preserveData {
-		for _, d := range deployments {
-			if err := removeManagedPath(filepath.Join(s.opts.DataDir, "logs"), d.LogPath); err != nil {
-				return errors.New("could not safely remove an application log file")
-			}
-		}
-		releases, err := s.db.ReleasesForApp(name)
+		bindings, err := s.db.GetBindingsForApp(appSettings.AppID)
 		if err != nil {
-			return err
+			return errors.New("could not load application data bindings for deletion")
 		}
-		for _, release := range releases {
-			if err := removeManagedPath(filepath.Join(s.opts.DataDir, "releases"), releaseArtifactCleanupPath(release.ArtifactDir)); err != nil {
-				return errors.New("could not safely remove an application release artifact")
+		for _, binding := range bindings {
+			svc, serviceErr := s.db.GetService(binding.ServiceID)
+			if serviceErr != nil {
+				return errors.New("could not safely inspect a bound service volume")
 			}
+			if svc.Type != "sqlite" {
+				continue
+			}
+			if filepath.Base(svc.ID) != svc.ID || svc.VolumeDir != filepath.Join(s.opts.DataDir, "volumes", svc.ID) {
+				return errors.New("bound SQLite volume is outside Harbor storage")
+			}
+			databasePath, pathErr := managedservice.DatabasePath(&binding, svc)
+			if pathErr != nil && !errors.Is(pathErr, os.ErrNotExist) {
+				return errors.New("could not safely inspect a bound SQLite database")
+			}
+			if databasePath == "" {
+				databasePath = filepath.Join(svc.VolumeDir, binding.DatabaseName, "database.sqlite")
+			}
+			if err := removeManagedPath(svc.VolumeDir, filepath.Dir(databasePath)); err != nil {
+				return errors.New("could not safely remove a bound SQLite database")
+			}
+		}
+
+	}
+	for _, d := range deployments {
+		if err := removeManagedPath(filepath.Join(s.opts.DataDir, "logs"), d.LogPath); err != nil {
+			return errors.New("could not safely remove an application log file")
+		}
+	}
+	releases, err := s.db.ReleasesForApp(name)
+	if err != nil {
+		return err
+	}
+	for _, release := range releases {
+		if err := removeManagedPath(filepath.Join(s.opts.DataDir, "releases"), releaseArtifactCleanupPath(release.ArtifactDir)); err != nil {
+			return errors.New("could not safely remove an application release artifact")
 		}
 	}
 	if err := s.db.DeleteApp(name); err != nil {
