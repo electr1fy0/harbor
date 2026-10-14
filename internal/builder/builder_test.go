@@ -548,3 +548,33 @@ func isZombie(pid int) bool {
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
+
+func TestSelectedBuildEnvironmentIsInjectedAndRedactedInActualBuild(t *testing.T) {
+	skipRootBuild(t)
+	dir := t.TempDir()
+	sourceDir := filepath.Join(dir, "source")
+	if err := os.Mkdir(sourceDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "fixture.txt"), []byte("build environment fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoted := "'" + strings.ReplaceAll(executable, "'", "'\"'\"'") + "'"
+	logPath := filepath.Join(dir, "build.log")
+	b := New(Options{DataDir: filepath.Join(dir, "data")})
+	_, err = b.Build(context.Background(), contracts.BuildRequest{AppName: "environment-probe", SourceDir: sourceDir, Runtime: "go", BuildCommand: "printf '%s\\n' \"$BUILD_TOKEN\"; cp " + quoted + " \"$PAAS_OUT/server\"; chmod 755 \"$PAAS_OUT/server\"", StartCommand: "/app/server", LogPath: logPath, BuildEnvironment: []string{"BUILD_TOKEN=synthetic-selected-secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "synthetic-selected-secret") || !strings.Contains(string(data), "[redacted]") {
+		t.Fatalf("unsafe or missing injected build output: %s", data)
+	}
+}

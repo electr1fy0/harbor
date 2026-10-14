@@ -73,16 +73,17 @@ type JobDeployment struct {
 }
 
 type Job struct {
-	ID         string              `json:"id"`
-	Name       string              `json:"name"`
-	State      string              `json:"state"`
-	Stage      string              `json:"stage"`
-	CreatedAt  time.Time           `json:"createdAt"`
-	UpdatedAt  time.Time           `json:"updatedAt"`
-	Deployment *JobDeployment      `json:"deployment,omitempty"`
-	Error      string              `json:"error,omitempty"`
-	Logs       []string            `json:"logs"`
-	Source     *source.GitMetadata `json:"source,omitempty"`
+	ID                   string              `json:"id"`
+	Name                 string              `json:"name"`
+	State                string              `json:"state"`
+	Stage                string              `json:"stage"`
+	CreatedAt            time.Time           `json:"createdAt"`
+	UpdatedAt            time.Time           `json:"updatedAt"`
+	Deployment           *JobDeployment      `json:"deployment,omitempty"`
+	Error                string              `json:"error,omitempty"`
+	Logs                 []string            `json:"logs"`
+	Source               *source.GitMetadata `json:"source,omitempty"`
+	CheckoutMilliseconds *int64              `json:"checkoutMilliseconds,omitempty"`
 }
 
 type jobRecord struct {
@@ -788,7 +789,9 @@ func (m *Manager) run(id string) {
 		m.finish(id, "FAILED", "FAILED", "GitHub credentials are unavailable.", nil)
 		return
 	}
+	checkoutStarted := time.Now()
 	selected, cleanup, err := m.checkout(ctx, request.RepoURL, request.Ref, request.RootDir, m.buildUser, token)
+	m.recordCheckoutTiming(id, time.Since(checkoutStarted))
 	if err != nil {
 		if ctx.Err() != nil {
 			m.finish(id, "CANCELED", "CANCELED", "Deployment was canceled.", nil)
@@ -1265,4 +1268,16 @@ func tailString(value string, limit int) string {
 		value = value[len(value)-limit:]
 	}
 	return strings.TrimSpace(value)
+}
+
+func (m *Manager) recordCheckoutTiming(id string, duration time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if record := m.jobs[id]; record != nil {
+		elapsed := duration.Milliseconds()
+		record.Job.CheckoutMilliseconds = &elapsed
+		if err := m.persistLocked(); err != nil {
+			log.Printf("persist checkout timing: %v", err)
+		}
+	}
 }

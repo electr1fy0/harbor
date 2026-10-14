@@ -63,8 +63,10 @@ func (s *Store) InitOperations() error {
 		`CREATE TRIGGER IF NOT EXISTS app_operations_create AFTER INSERT ON apps BEGIN
 			INSERT INTO app_operations (app_id) VALUES (NEW.id) ON CONFLICT(app_id) DO NOTHING;
 		END`,
-		`CREATE TRIGGER IF NOT EXISTS app_operations_settings_revision AFTER UPDATE OF memory_limit, cpu_quota, tasks_limit, environment, redaction_history ON app_settings
-			WHEN OLD.memory_limit IS NOT NEW.memory_limit OR OLD.cpu_quota IS NOT NEW.cpu_quota OR OLD.tasks_limit IS NOT NEW.tasks_limit OR OLD.environment IS NOT NEW.environment OR OLD.redaction_history IS NOT NEW.redaction_history
+		`CREATE INDEX IF NOT EXISTS events_timing_idx ON events(deployment_id,type,created_at,id)`,
+		`DROP TRIGGER IF EXISTS app_operations_settings_revision`,
+		`CREATE TRIGGER app_operations_settings_revision AFTER UPDATE OF memory_limit, cpu_quota, tasks_limit, environment ON app_settings
+			WHEN OLD.memory_limit IS NOT NEW.memory_limit OR OLD.cpu_quota IS NOT NEW.cpu_quota OR OLD.tasks_limit IS NOT NEW.tasks_limit OR OLD.environment IS NOT NEW.environment
 			BEGIN UPDATE app_operations SET settings_revision = settings_revision + 1 WHERE app_id = NEW.app_id; END`,
 		`CREATE TRIGGER IF NOT EXISTS app_operations_binding_insert AFTER INSERT ON bindings BEGIN
 			UPDATE app_operations SET settings_revision = settings_revision + 1 WHERE app_id = NEW.app_id;
@@ -728,4 +730,28 @@ func boolInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+// DeploymentTimingEvents returns only the earliest timing boundary per type.
+// Ongoing probe events and repeated runtime failures do not inflate history reads.
+func (s *Store) DeploymentTimingEvents(deploymentID string) ([]model.Event, error) {
+	rows, err := s.db.Query(`SELECT type,MIN(created_at),MIN(id) FROM events WHERE deployment_id=? AND type IN (?,?,?,?,?,?,?,?,?) GROUP BY type ORDER BY MIN(created_at),MIN(id)`, deploymentID, model.EventBuildStarted, model.EventBuildCompleted, model.EventBuildFailed, model.EventSandboxStarting, model.EventSandboxStarted, model.EventHealthCheckPassed, model.EventHealthCheckFailed, model.EventDeploymentSucceeded, model.EventDeploymentFailed)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := []model.Event{}
+	for rows.Next() {
+		var event model.Event
+		var at string
+		if err = rows.Scan(&event.Type, &at, &event.ID); err != nil {
+			return nil, err
+		}
+		event.CreatedAt, err = decodeTime(at)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }

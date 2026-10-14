@@ -26,6 +26,7 @@ import (
 
 	"paas/internal/config"
 	"paas/internal/contracts"
+	"paas/internal/fsutil"
 )
 
 const (
@@ -88,7 +89,7 @@ func (b *GoBuilder) PruneCache(ctx context.Context) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return fmt.Errorf("build cache path must be a real directory")
 	}
-	if err := os.RemoveAll(cacheDir); err != nil {
+	if err := fsutil.RemoveReadonlyTree(cacheDir); err != nil {
 		return fmt.Errorf("prune build cache: %w", err)
 	}
 	return nil
@@ -191,7 +192,7 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 				return nil, fmt.Errorf("build cache path must be a real directory")
 			}
-			if err := os.RemoveAll(cacheDir); err != nil {
+			if err := fsutil.RemoveReadonlyTree(cacheDir); err != nil {
 				return nil, fmt.Errorf("clear build cache: %w", err)
 			}
 		} else if !os.IsNotExist(statErr) {

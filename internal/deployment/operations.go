@@ -15,6 +15,7 @@ import (
 	"paas/internal/capacity"
 	"paas/internal/config"
 	"paas/internal/contracts"
+	"paas/internal/fsutil"
 	"paas/internal/health"
 	"paas/internal/model"
 	"paas/internal/sandbox"
@@ -689,7 +690,7 @@ func (s *Service) PruneBuildCache(ctx context.Context) (bool, error) {
 		if err := validateManagedPath(cacheDir, entryPath, false); err != nil {
 			return false, errors.New("Harbor build cache contains an unsafe entry")
 		}
-		if err := os.RemoveAll(entryPath); err != nil {
+		if err := fsutil.RemoveReadonlyTree(entryPath); err != nil {
 			return false, errors.New("remove Harbor build cache entry")
 		}
 	}
@@ -745,7 +746,7 @@ func removeManagedPath(root, candidate string) error {
 	} else if err != nil {
 		return err
 	}
-	return os.RemoveAll(absolute)
+	return fsutil.RemoveReadonlyTree(absolute)
 }
 
 func releaseArtifactCleanupPath(artifactDir string) string {
@@ -927,21 +928,24 @@ func (s *Service) StageDurations(name, deploymentID string) (StageDurations, err
 	if err != nil {
 		return StageDurations{}, err
 	}
-	events, err := s.db.Events(deploymentID)
+	events, err := s.db.DeploymentTimingEvents(deploymentID)
 	if err != nil {
 		return StageDurations{}, err
 	}
+	return stageDurations(*deployment, events), nil
+}
+
+func stageDurations(deployment model.Deployment, events []model.Event) StageDurations {
 	first := make(map[model.EventType]time.Time)
 	for _, event := range events {
 		if _, ok := first[event.Type]; !ok {
 			first[event.Type] = event.CreatedAt
 		}
 	}
-	lastOf := func(types ...model.EventType) (time.Time, bool) {
-		for i := len(events) - 1; i >= 0; i-- {
-			event := events[i]
-			for _, eventType := range types {
-				if event.Type == eventType {
+	firstOf := func(types ...model.EventType) (time.Time, bool) {
+		for _, event := range events {
+			for _, kind := range types {
+				if event.Type == kind {
 					return event.CreatedAt, true
 				}
 			}
@@ -950,29 +954,33 @@ func (s *Service) StageDurations(name, deploymentID string) (StageDurations, err
 	}
 	var result StageDurations
 	if start, ok := first[model.EventBuildStarted]; ok {
-		if end, endOK := lastOf(model.EventBuildCompleted, model.EventBuildFailed); endOK && !end.Before(start) {
+		if end, endOK := firstOf(model.EventBuildCompleted, model.EventBuildFailed); endOK && !end.Before(start) {
 			result.BuildMilliseconds = durationMS(end.Sub(start))
 		}
 	}
 	if start, ok := first[model.EventSandboxStarting]; ok {
-		if end, endOK := lastOf(model.EventHealthCheckPassed, model.EventHealthCheckFailed); endOK && !end.Before(start) {
+		end, endOK := first[model.EventSandboxStarted]
+		if !endOK {
+			end, endOK = firstOf(model.EventDeploymentFailed)
+		}
+		if endOK && !end.Before(start) {
 			result.StartupMilliseconds = durationMS(end.Sub(start))
 		}
 	}
 	if start, ok := first[model.EventSandboxStarted]; ok {
-		if end, endOK := lastOf(model.EventHealthCheckPassed, model.EventHealthCheckFailed); endOK && !end.Before(start) {
+		if end, endOK := firstOf(model.EventHealthCheckPassed, model.EventHealthCheckFailed); endOK && !end.Before(start) {
 			result.ReadinessMilliseconds = durationMS(end.Sub(start))
 		}
 	}
 	if start, ok := first[model.EventHealthCheckPassed]; ok {
-		if end, endOK := lastOf(model.EventDeploymentSucceeded, model.EventDeploymentFailed); endOK && !end.Before(start) {
+		if end, endOK := firstOf(model.EventDeploymentSucceeded, model.EventDeploymentFailed); endOK && !end.Before(start) {
 			result.PromotionMilliseconds = durationMS(end.Sub(start))
 		}
 	}
-	if end, ok := lastOf(model.EventDeploymentSucceeded, model.EventDeploymentFailed); ok && !end.Before(deployment.CreatedAt) {
+	if end, ok := firstOf(model.EventDeploymentSucceeded, model.EventDeploymentFailed); ok && !end.Before(deployment.CreatedAt) {
 		result.TotalMilliseconds = durationMS(end.Sub(deployment.CreatedAt))
 	}
-	return result, nil
+	return result
 }
 
 func durationMS(duration time.Duration) *int64 {

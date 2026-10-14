@@ -428,6 +428,9 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 	if err := validateBuildOptions(buildOptions); err != nil {
 		return nil, err
 	}
+	if err := s.registerBuildRedactions(app.ID, buildOptions.BuildEnvironment); err != nil {
+		return nil, err
+	}
 	id, err := newID("dep")
 	if err != nil {
 		return nil, fmt.Errorf("generate deployment id: %w", err)

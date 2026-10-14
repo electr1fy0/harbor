@@ -17,7 +17,7 @@ import (
 	"paas/internal/model"
 )
 
-const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]|settings NAME|configure NAME [--env-stdin] [--remove-env KEY] [--domain HOST|--clear-domains] [--memory LIMIT] [--cpu N] [--tasks N]|add TYPE --name NAME|link APP SERVICE|services}"
+const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]|settings NAME|configure NAME [--env-stdin] [--remove-env KEY] [--domain HOST|--clear-domains] [--memory LIMIT] [--cpu N] [--tasks N]|add TYPE --name NAME|link APP SERVICE|services|export-decrypt INPUT OUTPUT --passphrase-stdin}"
 
 func main() {
 	os.Exit(runWithInput(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -35,6 +35,9 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		return reportUsageError(stderr, err)
 	}
 
+	if command == "export-decrypt" {
+		return runExportDecrypt(commandArgs, stdin, stdout, stderr)
+	}
 	switch command {
 	case "ping", "deploy", "apps", "inspect", "logs", "stop", "releases", "rollback", "add", "link", "services", "settings", "configure":
 	default:

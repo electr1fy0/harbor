@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"paas/internal/contracts"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -294,5 +295,39 @@ func TestDomainOnlyAndNoopSettingsDoNotInventPendingRuntimeChanges(t *testing.T)
 	}
 	if !pending.PendingSettings {
 		t.Fatal("real environment change was not pending")
+	}
+}
+
+func TestBuildSecretsRemainRedactedFromRuntimeAndHistoricalLogs(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.DeployWithOptions(context.Background(), h.source, "demo", contracts.DeployOptions{BuildEnvironment: map[string]string{"BUILD_TOKEN": "old-build-secret"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(first.LogPath, []byte("runtime printed old-build-secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := h.service.DeployWithOptions(context.Background(), h.source, "demo", contracts.DeployOptions{BuildEnvironment: map[string]string{"BUILD_TOKEN": "new-build-secret"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(second.LogPath, []byte("runtime printed new-build-secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{first.ID, second.ID} {
+		logs, err := h.service.LogsForDeployment("demo", id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(logs, "old-build-secret") || strings.Contains(logs, "new-build-secret") {
+			t.Fatalf("build secret leaked: %s", logs)
+		}
+	}
+	settings, err := h.service.OperationSettings("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.PendingSettings {
+		t.Fatal("redaction-only history change made runtime configuration pending")
 	}
 }

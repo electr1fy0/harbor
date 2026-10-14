@@ -547,3 +547,50 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
+// Called under s.mu before builds start. Build credentials share the encrypted
+// redaction history so runtime output and older releases remain protected.
+func (s *Service) registerBuildRedactions(appID string, environment map[string]string) error {
+	if len(environment) == 0 {
+		return nil
+	}
+	settings, err := s.db.AppSettingsByID(appID)
+	if err != nil {
+		return err
+	}
+	history, err := s.decryptRedactionHistory(appID, settings.EncryptedRedactionHistory)
+	if err != nil {
+		return err
+	}
+	values := make(map[string]bool, len(history)+len(environment))
+	for _, value := range history {
+		if value != "" {
+			values[value] = true
+		}
+	}
+	changed := false
+	for _, value := range environment {
+		if value != "" && !values[value] {
+			values[value] = true
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	history = make([]string, 0, len(values))
+	for value := range values {
+		history = append(history, value)
+	}
+	sort.Strings(history)
+	data, err := json.Marshal(history)
+	if err != nil || len(data) > maxRedactionHistoryBytes {
+		return errors.New("build redaction history exceeds its supported limit")
+	}
+	settings.EncryptedRedactionHistory, err = s.encryptData(appID, "history", data)
+	if err != nil {
+		return err
+	}
+	_, _, err = s.db.UpdateAppSettings(settings.AppName, *settings, settings.Domains)
+	return err
+}

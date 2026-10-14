@@ -1182,3 +1182,12 @@ func decryptHarborArchive(passphrase string, encrypted []byte) ([]byte, error) {
 	}
 	return plain, nil
 }
+
+// DecryptHarborExport authenticates a downloaded archive and returns its
+// compressed tar contents. It does not extract files or modify a running host.
+func DecryptHarborExport(passphrase string, encrypted []byte) ([]byte, error) {
+	if len(encrypted) > maxExportBytes+72 {
+		return nil, errors.New("encrypted Harbor export exceeds its supported size")
+	}
+	return decryptHarborArchive(passphrase, encrypted)
+}
