@@ -42,6 +42,12 @@ Keep these values out of frontend environment variables and bundles. Generate a
 compatible scrypt hash with `./bin/paasd -hash-password`; deployment setup is
 documented in [`../deploy/README.md`](../deploy/README.md).
 
+Optional failure explanations use `OPENAI_API_KEY` in the Go daemon's
+environment and the OpenAI `gpt-5.4-mini` model. The project diagnostics button
+sends redacted evidence only when clicked. Never set the key in Vite variables
+or application settings. See [diagnostics](../docs/diagnostics.md#ai-failure-explanations)
+for configuration and behavior.
+
 The frontend build writes static files to `web/dist`. `make build` installs and
 builds the SPA before compiling `paasd`, which embeds those assets. Production
 serving uses the Go binary and does not need a Bun server process.

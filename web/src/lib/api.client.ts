@@ -77,6 +77,7 @@ export type DashboardFunctionName =
   | "getOverview"
   | "getApp"
   | "getAppSettings"
+  | "explainFailure"
   | "configureApp"
   | "getCapacity"
   | "deployApp"

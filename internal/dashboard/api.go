@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -40,6 +41,10 @@ var (
 // control-plane HTTP handler. Calls stay in process and each daemon response
 // is held in a bounded recorder before it is projected for browser use.
 func NewAPI(control http.Handler) http.Handler {
+	return newAPI(control, newFailureExplainer(strings.TrimSpace(os.Getenv("OPENAI_API_KEY")), &http.Client{Timeout: failureExplanationTimeout}))
+}
+
+func newAPI(control http.Handler, failureExplainer *failureExplainer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, apiPrefix) {
 			writeAPIJSON(w, http.StatusNotFound, map[string]string{"error": "Dashboard endpoint was not found."})
@@ -73,7 +78,13 @@ func NewAPI(control http.Handler) http.Handler {
 			writeAPIJSON(w, status, map[string]string{"error": message})
 			return
 		}
-		result, apiErr := safeDispatchDashboard(r.Context(), control, name, body, fields)
+		var result any
+		var apiErr *apiFailure
+		if name == "explainFailure" {
+			result, apiErr = safeExplainFailure(r.Context(), control, body, failureExplainer)
+		} else {
+			result, apiErr = safeDispatchDashboard(r.Context(), control, name, body, fields)
+		}
 		if apiErr != nil {
 			writeAPIJSON(w, apiErr.status, map[string]string{"error": apiErr.message})
 			return
@@ -98,7 +109,7 @@ func knownDashboardFunction(name string) bool {
 		"operations", "automation", "dataServices", "observe",
 		"retryGitHubDeployment", "getDeploymentJob", "stopApp", "rollbackApp", "listGitHubRepos",
 		"getGitHubRepo", "getGitHubConnection", "connectGitHub", "disconnectGitHub", "inspectProject",
-		"submitOnboardingJob", "getOnboardingJob", "cancelOnboardingJob":
+		"submitOnboardingJob", "getOnboardingJob", "cancelOnboardingJob", "explainFailure":
 		return true
 	default:
 		return false

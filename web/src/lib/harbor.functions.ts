@@ -5,6 +5,7 @@ import type {
   CapacitySnapshot,
   DeploymentJob,
   DeploymentResult,
+  FailureExplanation,
   GitHubConnection,
   GitHubRepo,
   Overview,
@@ -14,6 +15,7 @@ import {
   configureAppInputSchema,
   connectGitHubInputSchema,
   deployAppInputSchema,
+  explainFailureInputSchema,
   getAppInputSchema,
   getAppSettingsInputSchema,
   getCapacityInputSchema,
@@ -31,6 +33,7 @@ import type {
   ConfigureAppInput,
   ConnectGitHubInput,
   DeployAppInput,
+  ExplainFailureInput,
   GetAppInput,
   GetAppSettingsInput,
   GetCapacityInput,
@@ -63,6 +66,15 @@ export function getAppSettings(
   return callDashboardFunction(
     "getAppSettings",
     parseInput(getAppSettingsInputSchema, input.data)
+  )
+}
+
+export function explainFailure(
+  input: FunctionInput<ExplainFailureInput>
+): Promise<FailureExplanation> {
+  return callDashboardFunction(
+    "explainFailure",
+    parseInput(explainFailureInputSchema, input.data)
   )
 }
 

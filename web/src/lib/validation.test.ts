@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   deployAppInputSchema,
+  explainFailureInputSchema,
   getCapacityInputSchema,
   getAppInputSchema,
   parseGitHubRepoURL,
@@ -36,6 +37,28 @@ describe("Harbor input validation", () => {
     })
     expect(() =>
       parseInput(getCapacityInputSchema, { name: "invalid-" })
+    ).toThrow("Invalid request data.")
+  })
+
+  it("accepts a failure explanation request with a bounded deployment ID", () => {
+    expect(
+      parseInput(explainFailureInputSchema, {
+        name: "harbor-web",
+        deploymentID: "dep_123",
+      })
+    ).toEqual({ name: "harbor-web", deploymentID: "dep_123" })
+    expect(() =>
+      parseInput(explainFailureInputSchema, {
+        name: "harbor-web",
+        deploymentID: "../other-app",
+      })
+    ).toThrow("Invalid request data.")
+    expect(() =>
+      parseInput(explainFailureInputSchema, {
+        name: "harbor-web",
+        deploymentID: "dep_123",
+        prompt: "unexpected input",
+      })
     ).toThrow("Invalid request data.")
   })
 

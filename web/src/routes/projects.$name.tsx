@@ -50,6 +50,7 @@ import { ProjectSettings } from "@/components/app/project-settings"
 import { AdvancedLogs } from "@/components/app/advanced-logs"
 import { AppObservability } from "@/components/app/app-observability"
 import { AppAutomation } from "@/components/app/app-automation"
+import { FailureExplanation } from "@/components/app/failure-explanation"
 import {
   OperationsPanel,
   AttemptTimeline,
@@ -543,6 +544,15 @@ function ProjectDetailContent({ name }: { name: string }) {
                 <code>{diagnostics.excerpt}</code>
               </pre>
             ) : null}
+            {latestAttempt ? (
+              <FailureExplanation
+                name={name}
+                deployment={latestAttempt}
+                summary={diagnostics.summary}
+                excerpt={diagnostics.excerpt}
+                production={production}
+              />
+            ) : null}
             {jobID && (jobQuery.data || jobQuery.isError) ? (
               <div className="rounded-lg border border-border/70 bg-[#fbfcfb] px-3 py-2.5 text-sm">
                 <div className="flex flex-wrap items-center gap-2">
@@ -887,7 +897,11 @@ function ReleaseHistoryTable({
       ]),
     [onRollback, rollbackPending]
   )
-  const table = useTable({ features: releaseFeatures, columns, data: releases })
+  const table = useTable({
+    features: releaseFeatures,
+    columns,
+    data: releases,
+  })
 
   return (
     <div className="overflow-x-auto rounded-xl border border-border/80 bg-white">

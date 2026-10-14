@@ -41,7 +41,7 @@ def run(public):
         binary = work / "paasd"
         shutil.copy2(ROOT / "bin/paasd", binary)
         env = dict(os.environ)
-        for name in ("PAASD_PUBLIC_ORIGIN", "PAASD_ADMIN_PASSWORD_HASH", "PAASD_SESSION_SECRET", "GITHUB_TOKEN"):
+        for name in ("PAASD_PUBLIC_ORIGIN", "PAASD_ADMIN_PASSWORD_HASH", "PAASD_SESSION_SECRET", "GITHUB_TOKEN", "OPENAI_API_KEY"):
             env.pop(name, None)
         # The executable serves all assets from an empty working directory and
         # does not need to find Bun/Node on PATH.
@@ -82,6 +82,9 @@ def run(public):
                 assert status == 302 and headers.get("Location") == "/login", (status, headers)
                 status, _, _ = request(address, "/api/dashboard/getOverview", {}, host, origin)
                 assert status == 401, status
+                status, _, _ = request(address, "/api/dashboard/explainFailure",
+                                       {"name": "example", "deploymentID": "dep_missing"}, host, origin)
+                assert status == 401, status
                 status, _, body = request(address, "/api/auth/login", {"password": "incorrect"}, host, origin)
                 assert status == 200 and not json.loads(body)["ok"], (status, body)
                 status, headers, body = request(address, "/api/auth/login", {"password": password}, host, origin)
@@ -106,6 +109,13 @@ def run(public):
             assert overview["services"] == [], overview
             status, _, body = request(address, "/api/dashboard/getCapacity", {}, host, origin, cookie)
             assert status == 200 and "host" in json.loads(body), (status, body)
+            status, _, body = request(address, "/api/dashboard/explainFailure",
+                                      {"name": "example", "deploymentID": "dep_missing"}, host, origin, cookie)
+            assert status == 503 and "not configured" in json.loads(body)["error"], (status, body)
+            status, _, _ = request(address, "/api/dashboard/explainFailure",
+                                   {"name": "example", "deploymentID": "dep_missing"},
+                                   host, "https://evil.example", cookie)
+            assert status == 403, status
             status, _, _ = request(address, "/api/dashboard/getOverview", {}, host, "https://evil.example", cookie)
             assert status == 403, status
             status, _, _ = request(address, "/api/auth/status", host="evil.example")

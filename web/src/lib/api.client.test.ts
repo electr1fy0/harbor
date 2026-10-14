@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { HarborNotFoundError } from "./api.client"
 import type { HarborAPIError } from "./api.client"
 import { getAuthStatus, login, logout } from "./auth.functions"
-import { configureApp, getOverview } from "./harbor.functions"
+import { configureApp, explainFailure, getOverview } from "./harbor.functions"
 
 const fetchMock = vi.fn<typeof fetch>()
 
@@ -47,6 +47,34 @@ describe("browser API transport", () => {
           domains: ["example.com"],
           cpuQuota: 1,
         }),
+      })
+    )
+  })
+
+  it("posts only the validated app and deployment identity for failure explanations", async () => {
+    fetchMock.mockResolvedValue(
+      Response.json({
+        deploymentID: "dep_123",
+        model: "gpt-5.4-mini",
+        explanation: "The build could not resolve a package.",
+        evidence: ["package not found"],
+        nextStep: "Check the package name in the manifest.",
+        cached: false,
+      })
+    )
+    vi.stubGlobal("fetch", fetchMock)
+
+    await explainFailure({
+      data: { name: "demo", deploymentID: "dep_123" },
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/dashboard/explainFailure",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        body: JSON.stringify({ name: "demo", deploymentID: "dep_123" }),
       })
     )
   })

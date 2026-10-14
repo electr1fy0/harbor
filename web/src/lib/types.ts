@@ -77,6 +77,15 @@ export interface AppDiagnostics {
   actions: DiagnosticAction[]
 }
 
+export interface FailureExplanation {
+  deploymentID: string
+  model: "gpt-5.4-mini"
+  explanation: string
+  evidence: string[]
+  nextStep: string
+  cached: boolean
+}
+
 export type DeploymentJobState =
   | "QUEUED"
   | "RUNNING"

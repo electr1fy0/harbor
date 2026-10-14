@@ -40,3 +40,38 @@ in older release logs. If the encryption key or history cannot be read, log
 diagnostics fail closed with a generic error instead of returning unredacted
 text. The dashboard receives only safe deployment metadata, summary text, and
 redacted log excerpts.
+
+## AI failure explanations
+
+The latest failed attempt has an **Explain failure** button for `BUILD_FAILED`,
+`START_FAILED`, `UNHEALTHY`, `CRASHED`, and `OOM_KILLED`. It returns a short
+explanation, supporting evidence, and one suggested next step. Existing log,
+settings, retry, and rollback controls remain available; the explanation does
+not execute actions or modify application code or settings.
+
+Set `OPENAI_API_KEY` in the daemon's environment to enable the feature. The key
+is server-only. Harbor makes one OpenAI Responses API request using
+`gpt-5.4-mini` with structured output and `store: false`. No model request runs
+automatically on deployment, page load, or polling. Without a key, requesting
+an explanation reports that it is not configured.
+
+The request includes bounded, redacted diagnostic log evidence and selected
+deployment facts, including failure state, readiness configuration, resource
+limits, and production status. It does not include repository source or
+environment variable values. Logs can still contain application data beyond
+the credentials Harbor knows how to redact; the button discloses that redacted
+diagnostic evidence is sent to OpenAI. `store: false` disables Responses API
+response storage; it does not override OpenAI's other data retention policies.
+
+Harbor checks that the requested deployment is still the application's latest
+failed attempt and validates evidence references against the supplied facts
+and log lines. Model explanations can be uncertain; inspect the cited evidence
+before following the suggested step. Unavailable providers, incomplete answers,
+or invalid evidence return a local error while ordinary diagnostics remain
+usable.
+
+Successful explanations use a bounded in-memory cache scoped to the deployment
+and evidence content. Harbor reloads redacted diagnostics before using a cached
+answer, so changed evidence does not reuse the old answer. Concurrent requests
+for the same evidence share one provider call. Errors are not cached, and a
+daemon restart clears the cache.

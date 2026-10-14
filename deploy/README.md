@@ -49,6 +49,15 @@ see [GitHub onboarding](../docs/onboarding.md) for repository permissions.
 Dashboard startup fails if any auth variable is set without all valid values. With all three auth variables unset, only loopback requests are
 accepted and login is disabled for local development.
 
+To enable **Explain failure**, set `OPENAI_API_KEY` in the same root-only
+configuration file and restart `paasd`. The daemon calls the OpenAI Responses
+API with `gpt-5.4-mini` only when an operator requests an explanation. The key
+must stay out of application environment settings and frontend configuration.
+Without it, the dashboard and existing diagnostics still work; requesting an
+explanation reports that the feature is not configured. See
+[failure explanations](../docs/diagnostics.md#ai-failure-explanations) for the
+evidence sent to OpenAI and cache behavior.
+
 ## Install and start
 
 Install the service units from the deployment directory and reload systemd:

@@ -144,6 +144,12 @@ export const connectGitHubInputSchema = z
   .object({ token: z.string().min(10).max(4096) })
   .strict()
 export const getAppSettingsInputSchema = z.object({ name: appName }).strict()
+export const explainFailureInputSchema = z
+  .object({
+    name: appName,
+    deploymentID: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+  })
+  .strict()
 export const configureAppInputSchema = z
   .object({
     name: appName,
@@ -190,6 +196,7 @@ export type SubmitOnboardingJobInput = z.infer<
 export type OnboardingJobIDInput = z.infer<typeof onboardingJobIDSchema>
 export type ConnectGitHubInput = z.infer<typeof connectGitHubInputSchema>
 export type GetAppSettingsInput = z.infer<typeof getAppSettingsInputSchema>
+export type ExplainFailureInput = z.infer<typeof explainFailureInputSchema>
 export type ConfigureAppInput = z.infer<typeof configureAppInputSchema>
 
 /**
