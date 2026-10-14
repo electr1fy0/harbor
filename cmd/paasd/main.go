@@ -139,7 +139,7 @@ func main() {
 	}
 	svcManager := service.NewManager(db, dataDir)
 	server = daemon.NewPlatformServerWithServicesAndBuildUser(*socket, deploySvc, svcManager, *buildUser, routerListener.Addr().String())
-	webServer, webListener, err := listenDashboard(*webListen, server.Handler())
+	webServer, webListener, err := listenDashboard(*webListen, server.Handler(), server.PublicHooks())
 	if err != nil {
 		_ = routerListener.Close()
 		_ = deploySvc.Close()

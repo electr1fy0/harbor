@@ -62,12 +62,24 @@ func (l *attemptLimiter) reset() {
 
 type handler struct {
 	api       http.Handler
+	hooks     http.Handler
 	assets    fs.FS
 	static    http.Handler
 	config    Config
 	limiter   attemptLimiter
 	hashSlots chan struct{}
 	now       func() time.Time
+}
+
+// NewHandlerWithHooks exposes credential-authenticated deployment callbacks
+// under the same trusted dashboard host, without requiring a browser session.
+func NewHandlerWithHooks(api http.Handler, assets fs.FS, config Config, hooks http.Handler) (http.Handler, error) {
+	h, err := NewHandler(api, assets, config)
+	if err != nil {
+		return nil, err
+	}
+	h.(*handler).hooks = hooks
+	return h, nil
 }
 
 // NewHandler wraps the dashboard API and embedded frontend in host, origin,
@@ -105,6 +117,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.config.Mode == ModeLocal && !remotePeerIsLoopback(r.RemoteAddr) {
 		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/hooks/") && h.hooks != nil {
+		h.hooks.ServeHTTP(w, r)
 		return
 	}
 

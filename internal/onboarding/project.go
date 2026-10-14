@@ -158,6 +158,24 @@ func Prepare(sourceDir, appName string, selection ConfigSelection) (*config.Conf
 	return config.Load(sourceDir)
 }
 
+// PrepareConfigured prepares a disposable checkout using the persisted source
+// selection. Repository paas.yaml still supplies defaults, while explicitly
+// selected values override it for this deployment.
+func PrepareConfigured(sourceDir, appName string, selection ConfigSelection) (*config.Config, error) {
+	inspection, err := Inspect(sourceDir, appName, ConfigSelection{})
+	if err != nil {
+		return nil, err
+	}
+	if inspection.ExistingConfig {
+		cfg, err := config.Load(sourceDir)
+		if err != nil {
+			return nil, err
+		}
+		return applySelection(cfg, selection)
+	}
+	return Prepare(sourceDir, appName, selection)
+}
+
 func configFromSelection(name string, selection ConfigSelection) (*config.Config, error) {
 	if selection.Runtime == "" || selection.BuildCommand == "" || selection.StartCommand == "" || selection.MemoryLimit == "" || selection.CPUQuota == nil || selection.TasksLimit == nil {
 		return nil, errors.New("inspect the project and review its settings before deploying")
@@ -172,6 +190,29 @@ func configFromSelection(name string, selection ConfigSelection) (*config.Config
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func validateSourceSelection(name string, selection ConfigSelection) error {
+	if selectionEmpty(selection) {
+		return nil
+	}
+	runtime := selection.Runtime
+	if runtime == "" {
+		runtime = "go"
+	}
+	cfg := &config.Config{Name: name, Runtime: runtime, Resources: config.Resources{Memory: config.DefaultMemory, CPU: config.DefaultCPU, Tasks: config.DefaultTasks}}
+	switch runtime {
+	case "go":
+		cfg.Build.Command = `go build -o "$PAAS_OUT/server" .`
+		cfg.Start.Command = "/app/server"
+	case "node":
+		cfg.Build.Command = "npm install"
+		cfg.Start.Command = "node server.js"
+	default:
+		return errors.New("runtime must be go or node")
+	}
+	_, err := applySelection(cfg, selection)
+	return err
 }
 
 func detectConfig(sourceDir, appName string) (*config.Config, []string, error) {

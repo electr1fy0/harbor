@@ -15,7 +15,7 @@ import (
 	webassets "paas/web"
 )
 
-func listenDashboard(address string, control http.Handler) (*http.Server, net.Listener, error) {
+func listenDashboard(address string, control http.Handler, hookHandlers ...http.Handler) (*http.Server, net.Listener, error) {
 	if address == "" {
 		return nil, nil, nil
 	}
@@ -35,7 +35,11 @@ func listenDashboard(address string, control http.Handler) (*http.Server, net.Li
 	if err != nil {
 		return nil, nil, fmt.Errorf("dashboard assets: %w", err)
 	}
-	handler, err := dashboard.NewHandler(dashboard.NewAPI(control), assets, config)
+	var hooks http.Handler
+	if len(hookHandlers) > 0 {
+		hooks = hookHandlers[0]
+	}
+	handler, err := dashboard.NewHandlerWithHooks(dashboard.NewAPI(control), assets, config, hooks)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dashboard handler: %w", err)
 	}

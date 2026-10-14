@@ -95,6 +95,7 @@ func safeDispatchDashboard(ctx context.Context, control http.Handler, name strin
 func knownDashboardFunction(name string) bool {
 	switch name {
 	case "getOverview", "getApp", "getAppSettings", "configureApp", "getCapacity", "deployApp",
+		"operations", "automation", "dataServices", "observe",
 		"retryGitHubDeployment", "getDeploymentJob", "stopApp", "rollbackApp", "listGitHubRepos",
 		"getGitHubRepo", "getGitHubConnection", "connectGitHub", "disconnectGitHub", "inspectProject",
 		"submitOnboardingJob", "getOnboardingJob", "cancelOnboardingJob":
@@ -419,6 +420,47 @@ func validateOptionalConfig(c *configInput, fields map[string]json.RawMessage) b
 }
 
 func dispatchDashboard(ctx context.Context, control http.Handler, name string, body []byte, fields map[string]json.RawMessage) (any, *apiFailure) {
+	if endpoint, ok := map[string]string{"operations": "/operations", "automation": "/automation", "dataServices": "/data-services", "observe": "/observe"}[name]; ok {
+		if name == "operations" && string(fields["action"]) == `"delete"` {
+			var appName string
+			if json.Unmarshal(fields["appName"], &appName) != nil || !validAppName(appName) {
+				return nil, invalidRequest()
+			}
+			var preserve bool
+			if fields["preserveData"] == nil || string(fields["preserveData"]) == "null" || json.Unmarshal(fields["preserveData"], &preserve) != nil {
+				return nil, invalidRequest()
+			}
+			forgotten, fail := invokeControlJSON(ctx, control, http.MethodPost, "/automation", map[string]any{"action": "forgetSource", "name": appName}, defaultControlWait)
+			if fail != nil {
+				return nil, fail
+			}
+			if forgotten.status < 200 || forgotten.status >= 300 {
+				return nil, operationFailure("Deployment jobs must finish canceling before this project can be deleted.")
+			}
+		}
+		// Each feature handler owns a strict request schema and a public response
+		// projection. The gateway retains the dashboard's auth and size limits.
+		limit := maxControlResponse
+		if name == "dataServices" && string(fields["action"]) == `"export"` {
+			limit = 70 << 20
+		}
+		response, fail := invokeControlWithLimit(ctx, control, http.MethodPost, endpoint, body, deploymentControlWait, limit)
+		if fail != nil {
+			return nil, fail
+		}
+		var payload map[string]any
+		if json.Unmarshal(response.body, &payload) != nil || payload == nil {
+			return nil, operationFailure("Harbor returned an invalid response.")
+		}
+		if response.status < 200 || response.status >= 300 {
+			message, _ := payload["error"].(string)
+			if message == "" {
+				message = "Harbor could not complete the operation."
+			}
+			return nil, &apiFailure{response.status, message}
+		}
+		return payload, nil
+	}
 	switch name {
 	case "getOverview":
 		input, ok := decodeDashboardInput[struct{}](body)
@@ -675,6 +717,10 @@ type controlResponse struct {
 }
 
 func invokeControl(ctx context.Context, control http.Handler, method, target string, body []byte, timeout time.Duration) (response controlResponse, fail *apiFailure) {
+	return invokeControlWithLimit(ctx, control, method, target, body, timeout, maxControlResponse)
+}
+
+func invokeControlWithLimit(ctx context.Context, control http.Handler, method, target string, body []byte, timeout time.Duration, limit int) (response controlResponse, fail *apiFailure) {
 	if control == nil {
 		return response, unavailableFailure()
 	}
@@ -691,7 +737,7 @@ func invokeControl(ctx context.Context, control http.Handler, method, target str
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	recorder := newBoundedResponseWriter(maxControlResponse)
+	recorder := newBoundedResponseWriter(limit)
 	panicked := false
 	func() {
 		defer func() {

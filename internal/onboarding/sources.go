@@ -12,12 +12,15 @@ import (
 const sourceFileName = "onboarding-sources.json"
 
 type SourceSettings struct {
-	Name      string          `json:"name"`
-	RepoURL   string          `json:"repoURL"`
-	Ref       string          `json:"ref"`
-	RootDir   string          `json:"rootDir"`
-	Selection ConfigSelection `json:"selection"`
-	UpdatedAt time.Time       `json:"updatedAt"`
+	Name                string          `json:"name"`
+	RepoURL             string          `json:"repoURL"`
+	Ref                 string          `json:"ref"`
+	RootDir             string          `json:"rootDir"`
+	Selection           ConfigSelection `json:"selection"`
+	IncludePaths        []string        `json:"includePaths,omitempty"`
+	IgnorePaths         []string        `json:"ignorePaths,omitempty"`
+	BuildTimeoutSeconds int             `json:"buildTimeoutSeconds,omitempty"`
+	UpdatedAt           time.Time       `json:"updatedAt"`
 }
 
 type sourceFile struct {
@@ -94,6 +97,24 @@ func (s *sourceStore) read() (sourceFile, error) {
 func (s *sourceStore) canRedeploy(name string) bool {
 	settings, err := s.get(name)
 	return err == nil && settings.Name == name && settings.RepoURL != ""
+}
+
+func (s *sourceStore) delete(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	all, err := s.read()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	delete(all.Sources, name)
+	data, err := json.MarshalIndent(all, "", "  ")
+	if err != nil || len(data) > 1<<20 {
+		return errors.New("could not encode persisted repository settings")
+	}
+	return writeSourceFileAtomic(s.path, data)
 }
 
 func writeSourceFileAtomic(path string, data []byte) error {

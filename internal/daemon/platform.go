@@ -228,6 +228,7 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 	}
 	registerOnboardingRoutes(mux, server)
 	registerOperationsRoutes(mux, service)
+	registerAutomationRoutes(mux, server)
 	registerDiagnosticsRoute(mux, service, server.onboardingJobs.CanRedeploy)
 	server.http.Handler = mux
 	return server

@@ -119,6 +119,34 @@ func TestAuthoritativeConfigRetryReadsCurrentRepositoryFile(t *testing.T) {
 	}
 }
 
+func TestPrepareConfiguredAppliesPersistedSelectionOverRepositoryConfig(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectFile(t, dir, "paas.yaml", `name: repo-app
+runtime: go
+build:
+  command: go build -o "$PAAS_OUT/server" .
+start:
+  command: /app/server
+health:
+  path: /
+resources:
+  memory: 128Mi
+  cpu: 0.5
+  tasks: 64
+`)
+	selection := ConfigSelection{BuildCommand: `go build -o "$PAAS_OUT/server" ./cmd/server`, HealthPath: "/ready"}
+	cfg, err := PrepareConfigured(dir, "repo-app", selection)
+	if err != nil {
+		t.Fatalf("PrepareConfigured(): %v", err)
+	}
+	if cfg.Build.Command != selection.BuildCommand || cfg.Health.Path != selection.HealthPath || cfg.Start.Command != "/app/server" || cfg.Resources.Memory != "128Mi" || cfg.Resources.CPU != 0.5 || cfg.Resources.Tasks != 64 {
+		t.Fatalf("persisted selection did not override repository config: %+v", cfg)
+	}
+	if _, err := Inspect(dir, "repo-app", ConfigSelection{}); err != nil {
+		t.Fatalf("repository config was modified or invalid: %v", err)
+	}
+}
+
 func TestUnsupportedNodeAndAmbiguousRuntimeFailClearly(t *testing.T) {
 	dir := t.TempDir()
 	writeProjectFile(t, dir, "package.json", `{"scripts":{"build":"vite build"}}`)
