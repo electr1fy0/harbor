@@ -15,7 +15,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$root/bin/paasd" -socket "$socket" -data-dir "$data_dir" -listen 127.0.0.1:0 >"$root/.paasd-test.log" 2>&1 &
+"$root/bin/paasd" -socket "$socket" -data-dir "$data_dir" -listen 127.0.0.1:0 -web-listen 127.0.0.1:0 >"$root/.paasd-test.log" 2>&1 &
 daemon_pid=$!
 
 ready=0

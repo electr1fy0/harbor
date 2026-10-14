@@ -31,6 +31,8 @@ func main() {
 	data := flag.String("data-dir", "/var/lib/paas", "persistent data directory")
 	listen := flag.String("listen", "127.0.0.1:8080", "loopback router address")
 	tlsAskListen := flag.String("tls-ask-listen", "", "optional numeric loopback TLS authorization address")
+	webListen := flag.String("web-listen", "127.0.0.1:3000", "numeric loopback dashboard address; empty disables the dashboard")
+	hashPassword := flag.Bool("hash-password", false, "generate a dashboard password hash using a hidden terminal prompt, then exit")
 	buildUser := flag.String("build-user", "paas-build", "build user when daemon runs as root")
 	runtimeUser := flag.String("runtime-user", "paas-runtime", "runtime user when daemon runs as root")
 	buildTimeout := flag.Duration("build-timeout", 5*time.Minute, "maximum build duration")
@@ -38,6 +40,12 @@ func main() {
 	flag.Parse()
 	if flag.NArg() != 0 {
 		log.Fatal("unexpected positional argument")
+	}
+	if *hashPassword {
+		if err := printPasswordHash(); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 	if *buildTimeout <= 0 {
 		log.Fatal("build-timeout must be positive")
@@ -130,6 +138,16 @@ func main() {
 		defer askListener.Close()
 	}
 	svcManager := service.NewManager(db, dataDir)
+	server = daemon.NewPlatformServerWithServicesAndBuildUser(*socket, deploySvc, svcManager, *buildUser, routerListener.Addr().String())
+	webServer, webListener, err := listenDashboard(*webListen, server.Handler())
+	if err != nil {
+		_ = routerListener.Close()
+		_ = deploySvc.Close()
+		log.Fatal(err)
+	}
+	if webListener != nil {
+		defer webListener.Close()
+	}
 	serviceCtx, serviceCancel := context.WithTimeout(context.Background(), time.Minute)
 	serviceRestoreErr := svcManager.Restore(serviceCtx)
 	serviceCancel()
@@ -146,8 +164,6 @@ func main() {
 	recoveryCancel()
 	routerServer := &http.Server{Handler: hostRouter, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 
-	server = daemon.NewPlatformServerWithServicesAndBuildUser(*socket, deploySvc, svcManager, *buildUser, routerListener.Addr().String())
-
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(listener) }()
 
@@ -161,6 +177,12 @@ func main() {
 		askDone = make(chan error, 1)
 		go func() { askDone <- askServer.Serve(askListener) }()
 	}
+	var webDone chan error
+	if webServer != nil {
+		webDone = make(chan error, 1)
+		go func() { webDone <- webServer.Serve(webListener) }()
+		log.Printf("dashboard ready: http://%s", webListener.Addr())
+	}
 	log.Printf("paasd ready: socket=%s router=http://%s data=%s", server.SocketPath(), routerListener.Addr(), dataDir)
 
 	select {
@@ -172,8 +194,15 @@ func main() {
 		log.Printf("router: %v", err)
 	case err := <-askDone:
 		log.Printf("TLS authorization: %v", err)
+	case err := <-webDone:
+		log.Printf("dashboard: %v", err)
 	case sig := <-signals:
 		log.Printf("received %s; shutting down", sig)
+	}
+	// Stop accepting dashboard requests before closing the deployment engine.
+	// Close also cancels active requests, including synchronous deployment calls.
+	if webServer != nil {
+		_ = webServer.Close()
 	}
 	if err := deploySvc.Close(); err != nil {
 		log.Printf("stop runtimes: %v", err)

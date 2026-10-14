@@ -1,17 +1,10 @@
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query"
-import {
-  HeadContent,
-  Outlet,
-  Scripts,
-  createRootRouteWithContext,
-} from "@tanstack/react-router"
+import { Outlet, createRootRouteWithContext } from "@tanstack/react-router"
 import { TanStackDevtools } from "@tanstack/react-devtools"
 import { TanStackRouterDevtoolsPanel } from "@tanstack/react-router-devtools"
-import type { ReactNode } from "react"
 import { Toaster } from "@/components/ui/sonner"
 import { AppShell } from "@/components/app/app-shell"
 import { PageError } from "@/components/app/page-state"
-import appCss from "../styles.css?url"
 
 interface RouterContext {
   queryClient: QueryClient
@@ -29,15 +22,10 @@ export const Route = createRootRouteWithContext<RouterContext>()({
         content: "Manage Harbor applications and deployments.",
       },
     ],
-    links: [
-      { rel: "stylesheet", href: appCss },
-      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
-    ],
   }),
   component: RootLayout,
   errorComponent: RootError,
   notFoundComponent: NotFound,
-  shellComponent: RootDocument,
 })
 
 function RootLayout() {
@@ -76,20 +64,6 @@ function RootError({ error, reset }: { error: unknown; reset: () => void }) {
         onRetry={reset}
       />
     </main>
-  )
-}
-
-function RootDocument({ children }: { children: ReactNode }) {
-  return (
-    <html lang="en">
-      <head>
-        <HeadContent />
-      </head>
-      <body>
-        {children}
-        <Scripts />
-      </body>
-    </html>
   )
 }
 

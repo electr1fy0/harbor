@@ -67,7 +67,7 @@ func newCycle2Harness(t *testing.T) *cycle2Harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", h.socket, "-data-dir", filepath.Join(work, "data"), "-listen", "127.0.0.1:0", "-sandbox", "systemd")
+	command := exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", h.socket, "-data-dir", filepath.Join(work, "data"), "-listen", "127.0.0.1:0", "-web-listen", "127.0.0.1:0", "-sandbox", "systemd")
 	command.Stdout, command.Stderr = logFile, logFile
 	if err := command.Start(); err != nil {
 		logFile.Close()

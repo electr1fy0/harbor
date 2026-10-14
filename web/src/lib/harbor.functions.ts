@@ -1,155 +1,201 @@
-import { createServerFn } from "@tanstack/react-start"
+import { callDashboardFunction } from "./api.client"
+import type {
+  AppDetails,
+  AppSettings,
+  CapacitySnapshot,
+  DeploymentJob,
+  DeploymentResult,
+  GitHubConnection,
+  GitHubRepo,
+  Overview,
+  ProjectInspection,
+} from "./types"
 import {
   configureAppInputSchema,
   connectGitHubInputSchema,
   deployAppInputSchema,
-  getDeploymentJobInputSchema,
-  getAppSettingsInputSchema,
   getAppInputSchema,
+  getAppSettingsInputSchema,
   getCapacityInputSchema,
+  getDeploymentJobInputSchema,
   getGitHubRepoInputSchema,
   inspectProjectInputSchema,
   listGitHubReposInputSchema,
   onboardingJobIDSchema,
-  parseGitHubRepoURL,
   parseInput,
   rollbackAppInputSchema,
-  submitOnboardingJobInputSchema,
   stopAppInputSchema,
+  submitOnboardingJobInputSchema,
+} from "./validation"
+import type {
+  ConfigureAppInput,
+  ConnectGitHubInput,
+  DeployAppInput,
+  GetAppInput,
+  GetAppSettingsInput,
+  GetCapacityInput,
+  GetDeploymentJobInput,
+  GetGitHubRepoInput,
+  InspectProjectInput,
+  ListGitHubReposInput,
+  RollbackAppInput,
+  StopAppInput,
+  SubmitOnboardingJobInput,
+  OnboardingJobIDInput,
 } from "./validation"
 
-export const getOverview = createServerFn({ method: "GET" }).handler(
-  async () => {
-    const { getOverviewData } = await import("./harbor.server")
-    return getOverviewData()
-  }
-)
+type FunctionInput<T> = { data: T }
 
-export const getApp = createServerFn({ method: "GET" })
-  .validator((input: unknown) => parseInput(getAppInputSchema, input))
-  .handler(async ({ data }) => {
-    const { getAppData } = await import("./harbor.server")
-    return getAppData(data.name)
-  })
+export function getOverview(): Promise<Overview> {
+  return callDashboardFunction("getOverview")
+}
 
-export const getAppSettings = createServerFn({ method: "GET" })
-  .validator((input: unknown) => parseInput(getAppSettingsInputSchema, input))
-  .handler(async ({ data }) => {
-    const { getAppSettingsData } = await import("./harbor.server")
-    return getAppSettingsData(data.name)
-  })
-
-export const configureApp = createServerFn({ method: "POST" })
-  .validator((input: unknown) => parseInput(configureAppInputSchema, input))
-  .handler(async ({ data }) => {
-    const { configureAppData } = await import("./harbor.server")
-    return configureAppData(data)
-  })
-
-export const getCapacity = createServerFn({ method: "GET" })
-  .validator((input: unknown) => parseInput(getCapacityInputSchema, input))
-  .handler(async ({ data }) => {
-    const { getCapacityData } = await import("./harbor.server")
-    return getCapacityData(data.name)
-  })
-
-export const deployApp = createServerFn({ method: "POST" })
-  .validator((input: unknown) => parseInput(deployAppInputSchema, input))
-  .handler(async ({ data }) => {
-    const { deployAppData } = await import("./harbor.server")
-    return deployAppData(data)
-  })
-
-export const retryGitHubDeployment = createServerFn({ method: "POST" })
-  .validator((input: unknown) => parseInput(getAppInputSchema, input))
-  .handler(async ({ data }) => {
-    const { retryGitHubDeploymentData } = await import("./harbor.server")
-    return retryGitHubDeploymentData(data.name)
-  })
-
-export const getDeploymentJob = createServerFn({ method: "GET" })
-  .validator((input: unknown) => parseInput(getDeploymentJobInputSchema, input))
-  .handler(async ({ data }) => {
-    const { getDeploymentJobData } = await import("./harbor.server")
-    return getDeploymentJobData(data.id)
-  })
-
-export const stopApp = createServerFn({ method: "POST" })
-  .validator((input: unknown) => parseInput(stopAppInputSchema, input))
-  .handler(async ({ data }) => {
-    const { stopAppData } = await import("./harbor.server")
-    return stopAppData(data.name)
-  })
-
-export const rollbackApp = createServerFn({ method: "POST" })
-  .validator((input: unknown) => parseInput(rollbackAppInputSchema, input))
-  .handler(async ({ data }) => {
-    const { rollbackAppData } = await import("./harbor.server")
-    return rollbackAppData(data.name, data.releaseID)
-  })
-
-export const listGitHubRepos = createServerFn({ method: "GET" })
-  .validator((input: unknown) => parseInput(listGitHubReposInputSchema, input))
-  .handler(async ({ data }) => {
-    const { listGitHubReposData } = await import("./harbor.server")
-    return listGitHubReposData(data.owner)
-  })
-
-export const getGitHubRepo = createServerFn({ method: "GET" })
-  .validator((input: unknown) => parseInput(getGitHubRepoInputSchema, input))
-  .handler(async ({ data }) => {
-    const { getGitHubRepoData } = await import("./harbor.server")
-    const { owner, repo } = parseGitHubRepoURL(data.repoURL)
-    return getGitHubRepoData(owner, repo)
-  })
-
-export const getGitHubConnection = createServerFn({ method: "GET" }).handler(
-  async () => {
-    const { getGitHubConnectionData } = await import("./harbor.server")
-    return getGitHubConnectionData()
-  }
-)
-
-export const connectGitHub = createServerFn({ method: "POST" })
-  .validator((input: unknown) => parseInput(connectGitHubInputSchema, input))
-  .handler(async ({ data }) => {
-    const { connectGitHubData } = await import("./harbor.server")
-    return connectGitHubData(data.token)
-  })
-
-export const disconnectGitHub = createServerFn({ method: "POST" }).handler(
-  async () => {
-    const { disconnectGitHubData } = await import("./harbor.server")
-    return disconnectGitHubData()
-  }
-)
-
-export const inspectProject = createServerFn({ method: "POST" })
-  .validator((input: unknown) => parseInput(inspectProjectInputSchema, input))
-  .handler(async ({ data }) => {
-    const { inspectProjectData } = await import("./harbor.server")
-    return inspectProjectData(data)
-  })
-
-export const submitOnboardingJob = createServerFn({ method: "POST" })
-  .validator((input: unknown) =>
-    parseInput(submitOnboardingJobInputSchema, input)
+export function getApp(input: FunctionInput<GetAppInput>): Promise<AppDetails> {
+  return callDashboardFunction(
+    "getApp",
+    parseInput(getAppInputSchema, input.data)
   )
-  .handler(async ({ data }) => {
-    const { submitOnboardingJobData } = await import("./harbor.server")
-    return submitOnboardingJobData(data)
-  })
+}
 
-export const getOnboardingJob = createServerFn({ method: "GET" })
-  .validator((input: unknown) => parseInput(onboardingJobIDSchema, input))
-  .handler(async ({ data }) => {
-    const { getOnboardingJobData } = await import("./harbor.server")
-    return getOnboardingJobData(data.id)
-  })
+export function getAppSettings(
+  input: FunctionInput<GetAppSettingsInput>
+): Promise<AppSettings> {
+  return callDashboardFunction(
+    "getAppSettings",
+    parseInput(getAppSettingsInputSchema, input.data)
+  )
+}
 
-export const cancelOnboardingJob = createServerFn({ method: "POST" })
-  .validator((input: unknown) => parseInput(onboardingJobIDSchema, input))
-  .handler(async ({ data }) => {
-    const { cancelOnboardingJobData } = await import("./harbor.server")
-    return cancelOnboardingJobData(data.id)
-  })
+export function configureApp(
+  input: FunctionInput<ConfigureAppInput>
+): Promise<AppSettings> {
+  return callDashboardFunction(
+    "configureApp",
+    parseInput(configureAppInputSchema, input.data)
+  )
+}
+
+export function getCapacity(
+  input: FunctionInput<GetCapacityInput>
+): Promise<CapacitySnapshot> {
+  return callDashboardFunction(
+    "getCapacity",
+    parseInput(getCapacityInputSchema, input.data)
+  )
+}
+
+export function deployApp(
+  input: FunctionInput<DeployAppInput>
+): Promise<DeploymentResult> {
+  return callDashboardFunction(
+    "deployApp",
+    parseInput(deployAppInputSchema, input.data)
+  )
+}
+
+export function retryGitHubDeployment(
+  input: FunctionInput<GetAppInput>
+): Promise<DeploymentJob> {
+  return callDashboardFunction(
+    "retryGitHubDeployment",
+    parseInput(getAppInputSchema, input.data)
+  )
+}
+
+export function getDeploymentJob(
+  input: FunctionInput<GetDeploymentJobInput>
+): Promise<DeploymentJob> {
+  return callDashboardFunction(
+    "getDeploymentJob",
+    parseInput(getDeploymentJobInputSchema, input.data)
+  )
+}
+
+export function stopApp(
+  input: FunctionInput<StopAppInput>
+): Promise<DeploymentResult> {
+  return callDashboardFunction(
+    "stopApp",
+    parseInput(stopAppInputSchema, input.data)
+  )
+}
+
+export function rollbackApp(
+  input: FunctionInput<RollbackAppInput>
+): Promise<DeploymentResult> {
+  return callDashboardFunction(
+    "rollbackApp",
+    parseInput(rollbackAppInputSchema, input.data)
+  )
+}
+
+export function listGitHubRepos(
+  input: FunctionInput<ListGitHubReposInput>
+): Promise<GitHubRepo[]> {
+  return callDashboardFunction(
+    "listGitHubRepos",
+    parseInput(listGitHubReposInputSchema, input.data)
+  )
+}
+
+export function getGitHubRepo(
+  input: FunctionInput<GetGitHubRepoInput>
+): Promise<GitHubRepo> {
+  return callDashboardFunction(
+    "getGitHubRepo",
+    parseInput(getGitHubRepoInputSchema, input.data)
+  )
+}
+
+export function getGitHubConnection(): Promise<GitHubConnection> {
+  return callDashboardFunction("getGitHubConnection")
+}
+
+export function connectGitHub(
+  input: FunctionInput<ConnectGitHubInput>
+): Promise<GitHubConnection> {
+  return callDashboardFunction(
+    "connectGitHub",
+    parseInput(connectGitHubInputSchema, input.data)
+  )
+}
+
+export function disconnectGitHub(): Promise<GitHubConnection> {
+  return callDashboardFunction("disconnectGitHub")
+}
+
+export function inspectProject(
+  input: FunctionInput<InspectProjectInput>
+): Promise<ProjectInspection> {
+  return callDashboardFunction(
+    "inspectProject",
+    parseInput(inspectProjectInputSchema, input.data)
+  )
+}
+
+export function submitOnboardingJob(
+  input: FunctionInput<SubmitOnboardingJobInput>
+): Promise<DeploymentJob> {
+  return callDashboardFunction(
+    "submitOnboardingJob",
+    parseInput(submitOnboardingJobInputSchema, input.data)
+  )
+}
+
+export function getOnboardingJob(
+  input: FunctionInput<OnboardingJobIDInput>
+): Promise<DeploymentJob> {
+  return callDashboardFunction(
+    "getOnboardingJob",
+    parseInput(onboardingJobIDSchema, input.data)
+  )
+}
+
+export function cancelOnboardingJob(
+  input: FunctionInput<OnboardingJobIDInput>
+): Promise<DeploymentJob> {
+  return callDashboardFunction(
+    "cancelOnboardingJob",
+    parseInput(onboardingJobIDSchema, input.data)
+  )
+}

@@ -24,6 +24,9 @@ import (
 )
 
 func TestDeploymentLifecycle(t *testing.T) {
+	for _, name := range []string{"PAASD_PUBLIC_ORIGIN", "PAASD_ADMIN_PASSWORD_HASH", "PAASD_SESSION_SECRET"} {
+		t.Setenv(name, "")
+	}
 	root, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +60,7 @@ func TestDeploymentLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		command = exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", socket, "-data-dir", data, "-listen", "127.0.0.1:0", "-build-timeout", buildTimeout, "-sandbox", "host")
+		command = exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", socket, "-data-dir", data, "-listen", "127.0.0.1:0", "-web-listen", "127.0.0.1:0", "-build-timeout", buildTimeout, "-sandbox", "host")
 		command.Stdout = log
 		command.Stderr = log
 		if err := command.Start(); err != nil {
@@ -115,6 +118,42 @@ func TestDeploymentLifecycle(t *testing.T) {
 			t.Fatalf("%s %s unexpectedly succeeded", op, name)
 		}
 		return out
+	}
+	dashboardCall := func(operation, input string) map[string]any {
+		body, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		match := regexp.MustCompile(`dashboard ready: (http://[^\s]+)`).FindSubmatch(body)
+		if len(match) != 2 {
+			t.Fatalf("dashboard readiness missing: %s", body)
+		}
+		origin := string(match[1])
+		req, err := http.NewRequest(http.MethodPost, origin+"/api/dashboard/"+operation, strings.NewReader(input))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", origin)
+		response, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		result, err := io.ReadAll(response.Body)
+		if err != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf("dashboard %s: status=%d body=%s err=%v", operation, response.StatusCode, result, err)
+		}
+		for _, private := range []string{data, "dashboard-secret-value", `"PID"`, `"LogPath"`, `"artifact_dir"`} {
+			if strings.Contains(string(result), private) {
+				t.Fatalf("dashboard %s exposed private data %q: %s", operation, private, result)
+			}
+		}
+		var output map[string]any
+		if err := json.Unmarshal(result, &output); err != nil {
+			t.Fatal(err)
+		}
+		return output
 	}
 	cli := func(args ...string) string {
 		command := exec.Command(filepath.Join(root, "bin", "paas"), append([]string{"--socket", socket}, args...)...)
@@ -195,6 +234,18 @@ func TestDeploymentLifecycle(t *testing.T) {
 	if output := cli("inspect", "hello"); !strings.Contains(output, hello.ReleaseID) || !strings.Contains(output, "RUNNING") {
 		t.Fatalf("real CLI inspection incomplete: %s", output)
 	}
+	// The embedded dashboard and CLI operate on the same live deployment, while
+	// the browser receives only public metadata and write-only environment keys.
+	dashboardCall("configureApp", `{"name":"hello","environment":{"DASHBOARD_SECRET":"dashboard-secret-value"}}`)
+	webApp := dashboardCall("getApp", `{"name":"hello"}`)
+	webDeployment, ok := webApp["deployment"].(map[string]any)
+	if !ok || webDeployment["ReleaseID"] != hello.ReleaseID || webDeployment["State"] != "RUNNING" {
+		t.Fatalf("dashboard deployment differs from CLI: %#v", webApp)
+	}
+	webSettings := dashboardCall("getAppSettings", `{"name":"hello"}`)
+	if keys, ok := webSettings["environmentKeys"].([]any); !ok || len(keys) != 1 || keys[0] != "DASHBOARD_SECRET" {
+		t.Fatalf("dashboard environment metadata: %#v", webSettings)
+	}
 	if output := cli("apps"); !strings.Contains(output, "hello") || !strings.Contains(output, "RUNNING") {
 		t.Fatalf("real CLI apps incomplete: %s", output)
 	}
@@ -236,14 +287,14 @@ func TestDeploymentLifecycle(t *testing.T) {
 		}
 	}
 	// A second daemon must not steal the active Unix socket.
-	second := exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", socket, "-data-dir", filepath.Join(work, "second"), "-listen", "127.0.0.1:0")
+	second := exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", socket, "-data-dir", filepath.Join(work, "second"), "-listen", "127.0.0.1:0", "-web-listen", "127.0.0.1:0")
 	if out, err := second.CombinedOutput(); err == nil || !strings.Contains(string(out), "already listening") {
 		t.Fatalf("second daemon socket protection: %s %v", out, err)
 	}
 	if _, err := daemon.Ping(context.Background(), socket); err != nil {
 		t.Fatal(err)
 	}
-	second = exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", filepath.Join(work, "other.sock"), "-data-dir", data, "-listen", "127.0.0.1:0")
+	second = exec.Command(filepath.Join(root, "bin", "paasd"), "-socket", filepath.Join(work, "other.sock"), "-data-dir", data, "-listen", "127.0.0.1:0", "-web-listen", "127.0.0.1:0")
 	if out, err := second.CombinedOutput(); err == nil || !strings.Contains(string(out), "another daemon is using") {
 		t.Fatalf("second daemon data-directory protection: %s %v", out, err)
 	}
@@ -299,7 +350,7 @@ func TestDeploymentLifecycle(t *testing.T) {
 		}
 		call("stop", "identity", "", true)
 	}
-	call("stop", "hello", "", true)
+	dashboardCall("stopApp", `{"name":"hello"}`)
 	route(address, "hello.localhost", 404)
 	if got := call("inspect", "hello", "", true).Deployment.State; got != model.Stopped {
 		t.Fatalf("stop state=%s", got)

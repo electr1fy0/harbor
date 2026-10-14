@@ -23,7 +23,7 @@ function LoginPage() {
     onSuccess: async (result) => {
       setPassword("")
       if (!result.ok) {
-        setMessage(result.message)
+        setMessage(result.message || "Sign-in failed.")
         return
       }
       await queryClient.invalidateQueries({ queryKey: ["harbor", "auth"] })

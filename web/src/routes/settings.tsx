@@ -89,11 +89,12 @@ function SettingsPage() {
               />
               <p>
                 Public repositories need no token. For private repositories,
-                configure{" "}
+                connect a GitHub token from the import page. Harbor stores it
+                in the daemon's private data directory. A daemon-side{" "}
                 <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
                   GITHUB_TOKEN
                 </code>{" "}
-                in both the web server and daemon. It stays server-side.
+                is also supported.
               </p>
             </div>
             <div className="flex justify-end border-t border-border/60 pt-4">
@@ -128,7 +129,7 @@ function SettingsPage() {
               <pre className="overflow-x-auto rounded-lg bg-[#202726] p-3 font-mono text-xs leading-5 text-[#e6ebe7]">
                 <code>
                   {
-                    "make build\n./bin/paasd -socket /tmp/paasd.sock -data-dir /tmp/harbor-dev -listen 127.0.0.1:8080"
+                    "make build\n./bin/paasd -socket /tmp/paasd.sock -data-dir /tmp/harbor-dev -listen 127.0.0.1:8080 -web-listen 127.0.0.1:3000 -sandbox host"
                   }
                 </code>
               </pre>
@@ -139,13 +140,14 @@ function SettingsPage() {
               </p>
               <pre className="overflow-x-auto rounded-lg bg-[#202726] p-3 font-mono text-xs leading-5 text-[#e6ebe7]">
                 <code>
-                  {"cd web\nPAASD_SOCKET=/tmp/paasd.sock bun run dev"}
+                  {"cd web\nbun install\nbun run dev"}
                 </code>
               </pre>
             </div>
             <p className="text-xs leading-5">
-              The dashboard connects through Harbor’s owner-only Unix socket.
-              The web process needs permission to open it.
+              Vite serves the SPA on port 5173 and proxies API requests to the
+              Go dashboard on port 3000. The Go daemon accesses the control
+              socket directly.
             </p>
           </div>
         </details>

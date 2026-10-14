@@ -193,8 +193,7 @@ export type GetAppSettingsInput = z.infer<typeof getAppSettingsInputSchema>
 export type ConfigureAppInput = z.infer<typeof configureAppInputSchema>
 
 /**
- * Normalize validation failures so Zod's diagnostic object never crosses the
- * server-function boundary.
+ * Normalize validation failures so Zod diagnostics never cross the API boundary.
  */
 export function parseInput<TSchema extends z.ZodType>(
   schema: TSchema,

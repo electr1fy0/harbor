@@ -135,6 +135,41 @@ func (m *Manager) Repositories(ctx context.Context) ([]source.GitHubRepository, 
 	return source.NewGitHubAPI().Repositories(ctx, token)
 }
 
+// BrowseRepositories applies the connected-account owner filter or lists public
+// repositories when no credential is configured.
+func (m *Manager) BrowseRepositories(ctx context.Context, owner string) ([]source.GitHubRepository, error) {
+	token, err := m.githubToken()
+	if err != nil {
+		return nil, err
+	}
+	api := source.NewGitHubAPI()
+	if token == "" {
+		return api.PublicRepositories(ctx, owner, "")
+	}
+	repos, err := api.Repositories(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	if owner == "" {
+		return repos, nil
+	}
+	filtered := make([]source.GitHubRepository, 0)
+	for _, repo := range repos {
+		if strings.EqualFold(strings.SplitN(repo.FullName, "/", 2)[0], owner) {
+			filtered = append(filtered, repo)
+		}
+	}
+	return filtered, nil
+}
+
+func (m *Manager) Repository(ctx context.Context, owner, repo string) (source.GitHubRepository, error) {
+	token, err := m.githubToken()
+	if err != nil {
+		return source.GitHubRepository{}, err
+	}
+	return source.NewGitHubAPI().Repository(ctx, owner, repo, token)
+}
+
 func (m *Manager) githubToken() (string, error) {
 	token, err := m.credentials.Token()
 	if err != nil {

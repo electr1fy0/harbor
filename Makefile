@@ -1,8 +1,11 @@
-.PHONY: all build test vet fmt clean spikes integration test-privileged
+.PHONY: all web build test vet fmt clean spikes integration test-privileged
 
 all: test
 
-build:
+web:
+	cd web && bun install --frozen-lockfile && bun run build
+
+build: web
 	mkdir -p bin
 	go build -o bin/paas ./cmd/paas
 	go build -o bin/paasd ./cmd/paasd
@@ -12,7 +15,7 @@ build:
 	go build -o bin/memory-hog ./examples/memory-hog
 	(cd examples/sqlite-app && CGO_ENABLED=1 go build -o ../../bin/sqlite-app .)
 
-vet:
+vet: web
 	go vet ./...
 
 fmt:
@@ -33,6 +36,7 @@ test-privileged: build
 test: vet build
 	go test ./...
 	./scripts/tests/cli-ping.sh
+	python3 ./scripts/tests/dashboard.py
 	./scripts/tests/broken-build.sh
 	./scripts/tests/examples.sh
 	./scripts/spikes/router.sh

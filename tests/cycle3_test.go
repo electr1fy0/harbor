@@ -63,7 +63,7 @@ func newCycle3Harness(t *testing.T) *cycle3Harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	args := []string{"-socket", h.socket, "-data-dir", filepath.Join(work, "data"), "-listen", "127.0.0.1:0", "-build-timeout", "5m"}
+	args := []string{"-socket", h.socket, "-data-dir", filepath.Join(work, "data"), "-listen", "127.0.0.1:0", "-web-listen", "127.0.0.1:0", "-build-timeout", "5m"}
 	// Exercise the production Linux backend where available, and the real
 	// host runtime elsewhere. Candidate lifecycle is platform independent.
 	if runtime.GOOS != "linux" {

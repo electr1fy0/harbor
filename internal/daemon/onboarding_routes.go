@@ -60,13 +60,31 @@ func registerOnboardingRoutes(mux *http.ServeMux, server *Server) {
 			writeOnboardingError(w, http.StatusServiceUnavailable, "GitHub repositories are unavailable.")
 			return
 		}
-		repositories, err := server.onboardingJobs.Repositories(r.Context())
+		repositories, err := server.onboardingJobs.BrowseRepositories(r.Context(), r.URL.Query().Get("owner"))
 		if err != nil {
 			writeOnboardingError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeOnboardingJSON(w, http.StatusOK, map[string]any{"repositories": repositories})
 	})
+	mux.HandleFunc("/github/repo", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			writeOnboardingError(w, http.StatusMethodNotAllowed, "Method not allowed.")
+			return
+		}
+		if server.onboardingJobs == nil {
+			writeOnboardingError(w, http.StatusServiceUnavailable, "GitHub repositories are unavailable.")
+			return
+		}
+		repo, err := server.onboardingJobs.Repository(r.Context(), r.URL.Query().Get("owner"), r.URL.Query().Get("repo"))
+		if err != nil {
+			writeOnboardingError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeOnboardingJSON(w, http.StatusOK, map[string]any{"repository": repo})
+	})
+
 	mux.HandleFunc("/projects/inspect", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", "POST")

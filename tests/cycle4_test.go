@@ -55,7 +55,7 @@ func TestCycle4NodeDeploymentAndConcurrency(t *testing.T) {
 		filepath.Join(root, "bin", "paasd"),
 		"-socket", socket,
 		"-data-dir", data,
-		"-listen", "127.0.0.1:0",
+		"-listen", "127.0.0.1:0", "-web-listen", "127.0.0.1:0",
 		"-build-timeout", "5m",
 	)
 	daemonCmd.Stdout = log
@@ -263,7 +263,7 @@ func TestCycle4SQLiteManagedServiceAndPersistence(t *testing.T) {
 			filepath.Join(root, "bin", "paasd"),
 			"-socket", socket,
 			"-data-dir", data,
-			"-listen", "127.0.0.1:0",
+			"-listen", "127.0.0.1:0", "-web-listen", "127.0.0.1:0",
 			"-build-timeout", "5m",
 		)
 		cmd.Stdout = log

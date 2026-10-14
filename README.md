@@ -13,20 +13,20 @@ must be trusted; applications share the host network and runtime account.
 
 ## Web dashboard
 
-The `web/` application provides a responsive project dashboard, deployment and
-release views, logs, stop/rollback actions, managed-service status, and GitHub
-repository import. It uses TanStack Start, Router, Query, Form, and Table with
-the Base UI shadcn preset `b6F9PjJnG`.
+The complete React dashboard is embedded in the Go `paasd` executable. The same
+process serves the UI, authenticates dashboard API requests, and manages
+applications. Production needs no separate web service or Bun/Node runtime.
+The UI uses TanStack Router, Query, Form, and Table with the Base UI shadcn preset.
 
-Run the daemon using the local development commands below, then in another terminal:
+Build from source with `make build` (Bun 1.4+ is required on the build machine),
+then start the daemon using the local development commands below. Open
+<http://127.0.0.1:3000>. The default dashboard listener is numeric loopback;
+`-web-listen` selects another loopback address and `-web-listen ''` disables it.
+The CLI continues to use the private Unix socket.
 
-    cd web
-    bun install
-    PAASD_SOCKET=/tmp/paasd.sock bun run dev
-
-Open <http://127.0.0.1:3000>. The web server connects to the private control
-socket; its process identity must have permission to open that socket. Without
-a daemon, the dashboard shows a connection message and setup instructions.
+For frontend development, run `bun install` and `bun run dev` inside `web/`.
+Vite serves <http://127.0.0.1:5173> and proxies API calls to the daemon on port
+3000. See [web/README.md](web/README.md) for the development and verification steps.
 
 Import a repository by browsing a GitHub owner or entering its HTTPS URL. Connect
 a fine-grained personal access token in the dashboard to browse and clone private
@@ -44,17 +44,12 @@ GitHub OAuth and webhook-triggered deployments are not implemented. Legacy daemo
 Repository checkouts reject symlinks, path traversal, non-GitHub hosts, and embedded
 URL credentials; Git must be installed on the daemon host.
 
-For a local production build:
-
-    cd web
-    bun run build
-    PAASD_SOCKET=/tmp/paasd.sock bun run start
-
-Both development and production startup bind to loopback. Public mode requires
-an exact HTTPS dashboard origin, an admin password hash, and a session signing
-secret; partial configuration locks access. See [deploy/README.md](deploy/README.md)
-for the unprivileged dashboard service and Caddy setup, and
-[web/README.md](web/README.md) for frontend checks and configuration.
+Public access requires an exact HTTPS dashboard origin, an admin password hash,
+and a session signing secret; invalid or partial configuration fails startup.
+Generate the compatible scrypt hash with `paasd -hash-password`. See
+[deploy/README.md](deploy/README.md) for the single systemd service and Caddy setup.
+The dashboard API executes within the privileged daemon process and retains
+strict Host/Origin validation, signed sessions and bounded login attempts.
 
 Project settings support globally unique custom domains, write-only runtime
 environment values, and resource limits. Domain changes update routing

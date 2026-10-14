@@ -8,7 +8,7 @@ import {
 } from "@tabler/icons-react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Link, useRouter, useRouterState } from "@tanstack/react-router"
-import type { ReactNode } from "react"
+import { useEffect, type ReactNode } from "react"
 import { toast } from "sonner"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { logout } from "@/lib/auth.functions"
@@ -65,9 +65,40 @@ export function AppShell({ children }: { children: ReactNode }) {
     onError: (error) => toast.error(error.message || "Could not sign out."),
   })
 
+  useEffect(() => {
+    if (
+      pathname !== "/login" &&
+      auth.data?.mode === "public" &&
+      !auth.data.authenticated
+    ) {
+      void router.navigate({ to: "/login", replace: true })
+    }
+  }, [auth.data?.authenticated, auth.data?.mode, pathname, router])
+
+  useEffect(() => {
+    const refreshAuth = () => {
+      void queryClient.invalidateQueries({
+        queryKey: authQueryOptions().queryKey,
+      })
+    }
+    window.addEventListener("harbor:unauthorized", refreshAuth)
+    return () => window.removeEventListener("harbor:unauthorized", refreshAuth)
+  }, [queryClient])
+
   if (pathname === "/login") {
     return (
       <div className="min-h-svh bg-[#f8f9f8] text-foreground">{children}</div>
+    )
+  }
+
+  if (
+    auth.isPending ||
+    (auth.data?.mode === "public" && !auth.data.authenticated)
+  ) {
+    return (
+      <main className="grid min-h-svh place-items-center px-4 py-10 text-sm text-muted-foreground">
+        Checking dashboard access…
+      </main>
     )
   }
 

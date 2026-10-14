@@ -612,7 +612,7 @@ function ImportProjectPage() {
                     </div>
                     <FieldDescription>
                       Public repositories work without a GitHub connection.
-                      Private URLs use the connected token or server
+                      Private URLs use the connected token or a daemon-side
                       GITHUB_TOKEN.
                     </FieldDescription>
                   </Field>
