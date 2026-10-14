@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,44 @@ import (
 	"paas/internal/contracts"
 	"paas/internal/sandbox"
 )
+
+func TestRedactingWriterHandlesSecretsAcrossWrites(t *testing.T) {
+	var output bytes.Buffer
+	writer := newRedactingWriter(&output, []string{"PRIVATE_TOKEN=redact-this-token", "SHORT=redact"})
+	if _, err := writer.Write([]byte("token=redact-this-")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("token finished")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "redact-this-token") || !strings.Contains(output.String(), "[redacted]") {
+		t.Fatalf("secret was not redacted from streaming output: %q", output.String())
+	}
+	var overlap bytes.Buffer
+	writer = newRedactingWriter(&overlap, []string{"A=abc", "B=abcdef"})
+	_, _ = writer.Write([]byte("abcdef"))
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if overlap.String() != "[redacted]" {
+		t.Fatalf("overlapping secret was partially exposed: %q", overlap.String())
+	}
+}
+
+func TestPruneCacheHonorsContextWhileWaitingForBuild(t *testing.T) {
+	b := New(Options{DataDir: t.TempDir()})
+	b.cacheMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	err := b.PruneCache(ctx)
+	b.cacheMu.Unlock()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("PruneCache error = %v, want context deadline exceeded", err)
+	}
+}
 
 func TestBuildPublishesDeterministicImmutableReleases(t *testing.T) {
 	skipRootBuild(t)

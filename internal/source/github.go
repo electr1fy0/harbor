@@ -2,9 +2,11 @@
 package source
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
 	"os"
@@ -58,23 +60,67 @@ func CheckoutGitHubAsWithToken(ctx context.Context, repoURL, ref, rootDir, build
 	return (githubSource{run: runGit, timeout: defaultCheckoutTimeout, buildUser: buildUser}).checkout(ctx, repoURL, ref, rootDir, token)
 }
 
-func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir, token string) (string, func(), error) {
+// GitMetadata describes the exact commit selected by a checkout. Message is
+// the full commit message; URL is the canonical GitHub commit page.
+type GitMetadata struct {
+	CommitSHA   string `json:"commitSHA"`
+	Message     string `json:"message"`
+	Author      string `json:"author"`
+	AuthorEmail string `json:"authorEmail"`
+	URL         string `json:"url"`
+}
+
+// CheckoutGitHubAsWithTokenAndMetadata performs a private checkout and
+// returns metadata read from the detached checkout itself. Callers that need
+// webhook reproducibility should pass a full commit SHA as ref.
+func CheckoutGitHubAsWithTokenAndMetadata(ctx context.Context, repoURL, ref, rootDir, buildUser, token string) (string, func(), GitMetadata, error) {
+	return (githubSource{run: runGit, timeout: defaultCheckoutTimeout, buildUser: buildUser}).checkoutWithMetadata(ctx, repoURL, ref, rootDir, token)
+}
+
+// ReadGitMetadata reads the exact checked-out commit from a selected source
+// directory, including when that directory is nested under a repository root.
+func ReadGitMetadata(ctx context.Context, sourceDir, repoURL, buildUser string) (GitMetadata, error) {
 	if ctx == nil {
-		return "", nil, errors.New("checkout context must not be nil")
+		return GitMetadata{}, errors.New("metadata context must not be nil")
+	}
+	if strings.TrimSpace(sourceDir) == "" {
+		return GitMetadata{}, errors.New("source directory is required")
 	}
 	cloneURL, err := canonicalGitHubURL(repoURL)
 	if err != nil {
-		return "", nil, err
+		return GitMetadata{}, err
+	}
+	metadataCtx, cancel := context.WithTimeout(ctx, defaultCheckoutTimeout)
+	defer cancel()
+	return gitMetadata(metadataCtx, gitEnvironment("", ""), sourceDir, buildUser, sourceDir, cloneURL)
+}
+
+func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir, token string) (string, func(), error) {
+	selected, cleanup, _, err := s.checkoutInternal(ctx, repoURL, ref, rootDir, token, false)
+	return selected, cleanup, err
+}
+
+func (s githubSource) checkoutWithMetadata(ctx context.Context, repoURL, ref, rootDir, token string) (string, func(), GitMetadata, error) {
+	return s.checkoutInternal(ctx, repoURL, ref, rootDir, token, true)
+}
+
+func (s githubSource) checkoutInternal(ctx context.Context, repoURL, ref, rootDir, token string, includeMetadata bool) (string, func(), GitMetadata, error) {
+	if ctx == nil {
+		return "", nil, GitMetadata{}, errors.New("checkout context must not be nil")
+	}
+	cloneURL, err := canonicalGitHubURL(repoURL)
+	if err != nil {
+		return "", nil, GitMetadata{}, err
 	}
 	if err := validateRef(ref); err != nil {
-		return "", nil, err
+		return "", nil, GitMetadata{}, err
 	}
 	subdir, err := cleanRootDir(rootDir)
 	if err != nil {
-		return "", nil, err
+		return "", nil, GitMetadata{}, err
 	}
 	if s.run == nil {
-		return "", nil, errors.New("git runner is not configured")
+		return "", nil, GitMetadata{}, errors.New("git runner is not configured")
 	}
 	timeout := s.timeout
 	if timeout <= 0 {
@@ -91,36 +137,36 @@ func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir, token
 	}
 	workspace, err := os.MkdirTemp(tempDir, "paas-source-")
 	if err != nil {
-		return "", nil, fmt.Errorf("create source workspace: %w", err)
+		return "", nil, GitMetadata{}, fmt.Errorf("create source workspace: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(workspace) }
 	if err := os.Chmod(workspace, 0700); err != nil {
 		cleanup()
-		return "", nil, fmt.Errorf("secure source workspace: %w", err)
+		return "", nil, GitMetadata{}, fmt.Errorf("secure source workspace: %w", err)
 	}
 	gitWorkDir, err := prepareGitWorkspace(workspace, s.buildUser)
 	if err != nil {
 		cleanup()
-		return "", nil, err
+		return "", nil, GitMetadata{}, err
 	}
 
 	repoDir := filepath.Join(gitWorkDir, "repo")
 	if strings.ContainsAny(token, "\r\n") {
 		cleanup()
-		return "", nil, errors.New("GitHub token contains an invalid line break")
+		return "", nil, GitMetadata{}, errors.New("GitHub token contains an invalid line break")
 	}
 	askpassPath := ""
 	if token != "" {
 		askpassPath = filepath.Join(workspace, "git-askpass")
 		if err := os.WriteFile(askpassPath, []byte(githubAskpassScript), 0500); err != nil {
 			cleanup()
-			return "", nil, fmt.Errorf("create private Git credential helper: %w", err)
+			return "", nil, GitMetadata{}, fmt.Errorf("create private Git credential helper: %w", err)
 		}
 		// The Linux checkout account must be able to execute the helper while
 		// the token remains available only in the process environment.
 		if err := os.Chmod(askpassPath, 0555); err != nil {
 			cleanup()
-			return "", nil, fmt.Errorf("secure private Git credential helper: %w", err)
+			return "", nil, GitMetadata{}, fmt.Errorf("secure private Git credential helper: %w", err)
 		}
 	}
 	env := gitEnvironment(token, askpassPath)
@@ -132,7 +178,7 @@ func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir, token
 		"clone", "--quiet", "--no-checkout", "--depth=1", "--no-tags", "--", cloneURL, repoDir,
 	); err != nil {
 		cleanup()
-		return "", nil, fmt.Errorf("clone GitHub repository: %w", err)
+		return "", nil, GitMetadata{}, fmt.Errorf("clone GitHub repository: %w", err)
 	}
 
 	if ref != "" {
@@ -144,7 +190,7 @@ func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir, token
 			"-C", repoDir, "fetch", "--quiet", "--depth=1", "origin", ref,
 		); err != nil {
 			cleanup()
-			return "", nil, fmt.Errorf("fetch repository ref: %w", err)
+			return "", nil, GitMetadata{}, fmt.Errorf("fetch repository ref: %w", err)
 		}
 	}
 
@@ -160,7 +206,7 @@ func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir, token
 		"-C", repoDir, "checkout", "--quiet", "--detach", checkoutTarget,
 	); err != nil {
 		cleanup()
-		return "", nil, fmt.Errorf("check out repository source: %w", err)
+		return "", nil, GitMetadata{}, fmt.Errorf("check out repository source: %w", err)
 	}
 
 	selected := repoDir
@@ -169,9 +215,55 @@ func (s githubSource) checkout(ctx context.Context, repoURL, ref, rootDir, token
 	}
 	if err := verifySourceTree(repoDir, selected, subdir); err != nil {
 		cleanup()
-		return "", nil, err
+		return "", nil, GitMetadata{}, err
 	}
-	return selected, cleanup, nil
+	var metadata GitMetadata
+	if includeMetadata {
+		metadata, err = gitMetadata(checkoutCtx, env, workspace, s.buildUser, repoDir, cloneURL)
+		if err != nil {
+			cleanup()
+			return "", nil, GitMetadata{}, err
+		}
+	}
+	return selected, cleanup, metadata, nil
+}
+
+func gitMetadata(ctx context.Context, env []string, directory, buildUser, repoDir, cloneURL string) (GitMetadata, error) {
+	command := exec.CommandContext(ctx, "git", "-C", repoDir, "show", "-s", "--format=%H%x00%an%x00%ae%x00%B", "HEAD")
+	command.Dir = directory
+	command.Env = env
+	if err := configureGitCommand(command, buildUser); err != nil {
+		return GitMetadata{}, fmt.Errorf("read selected commit metadata: %w", err)
+	}
+	var metadataOutput boundedMetadataOutput
+	command.Stdout = &metadataOutput
+	command.Stderr = io.Discard
+	err := command.Run()
+	output := metadataOutput.Bytes()
+	if err != nil {
+		if ctx.Err() != nil {
+			return GitMetadata{}, ctx.Err()
+		}
+		return GitMetadata{}, errors.New("read selected commit metadata")
+	}
+	if metadataOutput.tooLarge {
+		return GitMetadata{}, errors.New("selected commit metadata is too large")
+	}
+	parts := strings.SplitN(string(output), "\x00", 4)
+	if len(parts) != 4 {
+		return GitMetadata{}, errors.New("selected commit metadata is invalid")
+	}
+	sha := strings.TrimSpace(parts[0])
+	if len(sha) != 40 && len(sha) != 64 {
+		return GitMetadata{}, errors.New("selected commit SHA is invalid")
+	}
+	for _, r := range sha {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return GitMetadata{}, errors.New("selected commit SHA is invalid")
+		}
+	}
+	repoURL := strings.TrimSuffix(cloneURL, ".git")
+	return GitMetadata{CommitSHA: sha, Author: strings.TrimSpace(parts[1]), AuthorEmail: strings.TrimSpace(parts[2]), Message: strings.TrimRight(parts[3], "\r\n"), URL: repoURL + "/commit/" + sha}, nil
 }
 
 const githubAskpassScript = "#!/bin/sh\ncase \"$1\" in\n  *Username*) printf '%s\\n' 'x-access-token' ;;\n  *) printf '%s\\n' \"$GITHUB_TOKEN\" ;;\nesac\n"
@@ -373,4 +465,21 @@ func verifySourceTree(repoDir, selected, subdir string) error {
 		return fmt.Errorf("inspect repository source: %w", err)
 	}
 	return nil
+}
+
+// Drain oversized metadata without retaining an unbounded commit message.
+type boundedMetadataOutput struct {
+	bytes.Buffer
+	tooLarge bool
+}
+
+func (w *boundedMetadataOutput) Write(data []byte) (int, error) {
+	size := len(data)
+	remaining := (16 << 10) - w.Len()
+	if size > remaining {
+		w.tooLarge = true
+		data = data[:remaining]
+	}
+	_, err := w.Buffer.Write(data)
+	return size, err
 }

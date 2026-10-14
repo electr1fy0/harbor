@@ -2,6 +2,7 @@
 package builder
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,9 +15,12 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,6 +45,7 @@ type GoBuilder struct {
 	dataDir   string
 	buildUser string
 	timeout   time.Duration
+	cacheMu   sync.RWMutex
 }
 
 // New creates a Go builder. An empty BuildUser selects paas-build, and a
@@ -55,6 +60,70 @@ func New(opts Options) *GoBuilder {
 		timeout = defaultTimeout
 	}
 	return &GoBuilder{dataDir: opts.DataDir, buildUser: buildUser, timeout: timeout}
+}
+
+// CacheDir returns the builder's persistent cache directory. The caller must
+// not remove it while a build is running; Build serializes cache clearing with
+// all builds performed by this builder instance.
+func (b *GoBuilder) CacheDir() string { return filepath.Join(b.dataDir, "build-cache") }
+
+// PruneCache safely removes the persistent build cache after all builds using
+// this builder have completed. It can be used by app deletion and maintenance.
+func (b *GoBuilder) PruneCache(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("cache-prune context must not be nil")
+	}
+	if err := b.acquireCacheLock(ctx, true); err != nil {
+		return err
+	}
+	defer b.cacheMu.Unlock()
+	cacheDir := filepath.Join(b.dataDir, "build-cache")
+	info, err := os.Lstat(cacheDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect build cache: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("build cache path must be a real directory")
+	}
+	if err := os.RemoveAll(cacheDir); err != nil {
+		return fmt.Errorf("prune build cache: %w", err)
+	}
+	return nil
+}
+
+func (b *GoBuilder) acquireCacheLock(ctx context.Context, exclusive bool) error {
+	if ctx == nil {
+		return fmt.Errorf("build cache context must not be nil")
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if exclusive && b.cacheMu.TryLock() {
+			if err := ctx.Err(); err != nil {
+				b.cacheMu.Unlock()
+				return err
+			}
+			return nil
+		}
+		if !exclusive && b.cacheMu.TryRLock() {
+			if err := ctx.Err(); err != nil {
+				b.cacheMu.RUnlock()
+				return err
+			}
+			return nil
+		}
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 type releaseManifest struct {
@@ -102,6 +171,33 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 		return nil, fmt.Errorf("resolve builder data directory: %w", err)
 	}
 	cacheDir := filepath.Join(dataDir, "build-cache")
+	buildTimeout := req.BuildTimeout
+	if req.BuildTimeout > 0 && (req.BuildTimeout < time.Second || req.BuildTimeout > 30*time.Minute) {
+		return nil, fmt.Errorf("build timeout must be between one second and thirty minutes")
+	}
+	if buildTimeout <= 0 {
+		buildTimeout = b.timeout
+	}
+	if err := b.acquireCacheLock(ctx, req.ClearCache); err != nil {
+		return nil, err
+	}
+	if req.ClearCache {
+		defer b.cacheMu.Unlock()
+	} else {
+		defer b.cacheMu.RUnlock()
+	}
+	if req.ClearCache {
+		if info, statErr := os.Lstat(cacheDir); statErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return nil, fmt.Errorf("build cache path must be a real directory")
+			}
+			if err := os.RemoveAll(cacheDir); err != nil {
+				return nil, fmt.Errorf("clear build cache: %w", err)
+			}
+		} else if !os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("inspect build cache before clearing: %w", statErr)
+		}
+	}
 	if err := prepareBuildCache(dataDir, cacheDir, b.buildUser); err != nil {
 		return nil, err
 	}
@@ -150,21 +246,35 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 	if logFile != nil {
 		output = logFile
 	}
+	var redactedOutput *redactingWriter
+	if output != nil {
+		redactedOutput = newRedactingWriter(output, req.BuildEnvironment)
+		output = redactedOutput
+	}
 
 	env := buildEnvironment(outputDir, homeDir, tempDir, cacheDir, nodeCacheDir)
+	buildEnv, err := buildEnvironmentEntries(req.BuildEnvironment)
+	if err != nil {
+		return nil, err
+	}
+	env = append(env, buildEnv...)
 	if os.Geteuid() == 0 {
 		if err := assignTree(workspace, b.buildUser); err != nil {
 			return nil, err
 		}
 	}
-
-	buildCtx, cancel := context.WithTimeout(ctx, b.timeout)
+	buildCtx, cancel := context.WithTimeout(ctx, buildTimeout)
 	defer cancel()
 	var buildErr error
 	if os.Geteuid() == 0 {
-		buildErr = runSystemd(buildCtx, b.buildUser, b.timeout, sourceRoot, env, output, req.BuildCommand)
+		buildErr = runSystemd(buildCtx, b.buildUser, buildTimeout, sourceRoot, env, output, req.BuildCommand)
 	} else {
 		buildErr = runLocal(buildCtx, sourceRoot, env, output, req.BuildCommand)
+	}
+	if redactedOutput != nil {
+		if flushErr := redactedOutput.Flush(); buildErr == nil && flushErr != nil {
+			buildErr = flushErr
+		}
 	}
 	if buildErr != nil {
 		return nil, fmt.Errorf("build command failed: %w", buildErr)
@@ -234,6 +344,135 @@ func buildEnvironment(outputDir, homeDir, tempDir, cacheDir, nodeCacheDir string
 		)
 	}
 	return env
+}
+
+var buildEnvironmentKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+
+var reservedBuildEnvironment = map[string]struct{}{
+	"PATH": {}, "HOME": {}, "TMPDIR": {}, "PAAS_OUT": {}, "CGO_ENABLED": {},
+	"GOFLAGS": {}, "GOMAXPROCS": {}, "GOCACHE": {}, "GOMODCACHE": {},
+	"npm_config_cache": {}, "npm_config_store_dir": {}, "pnpm_config_store_dir": {},
+	"YARN_CACHE_FOLDER": {}, "YARN_GLOBAL_FOLDER": {},
+}
+
+func buildEnvironmentEntries(entries []string) ([]string, error) {
+	if len(entries) > 100 {
+		return nil, fmt.Errorf("too many build environment values")
+	}
+	values := append([]string(nil), entries...)
+	sort.Strings(values)
+	seen := make(map[string]struct{}, len(values))
+	for _, entry := range values {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || !buildEnvironmentKey.MatchString(key) || strings.ContainsRune(value, '\x00') || len(value) > 65_536 {
+			return nil, fmt.Errorf("invalid build environment value")
+		}
+		if _, reserved := reservedBuildEnvironment[key]; reserved {
+			return nil, fmt.Errorf("build environment key %q is reserved", key)
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return nil, fmt.Errorf("duplicate build environment key %q", key)
+		}
+		seen[key] = struct{}{}
+	}
+	return values, nil
+}
+
+type redactingWriter struct {
+	mu      sync.Mutex
+	dst     io.Writer
+	secrets [][]byte
+	buffer  []byte
+	err     error
+	maxLen  int
+}
+
+func newRedactingWriter(dst io.Writer, environment []string) *redactingWriter {
+	if dst == nil {
+		dst = io.Discard
+	}
+	w := &redactingWriter{dst: dst}
+	for _, entry := range environment {
+		_, value, ok := strings.Cut(entry, "=")
+		if !ok || value == "" {
+			continue
+		}
+		w.secrets = append(w.secrets, []byte(value))
+		if len(value) > w.maxLen {
+			w.maxLen = len(value)
+		}
+	}
+	sort.Slice(w.secrets, func(i, j int) bool { return len(w.secrets[i]) > len(w.secrets[j]) })
+	return w
+}
+
+func (w *redactingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return 0, w.err
+	}
+	if len(w.secrets) == 0 {
+		n, err := w.dst.Write(p)
+		if err != nil {
+			w.err = err
+		}
+		return n, err
+	}
+	w.buffer = append(w.buffer, p...)
+	if err := w.drain(false); err != nil {
+		w.err = err
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (w *redactingWriter) drain(final bool) error {
+	limit := len(w.buffer)
+	if !final {
+		limit = len(w.buffer) - w.maxLen + 1
+		if limit <= 0 {
+			return nil
+		}
+	}
+	var output []byte
+	consumed := 0
+	for consumed < limit {
+		matched := 0
+		for _, secret := range w.secrets {
+			if len(secret) <= len(w.buffer)-consumed && bytes.Equal(w.buffer[consumed:consumed+len(secret)], secret) {
+				matched = len(secret)
+				break
+			}
+		}
+		if matched > 0 {
+			output = append(output, []byte("[redacted]")...)
+			consumed += matched
+		} else {
+			output = append(output, w.buffer[consumed])
+			consumed++
+		}
+	}
+	if len(output) != 0 {
+		if _, err := w.dst.Write(output); err != nil {
+			return err
+		}
+	}
+	w.buffer = append(w.buffer[:0], w.buffer[consumed:]...)
+	return nil
+}
+
+func (w *redactingWriter) Flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return w.err
+	}
+	if err := w.drain(true); err != nil {
+		w.err = err
+		return err
+	}
+	return nil
 }
 
 // prepareNodeBuildCache returns persistent per-application package-manager

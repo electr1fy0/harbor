@@ -21,6 +21,20 @@ type BuildRequest struct {
 	BuildCommand string
 	StartCommand string
 	LogPath      string
+	// BuildEnvironment contains explicitly selected KEY=VALUE pairs used only
+	// while running the build command. Values must never be returned to clients.
+	BuildEnvironment []string
+	BuildTimeout     time.Duration
+	ClearCache       bool
+}
+
+// DeployOptions carries per-deployment build controls through the lifecycle
+// service to the builder. Empty values preserve the builder's configured
+// defaults.
+type DeployOptions struct {
+	BuildEnvironment map[string]string
+	BuildTimeout     time.Duration
+	ClearCache       bool
 }
 
 // Release identifies an immutable build artifact.
