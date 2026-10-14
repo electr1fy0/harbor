@@ -47,6 +47,18 @@ import { formatDate, shortHash } from "@/components/app/format"
 import { PageError, PageLoading } from "@/components/app/page-state"
 import { StatusBadge } from "@/components/app/status-badge"
 import { ProjectSettings } from "@/components/app/project-settings"
+import { AdvancedLogs } from "@/components/app/advanced-logs"
+import { AppObservability } from "@/components/app/app-observability"
+import { AppAutomation } from "@/components/app/app-automation"
+import {
+  OperationsPanel,
+  AttemptTimeline,
+  useOperations,
+  type AttemptHistory,
+} from "@/components/app/app-operations"
+import { EnvironmentImport } from "@/components/app/environment-import"
+import { useFeatureAction } from "@/components/app/feature-card"
+import { featureCall } from "@/lib/features"
 import {
   appQueryOptions,
   deploymentJobQueryOptions,
@@ -72,8 +84,28 @@ type PendingAction =
 
 function ProjectDetailPage() {
   const { name } = Route.useParams()
+  return <ProjectDetailContent key={name} name={name} />
+}
+function ProjectDetailContent({ name }: { name: string }) {
   const queryClient = useQueryClient()
   const details = useQuery(appQueryOptions(name))
+  const operations = useOperations(name)
+  const operationalAction = useFeatureAction("operations")
+  const sourceAvailability = useQuery({
+    queryKey: ["harbor", "source", name],
+    queryFn: () => featureCall("automation", { action: "getSource", name }),
+    retry: false,
+  })
+  const attemptsQuery = useQuery({
+    queryKey: ["harbor", "attempts", name, "selector"],
+    queryFn: () =>
+      featureCall<AttemptHistory>("operations", {
+        action: "history",
+        appName: name,
+        limit: 100,
+      }),
+    refetchInterval: 5000,
+  })
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null)
   const [activeTab, setActiveTab] = useState("history")
   const [jobID, setJobID] = useState("")
@@ -225,6 +257,56 @@ function ProjectDetailPage() {
               Open app <IconExternalLink data-icon="inline-end" />
             </a>
           ) : null}
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={
+              operationalAction.isPending ||
+              (!production &&
+                !releases.some((release) => release.artifactAvailable))
+            }
+            onClick={() =>
+              operationalAction.mutate({
+                action: production ? "restart" : "start",
+                appName: name,
+              })
+            }
+          >
+            {production ? "Restart" : "Start"}
+          </Button>
+          {sourceAvailability.data ? (
+            <Button
+              size="sm"
+              disabled={retryMutation.isPending}
+              onClick={() => retryMutation.mutate()}
+            >
+              Redeploy
+            </Button>
+          ) : null}
+          {latestAttempt &&
+          latestAttempt.ID !== production?.ID &&
+          [
+            "QUEUED",
+            "BUILDING",
+            "BUILT",
+            "STARTING",
+            "HEALTH_CHECKING",
+          ].includes(latestAttempt.State) ? (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={operationalAction.isPending}
+              onClick={() =>
+                operationalAction.mutate({
+                  action: "cancelCandidate",
+                  appName: name,
+                  deploymentId: latestAttempt.ID,
+                })
+              }
+            >
+              Cancel deployment
+            </Button>
+          ) : null}
           {canStop ? (
             <Button
               variant="outline"
@@ -238,6 +320,24 @@ function ProjectDetailPage() {
         </div>
       </div>
 
+      {operations.data?.operations.pendingSettings ? (
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm">
+          <p>Saved configuration has not been applied to the running app.</p>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={operationalAction.isPending}
+            onClick={() =>
+              operationalAction.mutate({
+                action: production ? "restart" : "start",
+                appName: name,
+              })
+            }
+          >
+            Apply saved configuration
+          </Button>
+        </div>
+      ) : null}
       {details.isError ? (
         <div className="mb-5 rounded-lg border border-[#edc8c5] bg-[#fcf0ef] px-3 py-2 text-sm text-[#a4463f]">
           {details.error.message}
@@ -549,7 +649,10 @@ function ProjectDetailPage() {
           className="gap-4"
         >
           <div className="flex flex-col gap-3 border-b border-border/70 sm:flex-row sm:items-center sm:justify-between">
-            <TabsList variant="line" className="h-9 rounded-none px-0">
+            <TabsList
+              variant="line"
+              className="h-auto flex-wrap rounded-none px-0"
+            >
               <TabsTrigger value="history" className="flex-none gap-1.5 px-2.5">
                 <IconClock size={14} />
                 Release history
@@ -558,6 +661,10 @@ function ProjectDetailPage() {
                 <IconTerminal2 size={14} />
                 Logs
               </TabsTrigger>
+              <TabsTrigger value="attempts">Attempts</TabsTrigger>
+              <TabsTrigger value="automation">Automation</TabsTrigger>
+              <TabsTrigger value="observability">Metrics & routing</TabsTrigger>
+              <TabsTrigger value="operations">Operations</TabsTrigger>
               <TabsTrigger value="settings" className="flex-none px-2.5">
                 Settings
               </TabsTrigger>
@@ -584,24 +691,46 @@ function ProjectDetailPage() {
             )}
           </TabsContent>
           <TabsContent value="logs">
-            {details.data.logs.trim() ? (
-              <pre className="max-h-[540px] overflow-auto rounded-xl border border-[#242927] bg-[#202726] p-4 font-mono text-xs leading-6 text-[#e6ebe7] shadow-sm">
-                <code>{details.data.logs}</code>
-              </pre>
-            ) : (
-              <Card className="border-dashed bg-white/70 shadow-none">
-                <CardContent className="py-8 text-center text-sm text-muted-foreground">
-                  No logs are available for the latest deployment attempt.
-                </CardContent>
-              </Card>
-            )}
+            <AdvancedLogs
+              name={name}
+              productionId={production?.ID}
+              attempts={(attemptsQuery.data?.deployments ?? []).map(
+                (entry) => ({
+                  id: entry.deployment.id,
+                  state: entry.deployment.state,
+                })
+              )}
+            />
+          </TabsContent>
+          <TabsContent value="attempts">
+            <AttemptTimeline name={name} />
+          </TabsContent>
+          <TabsContent value="automation">
+            <AppAutomation name={name} />
+          </TabsContent>
+          <TabsContent value="observability">
+            <AppObservability
+              name={name}
+              domains={details.data.settings.domains}
+            />
+          </TabsContent>
+          <TabsContent value="operations">
+            <OperationsPanel name={name} />
           </TabsContent>
           <TabsContent value="settings">
-            <ProjectSettings
-              name={name}
-              settings={details.data.settings}
-              onSaved={async () => refresh()}
-            />
+            <div className="grid gap-4">
+              <ProjectSettings
+                key={name}
+                name={name}
+                settings={details.data.settings}
+                onSaved={async () => refresh()}
+              />
+              <EnvironmentImport
+                key={name}
+                name={name}
+                existingKeys={details.data.settings.environmentKeys}
+              />
+            </div>
           </TabsContent>
         </Tabs>
       </section>
@@ -743,10 +872,15 @@ function ReleaseHistoryTable({
             <Button
               variant="outline"
               size="xs"
-              disabled={row.original.isActive || rollbackPending}
+              disabled={
+                row.original.isActive ||
+                !row.original.artifactAvailable ||
+                rollbackPending
+              }
               onClick={() => onRollback(row.original)}
             >
-              <IconRotateClockwise data-icon="inline-start" /> Roll back
+              <IconRotateClockwise data-icon="inline-start" />{" "}
+              {row.original.artifactAvailable ? "Roll back" : "Artifact pruned"}
             </Button>
           ),
         }),

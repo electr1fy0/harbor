@@ -70,6 +70,10 @@ async function requestJSON<T>(
 }
 
 export type DashboardFunctionName =
+  | "operations"
+  | "automation"
+  | "dataServices"
+  | "observe"
   | "getOverview"
   | "getApp"
   | "getAppSettings"

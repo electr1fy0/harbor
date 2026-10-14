@@ -1,5 +1,5 @@
-import { useMemo, useState, type ReactNode } from "react"
-import { useQuery } from "@tanstack/react-query"
+import { useState, type ReactNode } from "react"
+import { useQuery, useQueries } from "@tanstack/react-query"
 import { createFileRoute, Link } from "@tanstack/react-router"
 import {
   IconArrowUpRight,
@@ -18,6 +18,8 @@ import { PageError, PageLoading } from "@/components/app/page-state"
 import { PageHeader } from "@/components/app/page-header"
 import { StatusBadge } from "@/components/app/status-badge"
 import { overviewQueryOptions } from "@/lib/queries"
+import { featureCall } from "@/lib/features"
+import type { OperationSettings } from "@/components/app/app-operations"
 import type { AppView } from "@/lib/types"
 
 export const Route = createFileRoute("/")({ component: ProjectsPage })
@@ -26,13 +28,43 @@ function ProjectsPage() {
   const [search, setSearch] = useState("")
   const overview = useQuery(overviewQueryOptions())
   const apps = overview.data?.apps ?? []
-  const filteredApps = useMemo(
-    () =>
-      apps.filter((app) =>
-        app.Application.Name.toLowerCase().includes(search.trim().toLowerCase())
-      ),
-    [apps, search]
+  const [showArchived, setShowArchived] = useState(false)
+  const [favoritesOnly, setFavoritesOnly] = useState(false)
+  const metadataQueries = useQueries({
+    queries: apps.map((app) => ({
+      queryKey: ["harbor", "operation-settings", app.Application.Name],
+      queryFn: () =>
+        featureCall<{ operations: OperationSettings }>("operations", {
+          action: "settings",
+          appName: app.Application.Name,
+        }),
+      staleTime: 10000,
+      refetchInterval: 15000,
+    })),
+  })
+  const metadata = Object.fromEntries(
+    apps.map((app, i) => [
+      app.Application.Name,
+      metadataQueries[i]?.data?.operations,
+    ])
   )
+  const filteredApps = apps
+    .filter((app) => {
+      const meta = metadata[app.Application.Name]
+      return (
+        (showArchived || !meta?.archived) &&
+        (!favoritesOnly || meta?.favorite) &&
+        [app.Application.Name, ...(meta?.tags ?? [])]
+          .join(" ")
+          .toLowerCase()
+          .includes(search.trim().toLowerCase())
+      )
+    })
+    .sort(
+      (a, b) =>
+        Number(metadata[b.Application.Name]?.favorite ?? false) -
+        Number(metadata[a.Application.Name]?.favorite ?? false)
+    )
   const running = apps.filter(
     (app) => app.Production?.State.toLowerCase() === "running"
   ).length
@@ -112,18 +144,36 @@ function ProjectsPage() {
             <h2 className="text-[15px] font-semibold tracking-tight">
               All projects
             </h2>
-            <div className="relative w-full sm:max-w-[270px]">
-              <IconSearch
-                size={16}
-                className="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-muted-foreground"
-              />
-              <Input
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search projects"
-                className="h-9 pl-8"
-                aria-label="Search projects"
-              />
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-1.5 text-xs">
+                <input
+                  type="checkbox"
+                  checked={favoritesOnly}
+                  onChange={(e) => setFavoritesOnly(e.target.checked)}
+                />
+                Favorites
+              </label>
+              <label className="flex items-center gap-1.5 text-xs">
+                <input
+                  type="checkbox"
+                  checked={showArchived}
+                  onChange={(e) => setShowArchived(e.target.checked)}
+                />
+                Include archived
+              </label>
+              <div className="relative w-full sm:max-w-[270px]">
+                <IconSearch
+                  size={16}
+                  className="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-muted-foreground"
+                />
+                <Input
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Search projects"
+                  className="h-9 pl-8"
+                  aria-label="Search projects"
+                />
+              </div>
             </div>
           </div>
         ) : null}
@@ -152,7 +202,11 @@ function ProjectsPage() {
         ) : (
           <div className="grid gap-3 xl:grid-cols-2">
             {filteredApps.map((app) => (
-              <ProjectCard key={app.Application.ID} app={app} />
+              <ProjectCard
+                key={app.Application.ID}
+                app={app}
+                metadata={metadata[app.Application.Name]}
+              />
             ))}
           </div>
         )}
@@ -193,7 +247,13 @@ function SummaryMetric({
   )
 }
 
-function ProjectCard({ app }: { app: AppView }) {
+function ProjectCard({
+  app,
+  metadata,
+}: {
+  app: AppView
+  metadata?: OperationSettings
+}) {
   const production = app.Production
   const latestAttempt = app.LatestAttempt
   const state = production?.State ?? latestAttempt?.State ?? "Not deployed"
@@ -215,7 +275,9 @@ function ProjectCard({ app }: { app: AppView }) {
               </span>
               <div className="min-w-0">
                 <h3 className="truncate text-sm font-semibold tracking-[-0.015em] group-hover:text-primary-foreground">
+                  {metadata?.favorite ? "★ " : ""}
                   {app.Application.Name}
+                  {metadata?.archived ? " · Archived" : ""}
                 </h3>
               </div>
             </div>
@@ -224,6 +286,11 @@ function ProjectCard({ app }: { app: AppView }) {
               className="mt-0.5 shrink-0 text-muted-foreground/60 group-hover:text-primary-foreground"
             />
           </div>
+          {metadata?.tags.length ? (
+            <p className="text-xs text-muted-foreground">
+              {metadata.tags.join(" · ")}
+            </p>
+          ) : null}
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3">
             <StatusBadge state={state} />
             <span className="text-[11px] text-muted-foreground">

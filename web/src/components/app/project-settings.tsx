@@ -1,6 +1,11 @@
 import { useState, type FormEvent } from "react"
 import { useMutation } from "@tanstack/react-query"
-import { IconCirclePlus, IconKey, IconTrash, IconWorld } from "@tabler/icons-react"
+import {
+  IconCirclePlus,
+  IconKey,
+  IconTrash,
+  IconWorld,
+} from "@tabler/icons-react"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -32,7 +37,9 @@ export function ProjectSettings({
   const [environmentValue, setEnvironmentValue] = useState("")
   const [memoryLimit, setMemoryLimit] = useState(settings.memoryLimit)
   const [cpuQuota, setCpuQuota] = useState(String(settings.cpuQuota || ""))
-  const [tasksLimit, setTasksLimit] = useState(String(settings.tasksLimit || ""))
+  const [tasksLimit, setTasksLimit] = useState(
+    String(settings.tasksLimit || "")
+  )
   const [message, setMessage] = useState("")
 
   const updateMutation = useMutation({
@@ -46,7 +53,8 @@ export function ProjectSettings({
       setMessage("")
       await onSaved(updated)
     },
-    onError: (error) => setMessage(error.message || "Could not update settings."),
+    onError: (error) =>
+      setMessage(error.message || "Could not update settings."),
   })
 
   const pending = updateMutation.isPending
@@ -90,8 +98,16 @@ export function ProjectSettings({
     event.preventDefault()
     const cpu = Number(cpuQuota)
     const tasks = Number(tasksLimit)
-    if (!memoryLimit.trim() || !Number.isFinite(cpu) || cpu <= 0 || !Number.isInteger(tasks) || tasks <= 0) {
-      setMessage("Enter a memory limit, positive CPU quota, and positive task limit.")
+    if (
+      !memoryLimit.trim() ||
+      !Number.isFinite(cpu) ||
+      cpu <= 0 ||
+      !Number.isInteger(tasks) ||
+      tasks <= 0
+    ) {
+      setMessage(
+        "Enter a memory limit, positive CPU quota, and positive task limit."
+      )
       return
     }
     updateMutation.mutate({
@@ -149,7 +165,10 @@ export function ProjectSettings({
               No custom domains are configured.
             </p>
           )}
-          <form className="flex flex-col gap-2 sm:flex-row" onSubmit={addDomain}>
+          <form
+            className="flex flex-col gap-2 sm:flex-row"
+            onSubmit={addDomain}
+          >
             <Input
               aria-label="Domain name"
               placeholder="app.example.com"
@@ -170,7 +189,9 @@ export function ProjectSettings({
             <IconKey size={18} />
           </span>
           <div>
-            <CardTitle className="text-sm">Runtime environment secrets</CardTitle>
+            <CardTitle className="text-sm">
+              Runtime environment secrets
+            </CardTitle>
             <CardDescription className="mt-1 leading-5">
               Harbor stores values server-side and shows key names only. Updates
               take effect on the next deployment.
@@ -206,7 +227,10 @@ export function ProjectSettings({
               No environment secrets are configured.
             </p>
           )}
-          <form className="grid gap-3 sm:grid-cols-[minmax(120px,0.7fr)_minmax(180px,1fr)_auto] sm:items-end" onSubmit={saveEnvironment}>
+          <form
+            className="grid gap-3 sm:grid-cols-[minmax(120px,0.7fr)_minmax(180px,1fr)_auto] sm:items-end"
+            onSubmit={saveEnvironment}
+          >
             <div className="space-y-2">
               <Label htmlFor="environment-key">Key</Label>
               <Input
@@ -245,7 +269,32 @@ export function ProjectSettings({
           </CardDescription>
         </CardHeader>
         <CardContent className="pt-4">
-          <form className="grid gap-3 sm:grid-cols-4 sm:items-end" onSubmit={saveResources}>
+          <div className="mb-4 flex flex-wrap gap-2">
+            {[
+              { name: "Tiny", memory: "128Mi", cpu: "0.25", tasks: "64" },
+              { name: "Small", memory: "512Mi", cpu: "0.5", tasks: "128" },
+              { name: "Medium", memory: "1Gi", cpu: "1", tasks: "256" },
+            ].map((preset) => (
+              <Button
+                key={preset.name}
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={pending}
+                onClick={() => {
+                  setMemoryLimit(preset.memory)
+                  setCpuQuota(preset.cpu)
+                  setTasksLimit(preset.tasks)
+                }}
+              >
+                {preset.name} · {preset.memory}
+              </Button>
+            ))}
+          </div>
+          <form
+            className="grid gap-3 sm:grid-cols-4 sm:items-end"
+            onSubmit={saveResources}
+          >
             <div className="space-y-2">
               <Label htmlFor="memory-limit">Memory</Label>
               <Input
@@ -288,7 +337,10 @@ export function ProjectSettings({
       </Card>
 
       {message ? (
-        <p role="alert" className="rounded-lg border border-[#edc8c5] bg-[#fcf0ef] px-3 py-2.5 text-sm text-[#a4463f]">
+        <p
+          role="alert"
+          className="rounded-lg border border-[#edc8c5] bg-[#fcf0ef] px-3 py-2.5 text-sm text-[#a4463f]"
+        >
           {message}
         </p>
       ) : null}

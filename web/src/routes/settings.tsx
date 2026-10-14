@@ -14,11 +14,13 @@ import { ConnectionBanner } from "@/components/app/connection-banner"
 import { PageLoading } from "@/components/app/page-state"
 import { PageHeader } from "@/components/app/page-header"
 import { overviewQueryOptions } from "@/lib/queries"
+import { FeatureCard, useFeatureAction } from "@/components/app/feature-card"
 
 export const Route = createFileRoute("/settings")({ component: SettingsPage })
 
 function SettingsPage() {
   const overview = useQuery(overviewQueryOptions())
+  const pruneCache = useFeatureAction("operations")
 
   if (overview.isPending) return <PageLoading rows={2} />
   const connected = Boolean(overview.data?.connected)
@@ -37,6 +39,18 @@ function SettingsPage() {
       ) : null}
 
       <div className="grid max-w-4xl gap-4">
+        <FeatureCard
+          title="Build cache cleanup"
+          description="Remove cached dependencies and build intermediates when no build holds the cache. The next build repopulates it."
+        >
+          <Button
+            variant="outline"
+            disabled={pruneCache.isPending || !connected}
+            onClick={() => pruneCache.mutate({ action: "pruneCache" })}
+          >
+            {pruneCache.isPending ? "Cleaning…" : "Prune build cache"}
+          </Button>
+        </FeatureCard>
         <Card className="border-border/80 bg-white">
           <CardHeader className="flex-row items-start gap-3 border-b border-border/60 pb-4">
             <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[#f5f6f4] text-muted-foreground">
@@ -89,8 +103,8 @@ function SettingsPage() {
               />
               <p>
                 Public repositories need no token. For private repositories,
-                connect a GitHub token from the import page. Harbor stores it
-                in the daemon's private data directory. A daemon-side{" "}
+                connect a GitHub token from the import page. Harbor stores it in
+                the daemon's private data directory. A daemon-side{" "}
                 <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
                   GITHUB_TOKEN
                 </code>{" "}
@@ -139,9 +153,7 @@ function SettingsPage() {
                 Terminal 2 · dashboard
               </p>
               <pre className="overflow-x-auto rounded-lg bg-[#202726] p-3 font-mono text-xs leading-5 text-[#e6ebe7]">
-                <code>
-                  {"cd web\nbun install\nbun run dev"}
-                </code>
+                <code>{"cd web\nbun install\nbun run dev"}</code>
               </pre>
             </div>
             <p className="text-xs leading-5">

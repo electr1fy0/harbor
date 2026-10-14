@@ -25,8 +25,8 @@ The dashboard can browse public repositories by owner and accepts GitHub HTTPS
 repository URLs. A user can connect a personal access token to browse private
 repositories and clone them. The token is sent to the Go API and stored by the
 daemon in its private data directory; the API returns connection metadata only.
-Legacy `GITHUB_TOKEN` configuration is also read by the daemon. GitHub OAuth and
-automatic push deployments are not implemented.
+Legacy `GITHUB_TOKEN` configuration is also read by the daemon. GitHub OAuth is not implemented. The project Automation tab supports signed
+GitHub push callbacks and authenticated CI deployment hooks.
 
 The daemon inspects `paas.yaml` or detects supported Go and Node layouts, then
 lets the user review build settings, runtime environment values, and an optional
@@ -45,6 +45,15 @@ documented in [`../deploy/README.md`](../deploy/README.md).
 The frontend build writes static files to `web/dist`. `make build` installs and
 builds the SPA before compiling `paasd`, which embeds those assets. Production
 serving uses the Go binary and does not need a Bun server process.
+
+## Operations, data services, and observability
+
+Project tabs expose operations, all deployment attempts and events, repository
+automation, incremental redacted logs, historical metrics, maintenance and
+primary-domain routing, notifications, and diagnostic exports. The Services
+page manages SQLite bindings, snapshots, scheduled retention, verification,
+clone restore, and encrypted Harbor exports. See [`../docs/features.md`](../docs/features.md)
+for behavior, authentication, limits, and the first 50 feature coverage map.
 
 ## Checks
 

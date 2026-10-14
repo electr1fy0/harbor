@@ -117,6 +117,7 @@ export interface ReleaseView {
   runtime: string
   createdAt: string
   isActive: boolean
+  artifactAvailable: boolean
 }
 
 export interface Overview {

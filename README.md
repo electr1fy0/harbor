@@ -39,7 +39,8 @@ you review generated settings. Add runtime environment values and optionally
 create or bind a managed SQLite service, then follow asynchronous deployment
 progress. Saved GitHub source details support retry without resetting application
 settings. See [docs/onboarding.md](docs/onboarding.md) for permissions and API details.
-GitHub OAuth and webhook-triggered deployments are not implemented. Legacy daemon
+GitHub OAuth is not implemented. Signed GitHub push callbacks and authenticated
+CI deployment hooks are available in the Automation tab. Legacy daemon
 `GITHUB_TOKEN` configuration is supported; a dashboard connection is preferred.
 Repository checkouts reject symlinks, path traversal, non-GitHub hosts, and embedded
 URL credentials; Git must be installed on the daemon host.
@@ -70,6 +71,13 @@ latest attempt. Failed candidates keep the healthy version serving traffic and
 show a bounded, redacted log excerpt with available retry, settings, and rollback
 actions. See [docs/diagnostics.md](docs/diagnostics.md) for the evidence and action
 boundaries.
+
+## Operations and automation
+
+See [docs/features.md](docs/features.md) for app start/restart and cancellation,
+deployment history and events, GitHub/CI automation, build settings, SQLite
+backups and clone restore, encrypted exports, historical metrics, routing
+policies, notifications, health recovery, retention, and dashboard workflows.
 
 ## Linux setup and demo
 
@@ -142,7 +150,9 @@ Success returns a release ID, port, and URL. Failed deployments persist
 BUILD_FAILED, START_FAILED, or UNHEALTHY with errors/logs, and get no route.
 Unexpected runtime exits become CRASHED; memory-limit kills become OOM_KILLED.
 Exits of the active runtime withdraw its route. Unknown hosts
-return 404. The logs command combines build output with up to 500 journal entries, bounded to 1 MiB; rotation/streaming are not implemented.
+return 404. The logs command combines build output with up to 500 journal entries, bounded
+to 1 MiB. The dashboard adds cursor-based log following, deployment/source
+selection, search, and redacted downloads; file rotation is not implemented.
 
 Redeployment builds and checks a candidate on a separate loopback port before
 atomically switching traffic. Candidate failures preserve the active version.
