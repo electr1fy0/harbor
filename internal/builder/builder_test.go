@@ -17,6 +17,7 @@ import (
 
 	"paas/internal/config"
 	"paas/internal/contracts"
+	"paas/internal/fsutil"
 	"paas/internal/sandbox"
 )
 
@@ -552,6 +553,11 @@ func shellQuote(value string) string {
 func TestSelectedBuildEnvironmentIsInjectedAndRedactedInActualBuild(t *testing.T) {
 	skipRootBuild(t)
 	dir := t.TempDir()
+	t.Cleanup(func() {
+		if err := fsutil.RemoveReadonlyTree(dir); err != nil {
+			t.Errorf("clean immutable fixture: %v", err)
+		}
+	})
 	sourceDir := filepath.Join(dir, "source")
 	if err := os.Mkdir(sourceDir, 0700); err != nil {
 		t.Fatal(err)
