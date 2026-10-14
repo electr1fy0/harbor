@@ -48,6 +48,30 @@ type blockedStartSandbox struct {
 	entered chan struct{}
 }
 
+type gatedStartSandbox struct {
+	contracts.Sandbox
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type sandboxKindOverride struct {
+	contracts.Sandbox
+	kind string
+}
+
+func (s *sandboxKindOverride) Kind() string { return s.kind }
+
+func (s *gatedStartSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) (*contracts.SandboxHandle, error) {
+	s.once.Do(func() { close(s.entered) })
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.release:
+	}
+	return s.Sandbox.Start(ctx, spec)
+}
+
 func (s *blockedStartSandbox) Start(ctx context.Context, _ contracts.SandboxSpec) (*contracts.SandboxHandle, error) {
 	close(s.entered)
 	<-ctx.Done()
@@ -508,7 +532,7 @@ func newServiceHarness(t *testing.T, contents string) *serviceHarness {
 		t.Fatal(err)
 	}
 	builder := newFakeBuilder()
-	builder.artifactRoot = filepath.Join(root, "artifacts")
+	builder.artifactRoot = filepath.Join(root, "data", "releases")
 	sandbox := newFakeSandbox()
 	routes := router.New()
 	service, err := New(db, builder, sandbox, routes, Options{DataDir: filepath.Join(root, "data"), RuntimeUser: "nobody"})
@@ -630,6 +654,447 @@ func TestDeployAllowsActiveApplicationRedeployAndSwapsRoute(t *testing.T) {
 		dep, getErr := h.db.Deployment(first.ID)
 		return getErr == nil && dep.State == model.Stopped
 	})
+}
+
+func TestRestartAndStartReusePromotedReleaseWithoutBuilding(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.builder.count() != 1 {
+		t.Fatalf("initial build count = %d, want 1", h.builder.count())
+	}
+
+	restarted, err := h.service.Restart(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("Restart() error = %v", err)
+	}
+	if restarted.ID == first.ID || restarted.ReleaseID != first.ReleaseID || h.builder.count() != 1 {
+		t.Fatalf("Restart() = %+v, original=%+v, build count=%d", restarted, first, h.builder.count())
+	}
+	active, err := h.db.ActiveDeployment("demo")
+	if err != nil || active.ID != restarted.ID {
+		t.Fatalf("route after restart = %+v, %v", active, err)
+	}
+
+	if _, err := h.service.Stop(context.Background(), "demo"); err != nil {
+		t.Fatal(err)
+	}
+	started, err := h.service.Start(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if started.ID == restarted.ID || started.ReleaseID != first.ReleaseID || h.builder.count() != 1 {
+		t.Fatalf("Start() = %+v, previous=%+v, build count=%d", started, restarted, h.builder.count())
+	}
+}
+
+func TestReleaseRetentionLabelsRemovedArtifacts(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pruned, err := h.service.ConfigureRetention(context.Background(), "demo", 1)
+	if err != nil {
+		t.Fatalf("ConfigureRetention() error = %v", err)
+	}
+	if len(pruned) != 1 || pruned[0] != first.ReleaseID {
+		t.Fatalf("pruned releases = %v, want only oldest release %s", pruned, first.ReleaseID)
+	}
+	releases, err := h.service.Releases("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	available := map[string]bool{}
+	for _, release := range releases {
+		available[release.ID] = release.ArtifactAvailable
+	}
+	if available[first.ReleaseID] || !available[second.ReleaseID] || !available[third.ReleaseID] {
+		t.Fatalf("release artifact availability = %v, want oldest unavailable and active/previous available", available)
+	}
+	if _, err := h.service.Rollback(context.Background(), "demo", first.ReleaseID); err == nil || !strings.Contains(err.Error(), "removed by retention") {
+		t.Fatalf("rollback of pruned artifact error = %v, want clear retained-history error", err)
+	}
+}
+
+func TestCapacityPreflightDistinguishesBuildFromRestart(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	const candidateBytes = int64(128 << 20)
+	const systemdBuildBytes = int64(512 << 20)
+	buildEstimate, err := h.service.capacityPreflight(context.Background(), "128Mi", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if buildEstimate.CandidateBytes != candidateBytes || !buildEstimate.BuildRequired || buildEstimate.BuildLimitKnown || buildEstimate.BuildBytes != nil || buildEstimate.EstimatedOverlapBytes != nil || buildEstimate.CanFit != nil {
+		t.Fatalf("host build capacity estimate = %+v, expected unavailable build limit", buildEstimate)
+	}
+	restartEstimate, err := h.service.capacityPreflight(context.Background(), "128Mi", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restartEstimate.BuildBytes == nil || *restartEstimate.BuildBytes != 0 || restartEstimate.EstimatedOverlapBytes == nil || *restartEstimate.EstimatedOverlapBytes != candidateBytes || restartEstimate.BuildRequired {
+		t.Fatalf("restart capacity estimate = %+v, expected candidate-only overlap", restartEstimate)
+	}
+	h.service.mu.Lock()
+	h.service.sandbox = &sandboxKindOverride{Sandbox: h.sandbox, kind: "systemd"}
+	h.service.mu.Unlock()
+	systemdEstimate, err := h.service.capacityPreflight(context.Background(), "128Mi", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if systemdEstimate.BuildBytes == nil || *systemdEstimate.BuildBytes != systemdBuildBytes || systemdEstimate.EstimatedOverlapBytes == nil || *systemdEstimate.EstimatedOverlapBytes != candidateBytes+systemdBuildBytes || !systemdEstimate.BuildLimitKnown {
+		t.Fatalf("systemd build capacity estimate = %+v", systemdEstimate)
+	}
+}
+
+func TestOngoingHealthProbeNeedsFailureThresholdBeforeWithdrawingTraffic(t *testing.T) {
+	ready := &atomic.Bool{}
+	ready.Store(true)
+	h := newServiceHarness(t, strings.Replace(testConfig, "start:\n", "health:\n  path: /ready\nstart:\n", 1))
+	h.sandbox.ready = ready
+	deployed, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.SetHealthPolicy("demo", 1, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	ready.Store(false)
+	waitFor(t, "first ongoing health failure", func() bool {
+		operations, settingsErr := h.db.OperationSettings("demo")
+		return settingsErr == nil && operations.HealthStatus == "degraded" && operations.HealthFailureCount == 1
+	})
+	active, err := h.db.ActiveDeployment("demo")
+	if err != nil || active.ID != deployed.ID || active.State != model.Running {
+		t.Fatalf("single transient failure withdrew active runtime: active=%+v err=%v", active, err)
+	}
+	if response := routerRequest(h.router, "demo.localhost", "/app"); response.Code != http.StatusOK {
+		t.Fatalf("route after one failure = %d, want HTTP 200", response.Code)
+	}
+	waitFor(t, "health failure threshold", func() bool {
+		operations, settingsErr := h.db.OperationSettings("demo")
+		latest, latestErr := h.db.Deployment(deployed.ID)
+		return settingsErr == nil && latestErr == nil && operations.HealthStatus == "unhealthy" && latest.State == model.Unhealthy
+	})
+	if _, err := h.db.ActiveDeployment("demo"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("active route after failure threshold = %v, want withdrawn", err)
+	}
+}
+
+func TestCrashRecoveryRestartsPromotedReleaseWithoutBuild(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.ConfigureRestartPolicy(context.Background(), "demo", RestartPolicy{Enabled: true, MaxAttempts: 2, BaseDelaySeconds: 1}); err != nil {
+		t.Fatal(err)
+	}
+	h.sandbox.markExited(first.ID, 17)
+	waitFor(t, "automatic restart after runtime crash", func() bool {
+		active, activeErr := h.db.ActiveDeployment("demo")
+		return activeErr == nil && active.ID != first.ID && active.ReleaseID == first.ReleaseID && active.State == model.Running
+	})
+	if builds := h.builder.count(); builds != 1 {
+		t.Fatalf("automatic recovery ran %d builds, want reuse of the promoted release", builds)
+	}
+	settings, err := h.db.OperationSettings("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.AutomaticRestartEnabled || settings.RestartAttempt != 1 || settings.CrashLoop {
+		t.Fatalf("automatic restart state after recovery = %+v", settings)
+	}
+}
+
+func TestExplicitStopCancelsScheduledAutomaticRestart(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.ConfigureRestartPolicy(context.Background(), "demo", RestartPolicy{Enabled: true, MaxAttempts: 2, BaseDelaySeconds: 2}); err != nil {
+		t.Fatal(err)
+	}
+	h.sandbox.markExited(first.ID, 17)
+	waitFor(t, "scheduled automatic restart", func() bool {
+		settings, settingsErr := h.db.OperationSettings("demo")
+		return settingsErr == nil && settings.NextRestartAt != nil
+	})
+	if _, err := h.service.Stop(context.Background(), "demo"); err != nil {
+		t.Fatalf("Stop() while recovery is scheduled: %v", err)
+	}
+	time.Sleep(2300 * time.Millisecond)
+	if builds := h.builder.count(); builds != 1 {
+		t.Fatalf("automatic restart built after explicit stop: build count=%d", builds)
+	}
+	settings, err := h.db.AppSettings("demo")
+	if err != nil || settings.DesiredRunning {
+		t.Fatalf("desired-running after explicit stop = %+v, %v", settings, err)
+	}
+	if _, err := h.db.ActiveDeployment("demo"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("active deployment after explicit stop = %v, want none", err)
+	}
+}
+
+func TestRecoverResumesPersistedAutomaticRestartDeadline(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	first, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.ConfigureRestartPolicy(context.Background(), "demo", RestartPolicy{Enabled: true, MaxAttempts: 2, BaseDelaySeconds: 1}); err != nil {
+		t.Fatal(err)
+	}
+	appSettings, err := h.db.AppSettings("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := h.db.RecordAutomaticRestart(appSettings.AppID, time.Now().UTC())
+	if err != nil || !plan.ShouldRun || plan.RestartAt == nil {
+		t.Fatalf("persisted restart plan = %+v, %v", plan, err)
+	}
+	h.service, err = New(h.db, h.builder, h.sandbox, h.router, Options{DataDir: h.service.opts.DataDir, RuntimeUser: "nobody"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if _, err := h.db.ActiveDeployment("demo"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("recovery ignored persisted backoff deadline and started early: %v", err)
+	}
+	waitFor(t, "recovered automatic restart deadline", func() bool {
+		active, activeErr := h.db.ActiveDeployment("demo")
+		return activeErr == nil && active.ID != first.ID && active.ReleaseID == first.ReleaseID && active.State == model.Running
+	})
+	if builds := h.builder.count(); builds != 1 {
+		t.Fatalf("recovery ran %d builds, want promoted release reuse", builds)
+	}
+}
+
+func TestRestartHoldsAppAdmissionThroughPromotion(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	production, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gated := &gatedStartSandbox{Sandbox: h.sandbox, entered: make(chan struct{}), release: make(chan struct{})}
+	h.service.mu.Lock()
+	h.service.sandbox = gated
+	h.service.mu.Unlock()
+
+	selected := make(chan struct{})
+	releaseSelection := make(chan struct{})
+	var releaseSelectionOnce sync.Once
+	releaseSelectionNow := func() { releaseSelectionOnce.Do(func() { close(releaseSelection) }) }
+	defer releaseSelectionNow()
+	restartDone := make(chan deployResult, 1)
+	go func() {
+		d, err := h.service.startPromotedReleaseWithSelectionHook(context.Background(), "demo", true, func() {
+			close(selected)
+			<-releaseSelection
+		})
+		restartDone <- deployResult{deployment: d, err: err}
+	}()
+	waitSignal(t, selected, "restart promoted-release selection")
+
+	newDeployDone := make(chan deployResult, 1)
+	go func() {
+		d, err := h.service.Deploy(context.Background(), h.source, "demo")
+		newDeployDone <- deployResult{deployment: d, err: err}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h.service.appLocksMu.Lock()
+		gate := h.service.appLocks["demo"]
+		queued := gate != nil && gate.refs >= 2
+		h.service.appLocksMu.Unlock()
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("new deployment did not queue behind restart's selected release")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if builds := h.builder.count(); builds != 1 {
+		t.Fatalf("queued deployment built while restart was promoting: build count=%d", builds)
+	}
+	releaseSelectionNow()
+	waitSignal(t, gated.entered, "restart sandbox startup")
+	if builds := h.builder.count(); builds != 1 {
+		t.Fatalf("queued deployment built during restart startup: build count=%d", builds)
+	}
+	close(gated.release)
+	restarted := awaitDeploy(t, restartDone)
+	if restarted.err != nil || restarted.deployment.ReleaseID != production.ReleaseID {
+		t.Fatalf("restart result = %+v, want original promoted release %s", restarted, production.ReleaseID)
+	}
+	deployed := awaitDeploy(t, newDeployDone)
+	if deployed.err != nil || deployed.deployment.ReleaseID == production.ReleaseID || h.builder.count() != 2 {
+		t.Fatalf("deployment after restart = %+v, build count=%d", deployed, h.builder.count())
+	}
+	active, err := h.db.ActiveDeployment("demo")
+	if err != nil || active.ID != deployed.deployment.ID {
+		t.Fatalf("active deployment after serialized operations = %+v, %v", active, err)
+	}
+}
+
+func TestConfigurationChangedDuringBuildRemainsPending(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	oldMemory, newMemory := "128Mi", "256Mi"
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{
+		MemoryLimit: &oldMemory, Environment: map[string]string{"TOKEN": "old-token"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.db.OperationSettings("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	behavior := &buildBehavior{entered: make(chan struct{}), release: make(chan struct{})}
+	h.builder.setBehavior("demo", behavior)
+	deployDone := make(chan deployResult, 1)
+	go func() {
+		d, err := h.service.Deploy(context.Background(), h.source, "demo")
+		deployDone <- deployResult{deployment: d, err: err}
+	}()
+	waitSignal(t, behavior.entered, "blocked build")
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{
+		MemoryLimit: &newMemory, Environment: map[string]string{"TOKEN": "new-token"},
+	}); err != nil {
+		t.Fatalf("Configure during build: %v", err)
+	}
+	close(behavior.release)
+	deployed := awaitDeploy(t, deployDone)
+	if deployed.err != nil {
+		t.Fatalf("Deploy() error = %v", deployed.err)
+	}
+	if deployed.deployment.MemoryLimit != oldMemory {
+		t.Fatalf("deployment memory = %q, want captured %q", deployed.deployment.MemoryLimit, oldMemory)
+	}
+	h.sandbox.mu.Lock()
+	var runtimeSpec *contracts.SandboxSpec
+	for i := range h.sandbox.specs {
+		if h.sandbox.specs[i].ID == deployed.deployment.ID {
+			copy := h.sandbox.specs[i]
+			runtimeSpec = &copy
+			break
+		}
+	}
+	h.sandbox.mu.Unlock()
+	if runtimeSpec == nil {
+		t.Fatal("runtime startup did not record its configuration")
+	}
+	if runtimeSpec.MemoryMax != oldMemory || !strings.Contains(strings.Join(runtimeSpec.Env, "\n"), "TOKEN=old-token") {
+		t.Fatalf("runtime spec after mid-build update = %+v", runtimeSpec)
+	}
+	after, err := h.db.OperationSettings("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.PendingSettings || after.AppliedSettingsRevision != before.SettingsRevision || after.SettingsRevision <= before.SettingsRevision {
+		t.Fatalf("settings revisions after promotion = before:%+v after:%+v", before, after)
+	}
+}
+
+func TestCancelCandidateLeavesProductionRouteUntouched(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	production, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	behavior := &buildBehavior{entered: make(chan struct{}), release: make(chan struct{})}
+	h.builder.setBehavior("demo", behavior)
+	candidateDone := make(chan deployResult, 1)
+	go func() {
+		d, err := h.service.Deploy(context.Background(), h.source, "demo")
+		candidateDone <- deployResult{deployment: d, err: err}
+	}()
+	waitSignal(t, behavior.entered, "candidate build")
+	candidate, err := h.service.LatestDeployment("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, err := h.service.CancelCandidate(context.Background(), "demo", candidate.ID)
+	if err != nil {
+		t.Fatalf("CancelCandidate() error = %v", err)
+	}
+	if canceled.ID != candidate.ID || canceled.PromotedAt != nil {
+		t.Fatalf("canceled candidate = %+v", canceled)
+	}
+	result := awaitDeploy(t, candidateDone)
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("candidate deployment error = %v, want context canceled", result.err)
+	}
+	active, err := h.db.ActiveDeployment("demo")
+	if err != nil || active.ID != production.ID {
+		t.Fatalf("production route after cancellation = %+v, %v", active, err)
+	}
+	if response := routerRequest(h.router, "demo.localhost", "/app"); response.Code != http.StatusOK {
+		t.Fatalf("production route response after cancellation = %d", response.Code)
+	}
+}
+
+func TestStopRejectsDeployQueuedBehindCanceledBuild(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	behavior := &buildBehavior{entered: make(chan struct{}), release: make(chan struct{})}
+	h.builder.setBehavior("demo", behavior)
+	firstDone := make(chan deployResult, 1)
+	go func() {
+		d, err := h.service.Deploy(context.Background(), h.source, "demo")
+		firstDone <- deployResult{deployment: d, err: err}
+	}()
+	waitSignal(t, behavior.entered, "first build")
+	secondDone := make(chan deployResult, 1)
+	go func() {
+		d, err := h.service.Deploy(context.Background(), h.source, "demo")
+		secondDone <- deployResult{deployment: d, err: err}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h.service.appLocksMu.Lock()
+		gate := h.service.appLocks["demo"]
+		queued := gate != nil && gate.refs >= 2
+		h.service.appLocksMu.Unlock()
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second deploy did not queue behind the active build")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stopped, err := h.service.Stop(context.Background(), "demo")
+	if err != nil || stopped.State != model.Stopped {
+		t.Fatalf("Stop() = %+v, %v", stopped, err)
+	}
+	if first := awaitDeploy(t, firstDone); !errors.Is(first.err, context.Canceled) {
+		t.Fatalf("first deploy error = %v, want cancellation", first.err)
+	}
+	if second := awaitDeploy(t, secondDone); second.err == nil || !strings.Contains(second.err.Error(), "explicit stop") {
+		t.Fatalf("queued deploy = %+v, want explicit-stop rejection", second)
+	}
+	if builds := h.builder.count(); builds != 1 {
+		t.Fatalf("builder ran %d times after Stop, want only the canceled first build", builds)
+	}
+	if _, err := h.db.ActiveDeployment("demo"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("active deployment after Stop = %v, want none", err)
+	}
 }
 
 func TestCandidateFailureLeavesActiveDeploymentUntouched(t *testing.T) {
@@ -1513,6 +1978,13 @@ func TestWaitingCandidateHonorsCancellationAndReleasesAppLock(t *testing.T) {
 	h.service.appLocksMu.Lock()
 	count := len(h.service.appLocks)
 	h.service.appLocksMu.Unlock()
+	deadline := time.Now().Add(time.Second)
+	for count != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		h.service.appLocksMu.Lock()
+		count = len(h.service.appLocks)
+		h.service.appLocksMu.Unlock()
+	}
 	if count != 0 {
 		t.Fatalf("unused app locks retained: %d", count)
 	}

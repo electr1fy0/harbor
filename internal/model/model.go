@@ -130,14 +130,15 @@ type Event struct {
 }
 
 type ReleaseView struct {
-	ID          string    `json:"id"`
-	AppID       string    `json:"app_id"`
-	AppName     string    `json:"app_name"`
-	SourceHash  string    `json:"source_hash"`
-	Runtime     string    `json:"runtime"`
-	ArtifactDir string    `json:"artifact_dir"`
-	CreatedAt   time.Time `json:"created_at"`
-	IsActive    bool      `json:"is_active"`
+	ID                string    `json:"id"`
+	AppID             string    `json:"app_id"`
+	AppName           string    `json:"app_name"`
+	SourceHash        string    `json:"source_hash"`
+	Runtime           string    `json:"runtime"`
+	ArtifactDir       string    `json:"artifact_dir"`
+	CreatedAt         time.Time `json:"created_at"`
+	IsActive          bool      `json:"is_active"`
+	ArtifactAvailable bool      `json:"artifactAvailable"`
 }
 
 type ServiceState string

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,21 +33,24 @@ type Options struct {
 }
 
 type Service struct {
-	mu         sync.Mutex
-	appLocksMu sync.Mutex
-	appLocks   map[string]*appLock
-	stopping   map[string]int
-	retiring   map[string]bool
-	inflight   sync.WaitGroup
-	pending    map[string]pendingDeploy
-	db         *store.Store
-	builder    contracts.Builder
-	sandbox    contracts.Sandbox
-	router     *router.HostRouter
-	opts       Options
-	ctx        context.Context
-	cancel     context.CancelFunc
-	done       chan struct{}
+	mu             sync.Mutex
+	buildCacheMu   sync.RWMutex
+	appLocksMu     sync.Mutex
+	appLocks       map[string]*appLock
+	stopping       map[string]int
+	stopGeneration map[string]uint64
+	retiring       map[string]bool
+	healthProbes   map[string]bool
+	inflight       sync.WaitGroup
+	pending        map[string]pendingDeploy
+	db             *store.Store
+	builder        contracts.Builder
+	sandbox        contracts.Sandbox
+	router         *router.HostRouter
+	opts           Options
+	ctx            context.Context
+	cancel         context.CancelFunc
+	done           chan struct{}
 }
 
 type pendingDeploy struct {
@@ -63,6 +67,9 @@ type DeploymentIdentity struct {
 }
 
 func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox, routes *router.HostRouter, opts Options) (*Service, error) {
+	if err := db.InitOperations(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Join(opts.DataDir, "logs"), 0700); err != nil {
 		return nil, err
 	}
@@ -71,7 +78,8 @@ func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox,
 		db: db, builder: b, sandbox: runtimeSandbox, router: routes, opts: opts,
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		pending: make(map[string]pendingDeploy), appLocks: make(map[string]*appLock),
-		stopping: make(map[string]int), retiring: make(map[string]bool),
+		stopping: make(map[string]int), stopGeneration: make(map[string]uint64), retiring: make(map[string]bool),
+		healthProbes: make(map[string]bool),
 	}
 	// Host processes are owned by this daemon session. Preserve history, but
 	// never present a previous session's unverifiable PID as a live process.
@@ -150,6 +158,23 @@ func (s *Service) lockApp(ctx context.Context, name string) (func(), error) {
 	}
 }
 
+// lockAppForAdmission remembers the explicit-stop generation before waiting
+// behind another app operation. A queued deploy cannot cross a Stop boundary.
+func (s *Service) lockAppForAdmission(ctx context.Context, name string) (func(), uint64, error) {
+	s.mu.Lock()
+	if s.stopping[name] > 0 {
+		s.mu.Unlock()
+		return nil, 0, fmt.Errorf("application %s is stopping", name)
+	}
+	generation := s.stopGeneration[name]
+	s.mu.Unlock()
+	unlock, err := s.lockApp(ctx, name)
+	if err != nil {
+		return nil, 0, err
+	}
+	return unlock, generation, nil
+}
+
 func (s *Service) recordEvent(deploymentID, appID string, eventType model.EventType, payload string) {
 	if err := s.db.RecordEvent(deploymentID, appID, eventType, payload); err != nil {
 		log.Printf("record lifecycle event %s for deployment %s: %v", eventType, deploymentID, err)
@@ -209,6 +234,12 @@ func (s *Service) Deploy(ctx context.Context, sourceDir, name string) (*model.De
 // its durable record is created. Existing synchronous callers keep using
 // Deploy; observers should copy only the identity they need.
 func (s *Service) DeployWithObserver(ctx context.Context, sourceDir, name string, observe func(DeploymentIdentity)) (*model.Deployment, error) {
+	return s.DeployWithOptions(ctx, sourceDir, name, contracts.DeployOptions{}, observe)
+}
+
+// DeployWithOptions forwards bounded build controls without changing the
+// default behavior used by existing deployment callers.
+func (s *Service) DeployWithOptions(ctx context.Context, sourceDir, name string, options contracts.DeployOptions, observe func(DeploymentIdentity)) (*model.Deployment, error) {
 	cfg, err := config.Load(sourceDir)
 	if err != nil {
 		return nil, err
@@ -216,7 +247,7 @@ func (s *Service) DeployWithObserver(ctx context.Context, sourceDir, name string
 	if name == "" {
 		name = cfg.Name
 	}
-	return s.deployObserved(ctx, sourceDir, name, cfg, nil, observe)
+	return s.deployObserved(ctx, sourceDir, name, cfg, nil, options, observe, false)
 }
 
 func (s *Service) Rollback(ctx context.Context, name, targetReleaseID string) (*model.Deployment, error) {
@@ -233,6 +264,22 @@ func (s *Service) Recover(ctx context.Context) error {
 	}
 	var failures []error
 	for _, app := range apps {
+		operations, operationErr := s.db.OperationSettings(app.Name)
+		if operationErr != nil {
+			failures = append(failures, fmt.Errorf("recover application %s settings: %w", app.Name, operationErr))
+			continue
+		}
+		if operations.CrashLoop {
+			// Reaching the persisted crash-loop limit requires an explicit
+			// Start or Restart, even across daemon restarts.
+			continue
+		}
+		if operations.AutomaticRestartEnabled && operations.NextRestartAt != nil {
+			s.mu.Lock()
+			s.scheduleAutomaticRestartAtLocked(app.Name, app.ID, *operations.NextRestartAt)
+			s.mu.Unlock()
+			continue
+		}
 		last, err := s.db.LatestPromotedDeployment(app.Name)
 		if err == nil {
 			_, err = s.deploy(ctx, "", app.Name, nil, &last.ReleaseID)
@@ -246,18 +293,22 @@ func (s *Service) Recover(ctx context.Context) error {
 
 // deploy is the single candidate lifecycle for both builds and rollback.
 func (s *Service) deploy(ctx context.Context, sourceDir, name string, cfg *config.Config, rollbackID *string) (*model.Deployment, error) {
-	return s.deployObserved(ctx, sourceDir, name, cfg, rollbackID, nil)
+	return s.deployObserved(ctx, sourceDir, name, cfg, rollbackID, contracts.DeployOptions{}, nil, false)
 }
 
-func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cfg *config.Config, rollbackID *string, observe func(DeploymentIdentity)) (*model.Deployment, error) {
-	if !config.ValidName(name) {
-		return nil, fmt.Errorf("invalid application name %q", name)
-	}
-	unlockApp, err := s.lockApp(ctx, name)
+func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cfg *config.Config, rollbackID *string, buildOptions contracts.DeployOptions, observe func(DeploymentIdentity), requireDesiredRunning bool) (*model.Deployment, error) {
+	unlockApp, generation, err := s.lockAppForAdmission(ctx, name)
 	if err != nil {
 		return nil, err
 	}
 	defer unlockApp()
+	return s.deployObservedLocked(ctx, sourceDir, name, cfg, rollbackID, buildOptions, observe, requireDesiredRunning, generation)
+}
+
+func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name string, cfg *config.Config, rollbackID *string, buildOptions contracts.DeployOptions, observe func(DeploymentIdentity), requireDesiredRunning bool, generation uint64) (*model.Deployment, error) {
+	if !config.ValidName(name) {
+		return nil, fmt.Errorf("invalid application name %q", name)
+	}
 
 	s.mu.Lock()
 	locked := true
@@ -269,11 +320,23 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 	if s.ctx.Err() != nil {
 		return nil, fmt.Errorf("daemon shutting down")
 	}
+	if s.stopGeneration[name] != generation {
+		return nil, errors.New("operation was interrupted by an explicit stop")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if s.stopping[name] > 0 {
 		return nil, fmt.Errorf("application %s is stopping", name)
+	}
+	if requireDesiredRunning {
+		settings, settingsErr := s.db.AppSettings(name)
+		if settingsErr != nil {
+			return nil, settingsErr
+		}
+		if !settings.DesiredRunning {
+			return nil, errors.New("application was explicitly stopped before restart could begin")
+		}
 	}
 	all, err := s.db.UnfinishedDeployments(name)
 	if err != nil {
@@ -297,6 +360,13 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 		}
 		if err != nil {
 			return nil, err
+		}
+		pruned, pruneErr := s.db.IsReleaseArtifactPruned(release.ID)
+		if pruneErr != nil {
+			return nil, pruneErr
+		}
+		if pruned {
+			return nil, fmt.Errorf("release %s artifact was removed by retention; deploy its source again", release.ID)
 		}
 		prior, priorErr := s.db.DeploymentForRelease(release.ID)
 		if priorErr != nil {
@@ -328,7 +398,14 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 	if err != nil {
 		return nil, err
 	}
-	appSettings, settingsErr := s.db.AppSettings(name)
+	configuration, settingsErr := s.db.DeploymentSettingsSnapshot(name)
+	if settingsErr != nil {
+		return nil, settingsErr
+	}
+	appSettings := configuration.AppSettings
+	settingsRevision := configuration.SettingsRevision
+	deploymentBindings := configuration.Bindings
+	runtimeEnvironment, settingsErr := s.decryptEnvironment(app.ID, appSettings.EncryptedEnvironment)
 	if settingsErr != nil {
 		return nil, settingsErr
 	}
@@ -340,6 +417,16 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 	}
 	if appSettings.TasksLimit > 0 {
 		cfg.Resources.Tasks = appSettings.TasksLimit
+	}
+	missingRequired := missingRequiredEnvironmentKeys(runtimeEnvironment, deploymentBindings, configuration.RequiredEnvironmentKeys)
+	if len(missingRequired) > 0 {
+		return nil, fmt.Errorf("deployment preflight is missing required environment keys: %s", strings.Join(missingRequired, ", "))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateBuildOptions(buildOptions); err != nil {
+		return nil, err
 	}
 	id, err := newID("dep")
 	if err != nil {
@@ -369,6 +456,10 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 		s.inflight.Done()
 	}()
 	if rollbackID == nil {
+		buildEnvironment, buildEnvErr := s.buildRequestOptions(name, buildOptions)
+		if buildEnvErr != nil {
+			return s.fail(&d, model.BuildFailed, buildEnvErr)
+		}
 		if err = s.state(&d, model.Building); err != nil {
 			return s.fail(&d, model.BuildFailed, err)
 		}
@@ -376,12 +467,23 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 		// Long builds must not block supervision or other app operations.
 		s.mu.Unlock()
 		locked = false
+		unlockCache, cacheErr := s.acquireBuildCache(ctx, buildOptions.ClearCache)
+		if cacheErr != nil {
+			s.mu.Lock()
+			locked = true
+			return s.fail(&d, model.BuildFailed, cacheErr)
+		}
 		release, err = s.builder.Build(ctx, contracts.BuildRequest{
 			SourceDir: sourceDir, AppName: name, Runtime: cfg.Runtime,
 			BuildCommand: cfg.Build.Command, StartCommand: cfg.Start.Command, LogPath: d.LogPath,
+			BuildEnvironment: buildEnvironment, BuildTimeout: buildOptions.BuildTimeout, ClearCache: buildOptions.ClearCache,
 		})
+		unlockCache()
 		s.mu.Lock()
 		locked = true
+		if err != nil {
+			err = s.redactBuildError(name, err, buildOptions)
+		}
 		if err == nil {
 			err = ctx.Err()
 		}
@@ -429,13 +531,9 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 			defaultPath = filepath.Join(home, ".local", "bin") + ":" + defaultPath
 		}
 		deployEnv := []string{"PORT=" + strconv.Itoa(port), "PATH=" + defaultPath, "HOME=/tmp"}
-		bindings, bindingErr := s.db.GetBindingsForApp(app.ID)
-		if bindingErr != nil {
-			return s.fail(&d, model.StartFailed, bindingErr)
-		}
-		binds := make([]contracts.BindMount, 0, len(bindings))
-		bindingKeys := make(map[string]bool, len(bindings))
-		for _, b := range bindings {
+		binds := make([]contracts.BindMount, 0, len(deploymentBindings))
+		bindingKeys := make(map[string]bool, len(deploymentBindings))
+		for _, b := range deploymentBindings {
 			if b.EnvKey == "" || bindingKeys[b.EnvKey] {
 				return s.fail(&d, model.StartFailed, fmt.Errorf("multiple managed service bindings use environment key %q", b.EnvKey))
 			}
@@ -457,12 +555,8 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 			deployEnv = append(deployEnv, b.EnvKey+"="+dbURL)
 			binds = append(binds, contracts.BindMount{HostPath: databasePath, MountPath: databasePath})
 		}
-		customEnvironment, envErr := s.runtimeEnvironment(app.ID)
-		if envErr != nil {
-			return s.fail(&d, model.StartFailed, envErr)
-		}
-		for _, key := range sortedKeys(customEnvironment) {
-			deployEnv = append(deployEnv, key+"="+customEnvironment[key])
+		for _, key := range sortedKeys(runtimeEnvironment) {
+			deployEnv = append(deployEnv, key+"="+runtimeEnvironment[key])
 		}
 
 		// Startup can wait on a runtime manager. Stop must be able to cancel
@@ -545,11 +639,11 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 	now := time.Now().UTC()
 	d.PromotedAt = &now
 	var oldDeploymentID string
-	settings, err := s.db.AppSettings(name)
+	currentSettings, err := s.db.AppSettings(name)
 	if err != nil {
 		return s.fail(&d, model.StartFailed, err)
 	}
-	routeHosts := append([]string{name + ".localhost"}, settings.Domains...)
+	routeHosts := append([]string{name + ".localhost"}, currentSettings.Domains...)
 	drained, err := s.router.SwitchRoutes(routeHosts, "http://127.0.0.1:"+strconv.Itoa(d.Port), func() error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -567,6 +661,15 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 	}
 	s.recordEvent(d.ID, app.ID, model.EventRouteSwitched, fmt.Sprintf("upstream=http://127.0.0.1:%d", d.Port))
 	s.recordEvent(d.ID, app.ID, model.EventDeploymentSucceeded, "")
+	if err := s.db.MarkSettingsAppliedRevision(app.ID, settingsRevision); err != nil {
+		log.Printf("mark settings applied for deployment %s: %v", d.ID, err)
+	}
+	if err := s.db.UpdateHealthStatus(app.ID, "healthy", 0, time.Now().UTC()); err != nil {
+		log.Printf("initialize health status for deployment %s: %v", d.ID, err)
+	}
+	if err := s.db.SetNextRestart(app.ID, nil); err != nil {
+		log.Printf("clear restart time after deployment %s: %v", d.ID, err)
+	}
 	if oldDeploymentID != "" {
 		old, err := s.db.Deployment(oldDeploymentID)
 		if err != nil {
@@ -578,6 +681,7 @@ func (s *Service) deployObserved(ctx context.Context, sourceDir, name string, cf
 		s.inflight.Add(1)
 		go func() { defer s.inflight.Done(); s.retireDeployment(oldDeploymentID, drained) }()
 	}
+	s.scheduleReleasePrune(name)
 	s.recordEvent(d.ID, app.ID, model.EventType(model.Running), fmt.Sprintf("route published at %s.localhost -> :%d", name, d.Port))
 	return &d, nil
 }
@@ -658,7 +762,22 @@ func (s *Service) DataDir() string { return s.opts.DataDir }
 func (s *Service) LifetimeContext() context.Context { return s.ctx }
 
 func (s *Service) Releases(name string) ([]model.ReleaseView, error) {
-	return s.db.ReleasesForApp(name)
+	releases, err := s.db.ReleasesForApp(name)
+	if err != nil {
+		return nil, err
+	}
+	pruned, err := s.db.PrunedReleaseIDs(name)
+	if err != nil {
+		return nil, err
+	}
+	for i := range releases {
+		if pruned[releases[i].ID] {
+			continue
+		}
+		info, statErr := os.Stat(releases[i].ArtifactDir)
+		releases[i].ArtifactAvailable = statErr == nil && info.IsDir()
+	}
+	return releases, nil
 }
 
 func (s *Service) Apps() ([]model.Application, error) { return s.db.Apps() }
@@ -757,6 +876,9 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 		s.mu.Unlock()
 		return d, err
 	}
+	// An explicit stop is authoritative: cancel any persisted crash-recovery
+	// timer and clear the previous crash-loop window before stopping runtimes.
+	restartStateErr := s.db.ClearAutomaticRestart(d.AppID)
 	all, err := s.db.UnfinishedDeployments(name)
 	if err != nil {
 		s.mu.Unlock()
@@ -765,6 +887,7 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 	// Freeze admission while canceling and awaiting every candidate. Capture IDs
 	// now so a stop never mutates a deployment admitted after this operation.
 	s.stopping[name]++
+	s.stopGeneration[name]++
 	defer func() {
 		s.mu.Lock()
 		s.stopping[name]--
@@ -798,6 +921,9 @@ func (s *Service) Stop(ctx context.Context, name string) (*model.Deployment, err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var failures []error
+	if restartStateErr != nil {
+		failures = append(failures, restartStateErr)
+	}
 	for id := range targets {
 		current, err := s.db.Deployment(id)
 		if err != nil {
@@ -937,7 +1063,30 @@ func (s *Service) monitor() {
 								log.Printf("finish runtime %s: %v", d.ID, err)
 							}
 						}
+						if settings, settingsErr := s.db.AppSettings(d.AppName); settingsErr == nil && settings.DesiredRunning && s.stopping[d.AppName] == 0 {
+							s.queueAutomaticRestart(d.AppName, d.AppID, d.ID)
+						}
 					}
+				}
+				for _, d := range running {
+					if s.ctx.Err() != nil || s.healthProbes[d.ID] {
+						continue
+					}
+					due, timeoutSeconds, failureThreshold, priorFailures, dueErr := s.healthProbeDue(d, time.Now().UTC())
+					if dueErr != nil || !due {
+						continue
+					}
+					current, currentErr := s.db.Deployment(d.ID)
+					if currentErr != nil || current.State != model.Running {
+						continue
+					}
+					active, activeErr := s.db.ActiveDeployment(d.AppName)
+					if activeErr != nil || active.ID != d.ID {
+						continue
+					}
+					s.healthProbes[d.ID] = true
+					s.inflight.Add(1)
+					go s.runHealthProbe(*current, timeoutSeconds, failureThreshold, priorFailures)
 				}
 			} else {
 				log.Printf("list deployments for supervision: %v", err)

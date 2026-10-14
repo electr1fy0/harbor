@@ -77,6 +77,58 @@ func Check(ctx context.Context, port int, path string) error {
 	return fmt.Errorf("health check failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
+// Probe performs one bounded readiness-style request. Runtime supervision uses
+// this separately from Check, which retries during startup before publication.
+func Probe(ctx context.Context, port int, path string, timeout time.Duration) error {
+	if ctx == nil {
+		return errors.New("health probe context must not be nil")
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("invalid health check port %d", port)
+	}
+	if timeout <= 0 || timeout > 30*time.Second {
+		return errors.New("health probe timeout must be between 1ms and 30s")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if path == "" {
+		connection, err := (&net.Dialer{}).DialContext(probeCtx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			return err
+		}
+		return connection.Close()
+	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return fmt.Errorf("invalid health check path: %w", err)
+	}
+	if parsed.IsAbs() || parsed.Host != "" {
+		return errors.New("health check path must be relative to loopback")
+	}
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	}
+	parsed.Scheme = "http"
+	parsed.Host = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	parsed.Fragment = ""
+	client := &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	_ = response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("health endpoint returned HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
 func probeTCP(ctx context.Context, port int) error {
 	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()

@@ -93,14 +93,15 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 	if !config.ValidName(name) {
 		return nil, errors.New("invalid application name")
 	}
-	unlockApp, err := s.lockApp(ctx, name)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer unlockApp()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.ctx.Err() != nil {
 		return nil, errors.New("daemon shutting down")
 	}
