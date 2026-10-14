@@ -108,6 +108,15 @@ Releases under `/var/lib/paas/releases` are daemon-owned and read-only; deleting
 the original source does not affect a running app. The setup script creates
 accounts/directories and, where needed, a scoped Bubblewrap AppArmor profile
 for the runtime and Linux probes; it does not disable global user-namespace restrictions.
+Go module/build caches persist under the daemon data directory. Node builds also
+keep npm, pnpm, and Yarn caches in per-application directories there, selected
+through `npm_config_cache`, `npm_config_store_dir`, `pnpm_config_store_dir`,
+`YARN_CACHE_FOLDER`, and `YARN_GLOBAL_FOLDER`. These are build caches; runtime
+dependencies still need to be present in the published release.
+Runtime supervision keeps a 250 ms polling interval; systemd-backed runtimes are
+queried in batches of up to 32 units per manager call. Build caches persist until
+manually pruned. Remove `build-cache` only when no builds are active; it is
+recreated automatically by the next build.
 
 ## Application contract
 

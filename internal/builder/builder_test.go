@@ -418,6 +418,82 @@ func TestNodeBuildPublishesRelease(t *testing.T) {
 	}
 }
 
+func TestNodePackageCachesPersistPerApplication(t *testing.T) {
+	skipRootBuild(t)
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	if err := os.MkdirAll(sourceDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "package.json"), []byte(`{"name":"test-node","version":"1.0.0"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(root, "data")
+	defer removeTree(dataDir)
+	b := New(Options{DataDir: dataDir})
+	build := func(appName, command string) *contracts.Release {
+		t.Helper()
+		release, err := b.Build(context.Background(), contracts.BuildRequest{
+			SourceDir: sourceDir, AppName: appName, Runtime: "node", BuildCommand: command, StartCommand: "node /app/server.js",
+		})
+		if err != nil {
+			t.Fatalf("Build(%s) failed: %v", appName, err)
+		}
+		return release
+	}
+	seedCaches := `set -eu; test "$npm_config_store_dir" = "$pnpm_config_store_dir"; test "$YARN_CACHE_FOLDER" = "$YARN_GLOBAL_FOLDER"; for cache in "$npm_config_cache" "$pnpm_config_store_dir" "$YARN_GLOBAL_FOLDER"; do test -d "$cache"; touch "$cache/marker"; done; printf 'ok' > "$PAAS_OUT/result"`
+	build("test-node", seedCaches)
+	for _, dir := range []string{"npm", "pnpm", "yarn"} {
+		info, err := os.Stat(filepath.Join(dataDir, "build-cache", "node", "test-node", dir))
+		if err != nil || info.Mode().Perm() != 0700 {
+			t.Fatalf("Node %s cache permissions = %v, err=%v; want 0700", dir, info, err)
+		}
+	}
+
+	verifyCaches := `set -eu; test "$npm_config_store_dir" = "$pnpm_config_store_dir"; test "$YARN_CACHE_FOLDER" = "$YARN_GLOBAL_FOLDER"; for cache in "$npm_config_cache" "$pnpm_config_store_dir" "$YARN_GLOBAL_FOLDER"; do test -f "$cache/marker"; done; printf 'reused' > "$PAAS_OUT/result"`
+	second := build("test-node", verifyCaches)
+	if data, err := os.ReadFile(filepath.Join(second.ArtifactDir, "result")); err != nil || string(data) != "reused" {
+		t.Fatalf("second build did not reuse Node caches: data=%q err=%v", data, err)
+	}
+
+	otherApp := `set -eu; test "$npm_config_store_dir" = "$pnpm_config_store_dir"; test "$YARN_CACHE_FOLDER" = "$YARN_GLOBAL_FOLDER"; for cache in "$npm_config_cache" "$pnpm_config_store_dir" "$YARN_GLOBAL_FOLDER"; do test ! -f "$cache/marker"; touch "$cache/marker"; done; printf 'separate' > "$PAAS_OUT/result"`
+	build("other-node", otherApp)
+}
+
+func TestNodeBuildCacheRejectsSymlinkedManagerCache(t *testing.T) {
+	cacheRoot := t.TempDir()
+	if os.Geteuid() == 0 {
+		// The production root path requires the configured unprivileged account;
+		// the path validation itself is checked before user lookup for symlinks.
+		if err := os.Mkdir(filepath.Join(cacheRoot, "node"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(t.TempDir(), filepath.Join(cacheRoot, "node", "unsafe")); err != nil {
+			t.Fatal(err)
+		}
+		if err := preparePrivateBuildDir(filepath.Join(cacheRoot, "node", "unsafe"), "paas-build"); err == nil || !strings.Contains(err.Error(), "real directory") {
+			t.Fatalf("symlinked app cache error = %v", err)
+		}
+		return
+	}
+	appCache, err := prepareNodeBuildCache(cacheRoot, "safe", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(appCache, "npm")); err != nil {
+		t.Fatalf("npm cache was not created: %v", err)
+	}
+	if err := os.Remove(filepath.Join(appCache, "pnpm")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(appCache, "pnpm")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepareNodeBuildCache(cacheRoot, "safe", ""); err == nil || !strings.Contains(err.Error(), "real directory") {
+		t.Fatalf("symlinked package-manager cache error = %v", err)
+	}
+}
+
 func isZombie(pid int) bool {
 	if runtime.GOOS != "linux" {
 		return false

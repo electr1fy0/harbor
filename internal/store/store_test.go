@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -199,6 +200,93 @@ func TestUnfinishedDeploymentsExcludesHistoryAndScopesApplication(t *testing.T) 
 		if !reflect.DeepEqual(ids, test.want) {
 			t.Errorf("UnfinishedDeployments(%q) = %v, want %v", test.name, ids, test.want)
 		}
+	}
+}
+
+func TestUnfinishedDeploymentsUsesPartialIndexesAfterCompletedHistory(t *testing.T) {
+	s := openTestStore(t)
+	app, err := s.CreateApp("indexed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUsesIndex := func(scope string) {
+		t.Helper()
+		query := deploymentSelect + `WHERE (d.state IN ('QUEUED', 'BUILDING', 'BUILT', 'STARTING', 'HEALTH_CHECKING', 'RUNNING')
+			OR (d.sandbox_id != '' AND d.stopped_at IS NULL))`
+		var args []any
+		if scope != "" {
+			query += ` AND a.name = ?`
+			args = append(args, scope)
+		}
+		query += ` ORDER BY d.created_at DESC, d.id DESC`
+		rows, err := s.db.Query(`EXPLAIN QUERY PLAN `+query, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var details []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			details = append(details, detail)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+		plan := strings.Join(details, "\n")
+		wantIndex := "deployments_unfinished_idx"
+		if scope != "" {
+			wantIndex = "deployments_unfinished_app_idx"
+		}
+		if !strings.Contains(plan, wantIndex) {
+			t.Fatalf("scope %q query plan did not use %s:\n%s", scope, wantIndex, plan)
+		}
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert, err := tx.Prepare(`INSERT INTO deployments (
+		id, app_id, release_id, port, state, error, pid, log_path, systemd_unit, sandbox_type, sandbox_id,
+		memory_limit, cpu_quota, tasks_limit, health_path, promoted_at, created_at, started_at, stopped_at
+	) VALUES (?, ?, NULL, 0, ?, '', 0, '', '', '', ?, '', 0, 0, NULL, NULL, ?, NULL, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5000; i++ {
+		id := fmt.Sprintf("history-%05d", i)
+		if _, err := insert.Exec(id, app.ID, model.Crashed, id, "2025-01-01T00:00:00.000000000Z", "2025-01-01T00:00:00.000000000Z"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := insert.Exec("active", app.ID, model.Running, "", "2025-02-01T00:00:00.000000000Z", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insert.Exec("cleanup", app.ID, model.Crashed, "sandbox-cleanup", "2025-03-01T00:00:00.000000000Z", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := insert.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	assertUsesIndex("")
+	assertUsesIndex("indexed")
+	if _, err := s.db.Exec(`ANALYZE`); err != nil {
+		t.Fatal(err)
+	}
+	assertUsesIndex("")
+	assertUsesIndex("indexed")
+	unfinished, err := s.UnfinishedDeployments("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unfinished) != 2 || unfinished[0].ID != "cleanup" || unfinished[1].ID != "active" {
+		t.Fatalf("unfinished deployments = %#v, want cleanup and active", unfinished)
 	}
 }
 
@@ -553,6 +641,13 @@ func TestStoreUpgradesExistingDeploymentSchemasWithoutInventingBackend(t *testin
 				columns = append(columns, "systemd_unit", "sandbox_id", "memory_limit", "cpu_quota", "tasks_limit")
 			}
 			for _, column := range columns {
+				if column == "sandbox_id" {
+					for _, index := range []string{"deployments_unfinished_idx", "deployments_unfinished_app_idx"} {
+						if _, err := db.db.Exec(`DROP INDEX ` + index); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
 				if _, err := db.db.Exec("ALTER TABLE deployments DROP COLUMN " + column); err != nil {
 					t.Fatal(err)
 				}
@@ -577,6 +672,41 @@ func TestStoreUpgradesExistingDeploymentSchemasWithoutInventingBackend(t *testin
 				t.Fatalf("schema=%d err=%v", schema, err)
 			}
 		})
+	}
+}
+
+func TestStoreUpgradesV7WithUnfinishedIndexes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upgrade-v7.sqlite")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []string{"deployments_unfinished_idx", "deployments_unfinished_app_idx"} {
+		if _, err := db.db.Exec("DROP INDEX " + index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.db.Exec(`PRAGMA user_version = 7`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	var version int
+	if err := upgraded.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 8 {
+		t.Fatalf("schema version=%d err=%v; want 8", version, err)
+	}
+	for _, index := range []string{"deployments_unfinished_idx", "deployments_unfinished_app_idx"} {
+		var count int
+		if err := upgraded.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("index %s count=%d err=%v", index, count, err)
+		}
 	}
 }
 func TestStoreCycle3Features(t *testing.T) {

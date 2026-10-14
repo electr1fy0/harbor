@@ -20,6 +20,9 @@ import (
 )
 
 var _ contracts.Sandbox = (*SystemdSandbox)(nil)
+var _ contracts.SandboxBatchInspector = (*SystemdSandbox)(nil)
+
+const systemdInspectBatchSize = 32
 
 // SystemdSandbox supervises Bubblewrap processes in transient cgroup v2 units.
 // Terminal snapshots survive Stop so callers can classify startup failures.
@@ -290,14 +293,142 @@ func (s *SystemdSandbox) Inspect(ctx context.Context, id string) (*contracts.San
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if info := s.units[id]; info != nil {
-		snapshot := *info
-		if info.ExitCode != nil {
-			code := *info.ExitCode
-			snapshot.ExitCode = &code
-		}
-		return &snapshot, nil
+		return cloneSandboxInfo(info), nil
 	}
 	return s.inspectUnit(ctx, id)
+}
+
+// InspectMany reads a bounded number of unit snapshots per systemctl process.
+// Result positions match ids; malformed, omitted, and failed records carry an
+// error so the supervisor never interprets partial output as a runtime exit.
+func (s *SystemdSandbox) InspectMany(ctx context.Context, ids []string) []contracts.SandboxInspection {
+	results := make([]contracts.SandboxInspection, len(ids))
+	if len(ids) == 0 {
+		return results
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		for i := range results {
+			results[i].Err = err
+		}
+		return results
+	}
+
+	type pendingUnit struct {
+		index int
+		id    string
+		unit  string
+	}
+	pending := make([]pendingUnit, 0, len(ids))
+	for i, id := range ids {
+		unit, err := SystemdUnitName(id)
+		if err != nil {
+			results[i].Err = err
+			continue
+		}
+		if cached := s.units[id]; cached != nil {
+			results[i].Info = cloneSandboxInfo(cached)
+			continue
+		}
+		pending = append(pending, pendingUnit{index: i, id: id, unit: unit})
+	}
+
+	for start := 0; start < len(pending); start += systemdInspectBatchSize {
+		end := start + systemdInspectBatchSize
+		if end > len(pending) {
+			end = len(pending)
+		}
+		batch := pending[start:end]
+		if err := ctx.Err(); err != nil {
+			for _, item := range batch {
+				results[item.index].Err = err
+			}
+			continue
+		}
+		args := append(managerArgs(), "show")
+		for _, item := range batch {
+			args = append(args, item.unit)
+		}
+		for _, property := range []string{"Id", "LoadState", "ActiveState", "SubState", "MainPID", "ExecMainCode", "ExecMainStatus", "Result", "MemoryCurrent", "TasksCurrent", "ControlGroup"} {
+			args = append(args, "-p", property)
+		}
+		out, err := s.run(ctx, "systemctl", args...)
+		if err != nil {
+			for _, item := range batch {
+				results[item.index].Err = fmt.Errorf("inspect systemd units: %w", err)
+			}
+			continue
+		}
+		propertiesByUnit := parseSystemdShowBlocks(string(out))
+		for _, item := range batch {
+			block, ok := propertiesByUnit[item.unit]
+			if !ok {
+				results[item.index].Err = fmt.Errorf("systemctl omitted properties for unit %s", item.unit)
+				continue
+			}
+			info, parseErr := parseSystemdBatchInfo(item.id, item.unit, block)
+			results[item.index] = contracts.SandboxInspection{Info: info, Err: parseErr}
+		}
+	}
+	return results
+}
+
+func parseSystemdBatchInfo(id, unit, block string) (*contracts.SandboxInfo, error) {
+	props := parseSystemdProperties(block)
+	if props["LoadState"] != "not-found" {
+		for _, property := range []string{"LoadState", "ActiveState", "SubState", "MainPID", "ExecMainCode", "ExecMainStatus", "Result"} {
+			if _, ok := props[property]; !ok {
+				return nil, fmt.Errorf("systemctl returned incomplete properties for unit %s: missing %s", unit, property)
+			}
+		}
+	}
+	return parseSystemdInfo(id, unit, block)
+}
+
+func cloneSandboxInfo(info *contracts.SandboxInfo) *contracts.SandboxInfo {
+	if info == nil {
+		return nil
+	}
+	snapshot := *info
+	if info.ExitCode != nil {
+		code := *info.ExitCode
+		snapshot.ExitCode = &code
+	}
+	return &snapshot
+}
+
+// systemctl show separates multiple unit records with blank lines. The Id
+// property can appear anywhere in a record, so it is only used to identify a
+// completed block after its separator has been seen.
+func parseSystemdShowBlocks(output string) map[string]string {
+	blocks := make(map[string]string)
+	var current strings.Builder
+	flush := func() {
+		block := strings.TrimSpace(current.String())
+		current.Reset()
+		if block == "" {
+			return
+		}
+		unit := parseSystemdProperties(block)["Id"]
+		if unit != "" {
+			if _, duplicate := blocks[unit]; duplicate {
+				blocks[unit] = "" // mark duplicate records as malformed
+			} else {
+				blocks[unit] = block
+			}
+		}
+	}
+	for _, line := range strings.Split(output, "\n") {
+		if line == "" {
+			flush()
+			continue
+		}
+		current.WriteString(line)
+		current.WriteByte('\n')
+	}
+	flush()
+	return blocks
 }
 
 func (s *SystemdSandbox) inspectUnit(ctx context.Context, id string) (*contracts.SandboxInfo, error) {

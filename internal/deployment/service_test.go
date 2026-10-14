@@ -418,6 +418,71 @@ func (s *fakeSandbox) close() {
 	}
 }
 
+type batchObservingSandbox struct {
+	*fakeSandbox
+	muBatch         sync.Mutex
+	batchCalls      int
+	individualCalls int
+	requested       [][]string
+	batchErr        error
+}
+
+func (s *batchObservingSandbox) Inspect(ctx context.Context, id string) (*contracts.SandboxInfo, error) {
+	s.muBatch.Lock()
+	s.individualCalls++
+	s.muBatch.Unlock()
+	return s.fakeSandbox.Inspect(ctx, id)
+}
+
+func (s *batchObservingSandbox) InspectMany(ctx context.Context, ids []string) []contracts.SandboxInspection {
+	s.muBatch.Lock()
+	s.batchCalls++
+	s.requested = append(s.requested, append([]string(nil), ids...))
+	err := s.batchErr
+	s.muBatch.Unlock()
+	results := make([]contracts.SandboxInspection, len(ids))
+	for i, id := range ids {
+		if err != nil {
+			results[i].Err = err
+			continue
+		}
+		if ctx.Err() != nil {
+			results[i].Err = ctx.Err()
+			continue
+		}
+		s.fakeSandbox.mu.Lock()
+		entry := s.fakeSandbox.entries[id]
+		if entry == nil {
+			results[i].Err = fmt.Errorf("unknown sandbox %q", id)
+		} else {
+			info := entry.info
+			if info.ExitCode != nil {
+				code := *info.ExitCode
+				info.ExitCode = &code
+			}
+			results[i].Info = &info
+		}
+		s.fakeSandbox.mu.Unlock()
+	}
+	return results
+}
+
+func (s *batchObservingSandbox) setBatchError(err error) {
+	s.muBatch.Lock()
+	s.batchErr = err
+	s.muBatch.Unlock()
+}
+
+func (s *batchObservingSandbox) batchSnapshot() (int, int, [][]string) {
+	s.muBatch.Lock()
+	defer s.muBatch.Unlock()
+	requested := make([][]string, len(s.requested))
+	for i := range s.requested {
+		requested[i] = append([]string(nil), s.requested[i]...)
+	}
+	return s.batchCalls, s.individualCalls, requested
+}
+
 type serviceHarness struct {
 	service *Service
 	db      *store.Store
@@ -1098,6 +1163,52 @@ func TestTransientInspectionFailureDoesNotKillHealthyDeployment(t *testing.T) {
 	h.sandbox.mu.Lock()
 	h.sandbox.inspectErr = nil
 	h.sandbox.mu.Unlock()
+}
+
+func TestBatchInspectionFailureDoesNotFailRuntimesAndUsesOneBatch(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	alpha, err := h.service.Deploy(context.Background(), h.source, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := h.service.Deploy(context.Background(), h.source, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := &batchObservingSandbox{fakeSandbox: h.sandbox}
+	batch.setBatchError(errors.New("temporary batch manager failure"))
+	h.service.mu.Lock()
+	h.service.sandbox = batch
+	h.service.mu.Unlock()
+	waitFor(t, "batched inspection", func() bool {
+		calls, _, _ := batch.batchSnapshot()
+		return calls > 0
+	})
+	for _, name := range []string{"alpha", "beta"} {
+		deployment, inspectErr := h.service.Inspect(name)
+		if inspectErr != nil || deployment.State != model.Running {
+			t.Fatalf("batch inspection error changed %s state: %+v %v", name, deployment, inspectErr)
+		}
+	}
+	calls, individualCalls, requested := batch.batchSnapshot()
+	if calls == 0 || individualCalls != 0 {
+		t.Fatalf("batch calls=%d individual calls=%d; want batch-only inspection", calls, individualCalls)
+	}
+	foundBoth := false
+	for _, ids := range requested {
+		if len(ids) == 2 && (ids[0] == alpha.ID && ids[1] == beta.ID || ids[0] == beta.ID && ids[1] == alpha.ID) {
+			foundBoth = true
+		}
+	}
+	if !foundBoth {
+		t.Fatalf("monitor did not inspect both apps in one request: %v", requested)
+	}
+	batch.setBatchError(nil)
+	h.sandbox.markExited(alpha.ID, 17)
+	waitFor(t, "batched crash supervision", func() bool {
+		latest, inspectErr := h.service.Inspect("alpha")
+		return inspectErr == nil && latest.State == model.Crashed && strings.Contains(latest.Error, "code 17")
+	})
 }
 
 func TestFailedCleanupIsPersistedRetriedAndBlocksReplacement(t *testing.T) {

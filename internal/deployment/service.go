@@ -865,6 +865,7 @@ func (s *Service) monitor() {
 					s.mu.Unlock()
 					continue
 				}
+				running := make([]model.Deployment, 0)
 				for _, d := range all {
 					if needsCleanup(d) {
 						if err := s.stopRuntime(d.SandboxID); err != nil {
@@ -901,15 +902,20 @@ func (s *Service) monitor() {
 						}
 						continue
 					}
-					info, err := s.inspectRuntime(d.ID)
+					running = append(running, d)
+				}
+				inspections := s.inspectRuntimeBatch(running)
+				for i, d := range running {
 					if s.ctx.Err() != nil {
 						break
 					}
-					if err != nil && !errors.Is(err, sandbox.ErrSandboxNotFound) {
-						log.Printf("inspect runtime %s: %v", d.ID, err)
+					inspection := inspections[i]
+					info, inspectErr := inspection.Info, inspection.Err
+					if inspectErr != nil && !errors.Is(inspectErr, sandbox.ErrSandboxNotFound) {
+						log.Printf("inspect runtime %s: %v", d.ID, inspectErr)
 						continue
 					}
-					if err != nil || info == nil || !info.Running {
+					if inspectErr != nil || info == nil || !info.Running {
 						exitCode, result := "unknown", ""
 						if info != nil {
 							result = info.Result
@@ -917,7 +923,7 @@ func (s *Service) monitor() {
 								exitCode = strconv.Itoa(*info.ExitCode)
 							}
 						}
-						s.recordEvent(d.ID, d.AppID, model.EventSandboxExited, fmt.Sprintf("exit_code=%s result=%s error=%v", exitCode, result, err))
+						s.recordEvent(d.ID, d.AppID, model.EventSandboxExited, fmt.Sprintf("exit_code=%s result=%s error=%v", exitCode, result, inspectErr))
 						if isOOM(info) {
 							if _, err := s.fail(&d, model.OOMKilled, errors.New("memory limit exceeded (OOM killed)")); err != nil {
 								log.Printf("finish runtime %s: %v", d.ID, err)
@@ -939,6 +945,49 @@ func (s *Service) monitor() {
 			s.mu.Unlock()
 		}
 	}
+}
+
+func (s *Service) inspectRuntimeBatch(deployments []model.Deployment) []contracts.SandboxInspection {
+	results := make([]contracts.SandboxInspection, len(deployments))
+	if len(deployments) == 0 {
+		return results
+	}
+	if batcher, ok := s.sandbox.(contracts.SandboxBatchInspector); ok {
+		ids := make([]string, len(deployments))
+		for i, d := range deployments {
+			ids[i] = d.ID
+		}
+		ctx, cancel := context.WithTimeout(s.ctx, 6*time.Second)
+		results = batcher.InspectMany(ctx, ids)
+		cancel()
+		if len(results) != len(deployments) {
+			return failedSandboxInspections(len(deployments), errors.New("sandbox batch inspector returned an incomplete result list"))
+		}
+		for i := range results {
+			if results[i].Err == nil && results[i].Info == nil {
+				results[i].Err = errors.New("sandbox batch inspector returned no runtime information")
+			}
+		}
+		return results
+	}
+	for i, d := range deployments {
+		if err := s.ctx.Err(); err != nil {
+			for j := i; j < len(results); j++ {
+				results[j].Err = err
+			}
+			break
+		}
+		results[i].Info, results[i].Err = s.inspectRuntime(d.ID)
+	}
+	return results
+}
+
+func failedSandboxInspections(count int, err error) []contracts.SandboxInspection {
+	results := make([]contracts.SandboxInspection, count)
+	for i := range results {
+		results[i].Err = err
+	}
+	return results
 }
 
 func (s *Service) Close() error {

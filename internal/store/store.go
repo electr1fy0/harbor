@@ -20,7 +20,7 @@ import (
 var ErrNotFound = errors.New("store: not found")
 var ErrDomainInUse = errors.New("store: domain is already assigned to another application")
 
-const schemaVersion = 7
+const schemaVersion = 8
 
 const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
@@ -230,9 +230,11 @@ func (s *Store) Deployments() ([]model.Deployment, error) {
 // runtime cleanups. An empty name selects all applications. Completed history
 // stays out of admission checks and the frequent supervision loop.
 func (s *Store) UnfinishedDeployments(name string) ([]model.Deployment, error) {
-	query := deploymentSelect + `WHERE (d.state IN (?, ?, ?, ?, ?, ?)
+	// These literals deliberately mirror model.State.Active and the v8 partial
+	// index predicate. Bound placeholders prevent SQLite proving the index fits.
+	query := deploymentSelect + `WHERE (d.state IN ('QUEUED', 'BUILDING', 'BUILT', 'STARTING', 'HEALTH_CHECKING', 'RUNNING')
 		OR (d.sandbox_id != '' AND d.stopped_at IS NULL))`
-	args := []any{model.Queued, model.Building, model.Built, model.Starting, model.HealthChecking, model.Running}
+	var args []any
 	if name != "" {
 		query += ` AND a.name = ?`
 		args = append(args, name)
@@ -1070,6 +1072,25 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 		version = 7
+	}
+	if version < 8 {
+		statements := []string{
+			`CREATE INDEX IF NOT EXISTS deployments_unfinished_idx
+				ON deployments(created_at DESC, id DESC)
+				WHERE state IN ('QUEUED', 'BUILDING', 'BUILT', 'STARTING', 'HEALTH_CHECKING', 'RUNNING')
+					OR (sandbox_id != '' AND stopped_at IS NULL)`,
+			`CREATE INDEX IF NOT EXISTS deployments_unfinished_app_idx
+				ON deployments(app_id, created_at DESC, id DESC)
+				WHERE state IN ('QUEUED', 'BUILDING', 'BUILT', 'STARTING', 'HEALTH_CHECKING', 'RUNNING')
+					OR (sandbox_id != '' AND stopped_at IS NULL)`,
+			`PRAGMA user_version = 8`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(statement); err != nil {
+				return err
+			}
+		}
+		version = 8
 	}
 	return tx.Commit()
 }

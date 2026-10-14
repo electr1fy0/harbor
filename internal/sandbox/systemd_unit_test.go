@@ -105,6 +105,183 @@ func TestSystemdInspectRecognizesExitedUnitsAndSignals(t *testing.T) {
 }
 func intPtr(value int) *int { return &value }
 
+func TestSystemdInspectManyBatchesUnitsAndKeepsResultsAligned(t *testing.T) {
+	var calls int
+	var requested [][]string
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if name != "systemctl" || !slices.Contains(args, "show") {
+			return nil, errors.New("unexpected systemd command")
+		}
+		calls++
+		showAt := slices.Index(args, "show")
+		var units []string
+		for _, arg := range args[showAt+1:] {
+			if arg == "-p" {
+				break
+			}
+			units = append(units, arg)
+		}
+		requested = append(requested, units)
+		blocks := make([]string, 0, len(units))
+		for _, unit := range units {
+			block := runningUnit
+			if strings.Contains(unit, "alpha") {
+				block = strings.Replace(block, "ActiveState=active\n", "ActiveState=active\nId="+unit+"\n", 1)
+			} else {
+				block += "Id=" + unit + "\n"
+			}
+			blocks = append(blocks, block)
+		}
+		return []byte(strings.Join(blocks, "\n")), nil
+	}
+	sb := &SystemdSandbox{units: make(map[string]*contracts.SandboxInfo), run: runner}
+	results := sb.InspectMany(context.Background(), []string{"alpha", "beta"})
+	if calls != 1 || len(requested) != 1 || !reflect.DeepEqual(requested[0], []string{"paas-deploy-alpha.service", "paas-deploy-beta.service"}) {
+		t.Fatalf("show calls=%d requested=%v; want one call for both units", calls, requested)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results length=%d, want 2", len(results))
+	}
+	for i, result := range results {
+		if result.Err != nil || result.Info == nil || !result.Info.Running || result.Info.ID != []string{"alpha", "beta"}[i] {
+			t.Fatalf("result %d = %+v, want running matching unit", i, result)
+		}
+	}
+}
+
+func TestSystemdInspectManyBoundsBatchesAndRejectsPartialOutput(t *testing.T) {
+	ids := make([]string, systemdInspectBatchSize+1)
+	for i := range ids {
+		ids[i] = "app" + strings.Repeat("a", i+1)
+	}
+	calls := 0
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		calls++
+		showAt := slices.Index(args, "show")
+		var units []string
+		for _, arg := range args[showAt+1:] {
+			if arg == "-p" {
+				break
+			}
+			units = append(units, arg)
+		}
+		blocks := make([]string, 0, len(units))
+		for _, unit := range units {
+			blocks = append(blocks, "Id="+unit+"\n"+runningUnit)
+		}
+		return []byte(strings.Join(blocks, "\n")), nil
+	}
+	sb := &SystemdSandbox{units: make(map[string]*contracts.SandboxInfo), run: runner}
+	results := sb.InspectMany(context.Background(), ids)
+	if calls != 2 || len(results) != len(ids) {
+		t.Fatalf("calls=%d results=%d; want 2 batches and %d results", calls, len(results), len(ids))
+	}
+	for i, result := range results {
+		if result.Err != nil || result.Info == nil || result.Info.ID != ids[i] {
+			t.Fatalf("result %d = %+v, want matching runtime", i, result)
+		}
+	}
+
+	alphaUnit, _ := SystemdUnitName("alpha")
+	sb.run = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("Id=" + alphaUnit + "\n" + runningUnit), nil
+	}
+	partial := sb.InspectMany(context.Background(), []string{"alpha", "beta"})
+	if partial[0].Err != nil || partial[0].Info == nil || partial[1].Err == nil || partial[1].Info != nil {
+		t.Fatalf("partial batch was not classified per unit: %+v", partial)
+	}
+}
+
+func TestSystemdInspectManyClassifiesMissingOOMAndClonesCachedExit(t *testing.T) {
+	unitFor := func(id string) string {
+		unit, err := SystemdUnitName(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return unit
+	}
+	blocks := []string{
+		"Id=" + unitFor("healthy") + "\n" + runningUnit,
+		"Id=" + unitFor("gone") + "\n" + missingUnit,
+		"Id=" + unitFor("oom") + "\n" + oomUnit,
+	}
+	sb := &SystemdSandbox{
+		units: make(map[string]*contracts.SandboxInfo),
+		run: func(context.Context, string, ...string) ([]byte, error) {
+			return []byte(strings.Join(blocks, "\n")), nil
+		},
+	}
+	results := sb.InspectMany(context.Background(), []string{"healthy", "gone", "oom"})
+	if len(results) != 3 || results[0].Err != nil || results[0].Info == nil || !results[0].Info.Running {
+		t.Fatalf("healthy result = %+v", results)
+	}
+	if !errors.Is(results[1].Err, ErrSandboxNotFound) || results[1].Info != nil {
+		t.Fatalf("missing result = %+v, want not found", results[1])
+	}
+	if results[2].Err != nil || results[2].Info == nil || !results[2].Info.OOMKilled || results[2].Info.ExitCode == nil || *results[2].Info.ExitCode != 137 {
+		t.Fatalf("OOM result = %+v", results[2])
+	}
+
+	exitCode := 137
+	sb.units["cached"] = &contracts.SandboxInfo{ID: "cached", ExitCode: &exitCode}
+	cached := sb.InspectMany(context.Background(), []string{"cached"})
+	if cached[0].Err != nil || cached[0].Info == nil || cached[0].Info.ExitCode == nil {
+		t.Fatalf("cached result = %+v", cached[0])
+	}
+	*cached[0].Info.ExitCode = 1
+	again := sb.InspectMany(context.Background(), []string{"cached"})
+	if again[0].Info == nil || again[0].Info.ExitCode == nil || *again[0].Info.ExitCode != 137 {
+		t.Fatalf("cached exit snapshot was mutable: %+v", again[0])
+	}
+}
+
+func TestSystemdInspectManyRejectsIncompleteLifecycleProperties(t *testing.T) {
+	unit, _ := SystemdUnitName("truncated")
+	sb := &SystemdSandbox{
+		units: make(map[string]*contracts.SandboxInfo),
+		run: func(context.Context, string, ...string) ([]byte, error) {
+			return []byte("Id=" + unit + "\nLoadState=loaded\nActiveState=failed\nSubState=failed\nMainPID=0\nResult=success\n"), nil
+		},
+	}
+	result := sb.InspectMany(context.Background(), []string{"truncated"})[0]
+	if result.Err == nil || result.Info != nil || !strings.Contains(result.Err.Error(), "ExecMainCode") {
+		t.Fatalf("truncated lifecycle record = %+v; want an inspection error", result)
+	}
+}
+
+func TestSystemdInspectManyCommandFailureAndCanceledContextAreSafe(t *testing.T) {
+	commandErr := errors.New("systemd manager unavailable")
+	calls := 0
+	sb := &SystemdSandbox{units: make(map[string]*contracts.SandboxInfo), run: func(context.Context, string, ...string) ([]byte, error) {
+		calls++
+		return []byte("Id=paas-deploy-alpha.service\n" + runningUnit), commandErr
+	}}
+	failed := sb.InspectMany(context.Background(), []string{"alpha", "beta"})
+	if calls != 1 || len(failed) != 2 {
+		t.Fatalf("calls=%d results=%d; want one failed batch", calls, len(failed))
+	}
+	for _, result := range failed {
+		if !errors.Is(result.Err, commandErr) || result.Info != nil {
+			t.Fatalf("command failure produced unsafe result: %+v", result)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceled := sb.InspectMany(ctx, []string{"alpha", "beta"})
+	if calls != 1 || len(canceled) != 2 {
+		t.Fatalf("canceled batch called systemctl: calls=%d results=%d", calls, len(canceled))
+	}
+	for _, result := range canceled {
+		if !errors.Is(result.Err, context.Canceled) || result.Info != nil {
+			t.Fatalf("canceled batch produced unsafe result: %+v", result)
+		}
+	}
+}
+
 type systemdRunner struct {
 	state             string
 	startErr, stopErr error

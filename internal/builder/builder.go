@@ -105,6 +105,13 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 	if err := prepareBuildCache(dataDir, cacheDir, b.buildUser); err != nil {
 		return nil, err
 	}
+	nodeCacheDir := ""
+	if req.Runtime == "node" {
+		nodeCacheDir, err = prepareNodeBuildCache(cacheDir, req.AppName, b.buildUser)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	workspace, err := os.MkdirTemp("", "paas-build-")
 	if err != nil {
@@ -144,7 +151,7 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 		output = logFile
 	}
 
-	env := buildEnvironment(outputDir, homeDir, tempDir, cacheDir)
+	env := buildEnvironment(outputDir, homeDir, tempDir, cacheDir, nodeCacheDir)
 	if os.Geteuid() == 0 {
 		if err := assignTree(workspace, b.buildUser); err != nil {
 			return nil, err
@@ -195,7 +202,7 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 	return b.publish(dataDir, outputDir, req.Runtime, req.StartCommand, sourceHash)
 }
 
-func buildEnvironment(outputDir, homeDir, tempDir, cacheDir string) []string {
+func buildEnvironment(outputDir, homeDir, tempDir, cacheDir, nodeCacheDir string) []string {
 	pathValue := "/usr/local/bin:/usr/local/go/bin:/usr/bin:/bin"
 	if home, err := os.UserHomeDir(); err == nil {
 		pathValue = filepath.Join(home, ".local", "bin") + ":" + pathValue
@@ -203,7 +210,7 @@ func buildEnvironment(outputDir, homeDir, tempDir, cacheDir string) []string {
 	if inheritedPath := os.Getenv("PATH"); inheritedPath != "" {
 		pathValue += ":" + inheritedPath
 	}
-	return []string{
+	env := []string{
 		"PATH=" + pathValue,
 		"HOME=" + homeDir,
 		"TMPDIR=" + tempDir,
@@ -214,6 +221,72 @@ func buildEnvironment(outputDir, homeDir, tempDir, cacheDir string) []string {
 		"GOCACHE=" + filepath.Join(cacheDir, "go-build"),
 		"GOMODCACHE=" + filepath.Join(cacheDir, "go", "pkg", "mod"),
 	}
+	if nodeCacheDir != "" {
+		npmCache := filepath.Join(nodeCacheDir, "npm")
+		pnpmCache := filepath.Join(nodeCacheDir, "pnpm")
+		yarnCache := filepath.Join(nodeCacheDir, "yarn")
+		env = append(env,
+			"npm_config_cache="+npmCache,
+			"npm_config_store_dir="+pnpmCache,
+			"pnpm_config_store_dir="+pnpmCache,
+			"YARN_CACHE_FOLDER="+yarnCache,
+			"YARN_GLOBAL_FOLDER="+yarnCache,
+		)
+	}
+	return env
+}
+
+// prepareNodeBuildCache returns persistent per-application package-manager
+// cache paths. Package managers create their own internal files under each
+// directory, so the app tree is secured before the build command is launched.
+func prepareNodeBuildCache(cacheDir, appName, buildUser string) (string, error) {
+	if !config.ValidName(appName) {
+		return "", fmt.Errorf("invalid application name %q", appName)
+	}
+	nodeDir := filepath.Join(cacheDir, "node")
+	appDir := filepath.Join(nodeDir, appName)
+	for _, dir := range []string{nodeDir, appDir} {
+		if err := preparePrivateBuildDir(dir, buildUser); err != nil {
+			return "", fmt.Errorf("prepare Node build cache: %w", err)
+		}
+	}
+	for _, manager := range []string{"npm", "pnpm", "yarn"} {
+		if err := preparePrivateBuildDir(filepath.Join(appDir, manager), buildUser); err != nil {
+			return "", fmt.Errorf("prepare Node %s cache: %w", manager, err)
+		}
+	}
+	return appDir, nil
+}
+
+func preparePrivateBuildDir(path, buildUser string) error {
+	if err := os.Mkdir(path, 0700); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s must be a real directory", path)
+	}
+	if os.Geteuid() == 0 {
+		uid, gid, err := unprivilegedUserIDs(buildUser)
+		if err != nil {
+			return err
+		}
+		if err := os.Chown(path, uid, gid); err != nil {
+			return fmt.Errorf("assign %s to %s: %w", path, buildUser, err)
+		}
+	} else {
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || int(stat.Uid) != os.Geteuid() {
+			return fmt.Errorf("%s must be owned by the current user", path)
+		}
+	}
+	if err := os.Chmod(path, 0700); err != nil {
+		return fmt.Errorf("secure %s: %w", path, err)
+	}
+	return nil
 }
 
 func prepareBuildCache(dataDir, cacheDir, buildUser string) error {

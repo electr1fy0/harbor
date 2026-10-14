@@ -42,6 +42,20 @@ type Sandbox interface {
 	Inspect(context.Context, string) (*SandboxInfo, error)
 }
 
+// SandboxInspection pairs one batch inspection result with its error. A
+// SandboxBatchInspector returns one result per requested ID, in the same order.
+type SandboxInspection struct {
+	Info *SandboxInfo
+	Err  error
+}
+
+// SandboxBatchInspector is an optional optimization for backends that can
+// inspect multiple runtimes in one manager call. Other backends keep using
+// Sandbox.Inspect.
+type SandboxBatchInspector interface {
+	InspectMany(context.Context, []string) []SandboxInspection
+}
+
 // BindMount specifies a host-to-sandbox directory mount.
 type BindMount struct {
 	HostPath  string
