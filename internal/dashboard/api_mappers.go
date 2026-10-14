@@ -399,6 +399,7 @@ func mapRelease(value any) (map[string]any, bool) {
 		"runtime":    safeString(release["runtime"], 64),
 		"createdAt":  safeTime(release["created_at"]),
 		"isActive":   safeBoolean(release["is_active"]),
+		"artifactAvailable": safeBoolean(release["artifactAvailable"]),
 	}, true
 }
 

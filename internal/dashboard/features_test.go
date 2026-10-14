@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,7 +34,8 @@ func TestFeatureGatewayStrictHandlersAndDeleteOrdering(t *testing.T) {
 	control := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/observe" {
+		body, _ := io.ReadAll(r.Body)
+		if r.URL.Path == "/observe" && strings.Contains(string(body), "configure") {
 			w.WriteHeader(400)
 			w.Write([]byte(`{"error":"Invalid settings."}`))
 			return
@@ -52,8 +54,13 @@ func TestFeatureGatewayStrictHandlersAndDeleteOrdering(t *testing.T) {
 	}
 	calls = nil
 	w = invoke("operations", `{"action":"delete","appName":"demo","preserveData":true}`)
-	if w.Code != 200 || len(calls) != 2 || calls[0] != "/automation" || calls[1] != "/operations" {
+	if w.Code != 200 || len(calls) != 3 || calls[0] != "/automation" || calls[1] != "/observe" || calls[2] != "/operations" {
 		t.Fatalf("delete calls=%v code=%d", calls, w.Code)
+	}
+	calls = nil
+	w = invoke("operations", `{"action":"delete","appName":"demo","preserveData":true,"unexpected":1}`)
+	if w.Code != 400 || len(calls) != 0 {
+		t.Fatal("invalid delete mutated source settings")
 	}
 	calls = nil
 	w = invoke("operations", `{"action":"delete","appName":"demo"}`)

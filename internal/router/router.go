@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"paas/internal/contracts"
 )
@@ -18,6 +19,7 @@ var _ contracts.Router = (*HostRouter)(nil)
 
 type route struct {
 	proxy    *httputil.ReverseProxy
+	upstream string
 	inflight int
 	retired  bool
 	drained  chan struct{}
@@ -30,11 +32,13 @@ type HostRouter struct {
 	updateMu sync.Mutex
 	mu       sync.Mutex
 	routes   map[string]*route
+	policies map[string]TrafficPolicy
+	traffic  map[string]TrafficStats
 }
 
 // New creates an empty hostname router.
 func New() *HostRouter {
-	return &HostRouter{routes: make(map[string]*route)}
+	return &HostRouter{routes: make(map[string]*route), policies: make(map[string]TrafficPolicy), traffic: make(map[string]TrafficStats)}
 }
 
 // Set adds or replaces a route. The interface intentionally has no error
@@ -94,10 +98,11 @@ func (r *HostRouter) SwitchRoutes(hosts []string, upstream string, commit func()
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.inheritTrafficPolicy(hosts)
 	var draining []<-chan struct{}
 	for _, host := range hosts {
 		old := r.routes[host]
-		r.routes[host] = &route{proxy: proxy, drained: make(chan struct{})}
+		r.routes[host] = &route{proxy: proxy, upstream: target.String(), drained: make(chan struct{})}
 		if old != nil {
 			r.retire(old)
 			draining = append(draining, old.drained)
@@ -130,6 +135,7 @@ func (r *HostRouter) UpdateRoutes(hosts, remove []string, upstream string, commi
 		return err
 	}
 	var proxy *httputil.ReverseProxy
+	var upstreamIdentity string
 	if len(setHosts) > 0 {
 		target, err := url.Parse(upstream)
 		if err != nil {
@@ -142,6 +148,7 @@ func (r *HostRouter) UpdateRoutes(hosts, remove []string, upstream string, commi
 			return fmt.Errorf("upstream host must not be empty")
 		}
 		proxy = httputil.NewSingleHostReverseProxy(target)
+		upstreamIdentity = target.String()
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 			log.Printf("proxy to %s: %v", target.Redacted(), err)
 			http.Error(w, "upstream unavailable", http.StatusBadGateway)
@@ -160,11 +167,16 @@ func (r *HostRouter) UpdateRoutes(hosts, remove []string, upstream string, commi
 		if old := r.routes[host]; old != nil {
 			r.retire(old)
 			delete(r.routes, host)
+			delete(r.traffic, host)
+			if !strings.HasSuffix(host, ".localhost") {
+				delete(r.policies, host)
+			}
 		}
 	}
+	r.inheritTrafficPolicy(setHosts)
 	for _, host := range setHosts {
 		old := r.routes[host]
-		r.routes[host] = &route{proxy: proxy, drained: make(chan struct{})}
+		r.routes[host] = &route{proxy: proxy, upstream: upstreamIdentity, drained: make(chan struct{})}
 		if old != nil {
 			r.retire(old)
 		}
@@ -203,14 +215,23 @@ func (r *HostRouter) Delete(host string) {
 		r.retire(old)
 	}
 	delete(r.routes, host)
+	delete(r.traffic, host)
+	if !strings.HasSuffix(host, ".localhost") {
+		delete(r.policies, host)
+	}
 	r.mu.Unlock()
 }
 
 // ServeHTTP routes the request based on the normalized Host header.
 func (r *HostRouter) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	host := normalizeHost(request.Host)
+	started := time.Now()
+	counter := &trafficWriter{ResponseWriter: w}
+	w = counter
+	defer func() { r.recordTraffic(host, counter.status, counter.bytes, time.Since(started)) }()
 	r.mu.Lock()
 	entry, ok := r.routes[host]
+	policy := r.policies[host]
 	if ok {
 		entry.inflight++
 	}
@@ -228,6 +249,23 @@ func (r *HostRouter) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 			close(entry.drained)
 		}
 	}()
+	if policy.Maintenance {
+		w.Header().Set("Retry-After", "60")
+		message := policy.Message
+		if message == "" {
+			message = "Application temporarily unavailable for maintenance."
+		}
+		http.Error(w, message, http.StatusServiceUnavailable)
+		return
+	}
+	if policy.PrimaryDomain != "" && host != policy.PrimaryDomain {
+		target := "https://" + policy.PrimaryDomain + request.URL.EscapedPath()
+		if request.URL.RawQuery != "" {
+			target += "?" + request.URL.RawQuery
+		}
+		http.Redirect(w, request, target, http.StatusPermanentRedirect)
+		return
+	}
 	entry.proxy.ServeHTTP(w, request)
 }
 

@@ -230,6 +230,7 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 	registerOperationsRoutes(mux, service)
 	registerAutomationRoutes(mux, server)
 	registerDataServicesRoutes(mux, services, service)
+	registerObservabilityRoutes(mux, service)
 	if scheduled, ok := services.(interface{ StartBackups(context.Context) }); ok && service != nil {
 		scheduled.StartBackups(service.LifetimeContext())
 	}

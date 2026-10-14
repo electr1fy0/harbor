@@ -421,27 +421,38 @@ func validateOptionalConfig(c *configInput, fields map[string]json.RawMessage) b
 
 func dispatchDashboard(ctx context.Context, control http.Handler, name string, body []byte, fields map[string]json.RawMessage) (any, *apiFailure) {
 	if endpoint, ok := map[string]string{"operations": "/operations", "automation": "/automation", "dataServices": "/data-services", "observe": "/observe"}[name]; ok {
-		if name == "operations" && string(fields["action"]) == `"delete"` {
-			var appName string
-			if json.Unmarshal(fields["appName"], &appName) != nil || !validAppName(appName) {
+		var action string
+		if json.Unmarshal(fields["action"], &action) != nil || action == "" {
+			return nil, invalidRequest()
+		}
+		if name == "operations" && action == "delete" {
+			input, ok := decodeDashboardInput[struct {
+				Action       string `json:"action"`
+				AppName      string `json:"appName"`
+				PreserveData *bool  `json:"preserveData"`
+			}](body)
+			if !ok || !validAppName(input.AppName) || input.PreserveData == nil {
 				return nil, invalidRequest()
 			}
-			var preserve bool
-			if fields["preserveData"] == nil || string(fields["preserveData"]) == "null" || json.Unmarshal(fields["preserveData"], &preserve) != nil {
-				return nil, invalidRequest()
-			}
-			forgotten, fail := invokeControlJSON(ctx, control, http.MethodPost, "/automation", map[string]any{"action": "forgetSource", "name": appName}, defaultControlWait)
+			forgotten, fail := invokeControlJSON(ctx, control, http.MethodPost, "/automation", map[string]any{"action": "forgetSource", "name": input.AppName}, defaultControlWait)
 			if fail != nil {
 				return nil, fail
 			}
 			if forgotten.status < 200 || forgotten.status >= 300 {
 				return nil, operationFailure("Deployment jobs must finish canceling before this project can be deleted.")
 			}
+			observed, fail := invokeControlJSON(ctx, control, http.MethodPost, "/observe", map[string]any{"action": "forget", "name": input.AppName}, defaultControlWait)
+			if fail != nil {
+				return nil, fail
+			}
+			if observed.status < 200 || observed.status >= 300 {
+				return nil, operationFailure("Routing and notification settings must be cleared before this project can be deleted.")
+			}
 		}
 		// Each feature handler owns a strict request schema and a public response
 		// projection. The gateway retains the dashboard's auth and size limits.
 		limit := maxControlResponse
-		if name == "dataServices" && string(fields["action"]) == `"export"` {
+		if name == "dataServices" && action == "export" {
 			limit = 70 << 20
 		}
 		response, fail := invokeControlWithLimit(ctx, control, http.MethodPost, endpoint, body, deploymentControlWait, limit)
