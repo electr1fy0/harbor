@@ -354,7 +354,8 @@ func TestCycle4SQLiteManagedServiceAndPersistence(t *testing.T) {
 	sqliteSrc := filepath.Join(root, "examples", "sqlite-app")
 	deployOut, err := cli("deploy", sqliteSrc, "--name", "sqliteapp")
 	if err != nil {
-		t.Fatalf("deploy sqlite-app failed: %v: %s", err, deployOut)
+		buildLogs, _ := cli("logs", "sqliteapp")
+		t.Fatalf("deploy sqlite-app failed: %v: %s\nbuild logs: %s", err, deployOut, buildLogs)
 	}
 	if !strings.Contains(deployOut, "State: RUNNING") {
 		t.Fatalf("unexpected deploy output: %s", deployOut)
