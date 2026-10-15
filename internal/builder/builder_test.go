@@ -59,6 +59,44 @@ func TestPruneCacheHonorsContextWhileWaitingForBuild(t *testing.T) {
 	}
 }
 
+func TestBuildTimeoutCoversWaitingForBuildCache(t *testing.T) {
+	if os.Geteuid() == 0 && runtime.GOOS != "linux" {
+		t.Skip("root builds require Linux systemd-run")
+	}
+	root := t.TempDir()
+	source := writeGoFixture(t, filepath.Join(root, "source"))
+	b := New(Options{DataDir: filepath.Join(root, "data"), Timeout: 20 * time.Millisecond})
+	b.cacheMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			b.cacheMu.Unlock()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Build(context.Background(), fixtureRequest(source, ""))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Build while waiting for cache = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		b.cacheMu.Unlock()
+		locked = false
+		select {
+		case err := <-done:
+			t.Fatalf("Build did not apply its timeout while waiting for cache; after release it returned %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Build remained stuck after the cache lock was released")
+		}
+	}
+	b.cacheMu.Unlock()
+	locked = false
+}
+
 func TestBuildPublishesDeterministicImmutableReleases(t *testing.T) {
 	skipRootBuild(t)
 	root := t.TempDir()
@@ -386,6 +424,62 @@ func TestCopySourceHashIncludesExecutableMode(t *testing.T) {
 	}
 }
 
+func TestCopySourceHashIncludesEmptyDirectories(t *testing.T) {
+	root := t.TempDir()
+	sourceA := t.TempDir()
+	sourceB := t.TempDir()
+	if err := os.Mkdir(filepath.Join(sourceB, "empty"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	destinationA := filepath.Join(root, "a")
+	destinationB := filepath.Join(root, "b")
+	if err := os.Mkdir(destinationA, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destinationB, 0700); err != nil {
+		t.Fatal(err)
+	}
+	hashA, err := copySource(sourceA, destinationA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hashB, err := copySource(sourceB, destinationB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hashA == hashB {
+		t.Fatal("source hash did not include an empty directory")
+	}
+}
+
+type cancelOnWrite struct{ cancel context.CancelFunc }
+
+func (w cancelOnWrite) Write(value []byte) (int, error) {
+	w.cancel()
+	return len(value), nil
+}
+
+func TestCopyRegularFileStopsWhenContextIsCanceledMidCopy(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "large-file")
+	if err := os.WriteFile(source, bytes.Repeat([]byte("x"), 1<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "copy")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err = copyRegularFileContext(ctx, source, destination, "large-file", info, cancelOnWrite{cancel: cancel})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copyRegularFileContext() error = %v, want cancellation", err)
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled copy left a partial destination: %v", err)
+	}
+}
+
 func fixtureRequest(source, logPath string) contracts.BuildRequest {
 	return contracts.BuildRequest{
 		SourceDir:    source,
@@ -455,6 +549,126 @@ func TestNodeBuildPublishesRelease(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(release.ArtifactDir, "server.js")); err != nil {
 		t.Fatalf("server.js not found in artifact dir: %v", err)
+	}
+}
+
+func TestNodeBuildKeepsRootBinDirectoryInFallbackArtifact(t *testing.T) {
+	skipRootBuild(t)
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	if err := os.MkdirAll(filepath.Join(sourceDir, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "package.json"), []byte(`{"name":"bin-entrypoint","version":"1.0.0"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entrypoint := filepath.Join(sourceDir, "bin", "www")
+	if err := os.WriteFile(entrypoint, []byte("console.log('bin entrypoint')\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(root, "data")
+	defer removeTree(dataDir)
+	release, err := New(Options{DataDir: dataDir}).Build(context.Background(), contracts.BuildRequest{
+		SourceDir: sourceDir, AppName: "bin-entrypoint", Runtime: "node",
+		BuildCommand: "test -f bin/www", StartCommand: "node /app/bin/www",
+	})
+	if err != nil {
+		t.Fatalf("Node build with a root bin/ entrypoint failed: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(release.ArtifactDir, "bin", "www")); err != nil || string(data) != "console.log('bin entrypoint')\n" {
+		t.Fatalf("fallback artifact omitted Node's bin/ entrypoint: data=%q err=%v", data, err)
+	}
+}
+
+func TestNodeBuildPublishesInternalPackageManagerSymlinks(t *testing.T) {
+	skipRootBuild(t)
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	if err := os.MkdirAll(filepath.Join(sourceDir, "node_modules"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "package.json"), []byte(`{"name":"linked-package","version":"1.0.0"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(root, "data")
+	defer removeTree(dataDir)
+	buildCommand := `set -eu; mkdir -p node_modules/.bin node_modules/pkg; printf '#!/bin/sh\nprintf linked\n' > node_modules/pkg/cli.js; chmod +x node_modules/pkg/cli.js; ln -s ../pkg/cli.js node_modules/.bin/tool`
+	release, err := New(Options{DataDir: dataDir}).Build(context.Background(), contracts.BuildRequest{
+		SourceDir: sourceDir, AppName: "linked-package", Runtime: "node",
+		BuildCommand: buildCommand, StartCommand: "node /app/node_modules/.bin/tool",
+	})
+	if err != nil {
+		t.Fatalf("Node build with an internal package-manager symlink failed: %v", err)
+	}
+	link := filepath.Join(release.ArtifactDir, "node_modules", ".bin", "tool")
+	if target, err := os.Readlink(link); err != nil || target != "../pkg/cli.js" {
+		t.Fatalf("published package-manager link target = %q, err=%v", target, err)
+	}
+	output, err := exec.Command(link).CombinedOutput()
+	if err != nil || string(output) != "linked" {
+		t.Fatalf("published package-manager link did not run its internal target: output=%q err=%v", output, err)
+	}
+}
+
+func TestNodeBuildRejectsExternalAndCyclicDependencySymlinks(t *testing.T) {
+	skipRootBuild(t)
+	for _, test := range []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{name: "external", command: "ln -s /etc/passwd node_modules/escape", want: "absolute target"},
+		{name: "cycle", command: "ln -s second node_modules/first; ln -s first node_modules/second", want: "cyclic"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			sourceDir := filepath.Join(root, "source")
+			if err := os.MkdirAll(filepath.Join(sourceDir, "node_modules"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(sourceDir, "package.json"), []byte(`{"name":"unsafe-links","version":"1.0.0"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := New(Options{DataDir: filepath.Join(root, "data")}).Build(context.Background(), contracts.BuildRequest{
+				SourceDir: sourceDir, AppName: "unsafe-links", Runtime: "node",
+				BuildCommand: test.command, StartCommand: "node /app/server.js",
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Build() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateArtifactSymlinksRejectsExternalAndCyclicTargets(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		links map[string]string
+		want  string
+	}{
+		{name: "external", links: map[string]string{"escape": "../outside"}, want: "escapes the release"},
+		{name: "cycle", links: map[string]string{"first": "second", "second": "first"}, want: "dangling or cyclic"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := t.TempDir()
+			root := filepath.Join(base, "artifact")
+			if err := os.Mkdir(root, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if test.name == "external" {
+				if err := os.WriteFile(filepath.Join(base, "outside"), []byte("outside"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for name, target := range test.links {
+				if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := validateArtifactSymlinks(root); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateArtifactSymlinks() error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

@@ -12,6 +12,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { configureApp } from "@/lib/harbor.functions"
+import { shouldClearRuntimeSecretDraft } from "@/lib/features"
 import type { AppSettings } from "@/lib/types"
 import type { ConfigureAppInput } from "@/lib/validation"
 
@@ -39,11 +40,15 @@ export function ProjectSettings({
   const updateMutation = useMutation({
     mutationFn: (input: Omit<ConfigureAppInput, "name">) =>
       configureApp({ data: { name, ...input } }),
-    onSuccess: async (updated) => {
+    onSuccess: async (updated, input) => {
       setCurrent(updated)
       setMemoryLimit(updated.memoryLimit)
       setCpuQuota(String(updated.cpuQuota || ""))
       setTasksLimit(String(updated.tasksLimit || ""))
+      if (shouldClearRuntimeSecretDraft(input)) {
+        setEnvironmentKey("")
+        setEnvironmentValue("")
+      }
       setMessage("")
       await onSaved(updated)
     },
@@ -65,8 +70,6 @@ export function ProjectSettings({
       return
     }
     updateMutation.mutate({ environment: { [key]: environmentValue } })
-    setEnvironmentKey("")
-    setEnvironmentValue("")
   }
 
   function saveResources(event: FormEvent<HTMLFormElement>) {

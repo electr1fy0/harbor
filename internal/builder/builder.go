@@ -179,7 +179,11 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 	if buildTimeout <= 0 {
 		buildTimeout = b.timeout
 	}
-	if err := b.acquireCacheLock(ctx, req.ClearCache); err != nil {
+	// The build timeout covers waiting for shared build resources and staging
+	// source as well as executing and publishing the build output.
+	buildCtx, cancel := context.WithTimeout(ctx, buildTimeout)
+	defer cancel()
+	if err := b.acquireCacheLock(buildCtx, req.ClearCache); err != nil {
 		return nil, err
 	}
 	if req.ClearCache {
@@ -229,8 +233,11 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 		}
 	}
 
-	sourceHash, err := copySource(req.SourceDir, sourceRoot)
+	sourceHash, err := copySourceForRuntimeContext(buildCtx, req.SourceDir, sourceRoot, req.Runtime)
 	if err != nil {
+		return nil, err
+	}
+	if err := buildCtx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -264,8 +271,6 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 			return nil, err
 		}
 	}
-	buildCtx, cancel := context.WithTimeout(ctx, buildTimeout)
-	defer cancel()
 	var buildErr error
 	if os.Geteuid() == 0 {
 		buildErr = runSystemd(buildCtx, b.buildUser, buildTimeout, sourceRoot, env, output, req.BuildCommand)
@@ -295,7 +300,7 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 		entries, _ := os.ReadDir(outputDir)
 		if len(entries) == 0 {
 			// Copy built sourceRoot into outputDir
-			if err := copyDirectory(sourceRoot, outputDir, "", true, io.Discard); err != nil {
+			if err := copyBuildOutputContext(buildCtx, sourceRoot, outputDir); err != nil {
 				return nil, fmt.Errorf("copy node build output: %w", err)
 			}
 		}
@@ -310,7 +315,7 @@ func (b *GoBuilder) Build(ctx context.Context, req contracts.BuildRequest) (*con
 		}
 	}
 
-	return b.publish(dataDir, outputDir, req.Runtime, req.StartCommand, sourceHash)
+	return b.publish(buildCtx, dataDir, outputDir, req.Runtime, req.StartCommand, sourceHash)
 }
 
 func buildEnvironment(outputDir, homeDir, tempDir, cacheDir, nodeCacheDir string) []string {
@@ -582,6 +587,26 @@ func openBuildLog(path string) (*os.File, error) {
 }
 
 func copySource(sourceDir, destination string) (string, error) {
+	return copySourceContext(context.Background(), sourceDir, destination)
+}
+
+func copySourceContext(ctx context.Context, sourceDir, destination string) (string, error) {
+	return copySourceWithOptionsContext(ctx, sourceDir, destination, true)
+}
+
+func copySourceForRuntimeContext(ctx context.Context, sourceDir, destination, runtimeName string) (string, error) {
+	// Go repositories often keep generated binaries in a root bin/ directory,
+	// while Node applications commonly use bin/ for their entrypoint and scripts.
+	return copySourceWithOptionsContext(ctx, sourceDir, destination, runtimeName == "go")
+}
+
+func copySourceWithOptionsContext(ctx context.Context, sourceDir, destination string, excludeRootBin bool) (string, error) {
+	if ctx == nil {
+		return "", fmt.Errorf("source copy context must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	info, err := os.Lstat(sourceDir)
 	if err != nil {
 		return "", fmt.Errorf("inspect source directory: %w", err)
@@ -591,13 +616,34 @@ func copySource(sourceDir, destination string) (string, error) {
 	}
 
 	hash := sha256.New()
-	if err := copyDirectory(sourceDir, destination, "", true, hash); err != nil {
+	if err := copyDirectoryPolicyContext(ctx, sourceDir, destination, "", true, excludeRootBin, false, hash); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func copyDirectory(source, destination, relative string, excludePlatformEntries bool, hash io.Writer) error {
+	return copyDirectoryContext(context.Background(), source, destination, relative, excludePlatformEntries, hash)
+}
+
+func copyDirectoryContext(ctx context.Context, source, destination, relative string, excludePlatformEntries bool, hash io.Writer) error {
+	return copyDirectoryPolicyContext(ctx, source, destination, relative, excludePlatformEntries, excludePlatformEntries, false, hash)
+}
+
+// copyBuildOutputContext preserves relative symlinks emitted by package
+// managers, such as node_modules/.bin entries. The completed tree is validated
+// before publication so these links cannot escape the release artifact.
+func copyBuildOutputContext(ctx context.Context, source, destination string) error {
+	return copyDirectoryPolicyContext(ctx, source, destination, "", false, false, true, io.Discard)
+}
+
+func copyDirectoryPolicyContext(ctx context.Context, source, destination, relative string, excludePlatformEntries, excludeRootBin, allowSymlinks bool, hash io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	rootInfo, err := os.Lstat(source)
 	if err != nil {
 		return fmt.Errorf("inspect source directory %s: %w", source, err)
@@ -605,13 +651,27 @@ func copyDirectory(source, destination, relative string, excludePlatformEntries 
 	if !rootInfo.IsDir() {
 		return fmt.Errorf("source path %s must be a real directory", source)
 	}
+	if hash != nil {
+		pathBytes := []byte(filepath.ToSlash(relative))
+		var integer [8]byte
+		_, _ = hash.Write([]byte{'D'})
+		binary.BigEndian.PutUint64(integer[:], uint64(len(pathBytes)))
+		_, _ = hash.Write(integer[:])
+		_, _ = hash.Write(pathBytes)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(source)
 	if err != nil {
 		return fmt.Errorf("read source directory %s: %w", source, err)
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		name := entry.Name()
-		if excludePlatformEntries && (name == ".git" || name == "bin" || name == ".paas") {
+		if relative == "" && excludePlatformEntries && (name == ".git" || name == ".paas" || (excludeRootBin && name == "bin")) {
 			continue
 		}
 		sourcePath := filepath.Join(source, name)
@@ -629,12 +689,20 @@ func copyDirectory(source, destination, relative string, excludePlatformEntries 
 			if err := os.Mkdir(destinationPath, 0700); err != nil {
 				return fmt.Errorf("create source directory %s: %w", relPath, err)
 			}
-			if err := copyDirectory(sourcePath, destinationPath, relPath, false, hash); err != nil {
+			if err := copyDirectoryPolicyContext(ctx, sourcePath, destinationPath, relPath, false, false, allowSymlinks, hash); err != nil {
 				return err
 			}
 		case info.Mode().IsRegular():
-			if err := copyRegularFile(sourcePath, destinationPath, relPath, info, hash); err != nil {
+			if err := copyRegularFileContext(ctx, sourcePath, destinationPath, relPath, info, hash); err != nil {
 				return err
+			}
+		case info.Mode()&os.ModeSymlink != 0 && allowSymlinks:
+			linkTarget, err := os.Readlink(sourcePath)
+			if err != nil {
+				return fmt.Errorf("read build output symlink %s: %w", relPath, err)
+			}
+			if err := os.Symlink(linkTarget, destinationPath); err != nil {
+				return fmt.Errorf("copy build output symlink %s: %w", relPath, err)
 			}
 		default:
 			return fmt.Errorf("source entry %s is a symlink or unsupported special file", relPath)
@@ -644,6 +712,13 @@ func copyDirectory(source, destination, relative string, excludePlatformEntries 
 }
 
 func copyRegularFile(source, destination, relative string, info os.FileInfo, hash io.Writer) error {
+	return copyRegularFileContext(context.Background(), source, destination, relative, info, hash)
+}
+
+func copyRegularFileContext(ctx context.Context, source, destination, relative string, info os.FileInfo, hash io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	input, err := os.Open(source)
 	if err != nil {
 		return fmt.Errorf("open source file %s: %w", relative, err)
@@ -671,6 +746,7 @@ func copyRegularFile(source, destination, relative string, info os.FileInfo, has
 
 	pathBytes := []byte(filepath.ToSlash(relative))
 	var integer [8]byte
+	_, _ = hash.Write([]byte{'F'})
 	binary.BigEndian.PutUint64(integer[:], uint64(len(pathBytes)))
 	_, _ = hash.Write(integer[:])
 	_, _ = hash.Write(pathBytes)
@@ -678,9 +754,10 @@ func copyRegularFile(source, destination, relative string, info os.FileInfo, has
 	_, _ = hash.Write(integer[:])
 	_, _ = hash.Write([]byte{byte(executable >> 8), byte(executable)})
 
-	written, copyErr := io.Copy(io.MultiWriter(output, hash), input)
+	written, copyErr := io.Copy(io.MultiWriter(output, hash), contextReader{ctx: ctx, reader: input})
 	closeErr := output.Close()
 	if copyErr != nil {
+		_ = os.Remove(destination)
 		return fmt.Errorf("copy source file %s: %w", relative, copyErr)
 	}
 	if closeErr != nil {
@@ -690,6 +767,18 @@ func copyRegularFile(source, destination, relative string, info os.FileInfo, has
 		return fmt.Errorf("source file %s changed size while it was being copied", relative)
 	}
 	return nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(buffer)
 }
 
 func runLocal(ctx context.Context, directory string, env []string, output io.Writer, buildCommand string) error {
@@ -818,7 +907,10 @@ func unprivilegedUserIDs(name string) (int, int, error) {
 	return uid, gid, nil
 }
 
-func (b *GoBuilder) publish(dataDir, outputDir, runtimeName, startCommand, sourceHash string) (*contracts.Release, error) {
+func (b *GoBuilder) publish(ctx context.Context, dataDir, outputDir, runtimeName, startCommand, sourceHash string) (*contracts.Release, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	releasesDir := filepath.Join(dataDir, "releases")
 	if err := os.MkdirAll(releasesDir, 0755); err != nil {
 		return nil, fmt.Errorf("create releases directory: %w", err)
@@ -853,8 +945,22 @@ func (b *GoBuilder) publish(dataDir, outputDir, runtimeName, startCommand, sourc
 	if err := os.Mkdir(appDir, 0700); err != nil {
 		return nil, fmt.Errorf("create release app directory: %w", err)
 	}
-	if err := copyDirectory(outputDir, appDir, "", false, io.Discard); err != nil {
+	copyOutput := func() error {
+		if runtimeName == "node" {
+			return copyBuildOutputContext(ctx, outputDir, appDir)
+		}
+		return copyDirectoryContext(ctx, outputDir, appDir, "", false, io.Discard)
+	}
+	if err := copyOutput(); err != nil {
 		return nil, fmt.Errorf("copy build output into release: %w", err)
+	}
+	if runtimeName == "node" {
+		if err := validateArtifactSymlinks(appDir); err != nil {
+			return nil, fmt.Errorf("validate Node build output: %w", err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	manifest := releaseManifest{
@@ -879,7 +985,13 @@ func (b *GoBuilder) publish(dataDir, outputDir, runtimeName, startCommand, sourc
 			return nil, fmt.Errorf("make release executable immutable: %w", err)
 		}
 	}
-	if err := freezeRelease(stagingDir); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := freezeRelease(stagingDir, runtimeName == "node"); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	finalDir := filepath.Join(releasesDir, id)
@@ -898,13 +1010,54 @@ func (b *GoBuilder) publish(dataDir, outputDir, runtimeName, startCommand, sourc
 	}, nil
 }
 
-func freezeRelease(root string) error {
+func validateArtifactSymlinks(root string) error {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve artifact root: %w", err)
+	}
+	rootReal, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return fmt.Errorf("resolve artifact root: %w", err)
+	}
+	return filepath.WalkDir(rootAbs, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink == 0 {
+			return nil
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return fmt.Errorf("read artifact symlink %s: %w", path, err)
+		}
+		if filepath.IsAbs(target) {
+			return fmt.Errorf("artifact symlink %s has an absolute target", path)
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return fmt.Errorf("artifact symlink %s is dangling or cyclic: %w", path, err)
+		}
+		relative, err := filepath.Rel(rootReal, resolved)
+		if err != nil {
+			return fmt.Errorf("resolve artifact symlink %s: %w", path, err)
+		}
+		if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+			return fmt.Errorf("artifact symlink %s escapes the release", path)
+		}
+		return nil
+	})
+}
+
+func freezeRelease(root string, allowSymlinks bool) error {
 	var paths []string
 	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
+			if allowSymlinks {
+				return nil
+			}
 			return fmt.Errorf("release contains unexpected symlink: %s", path)
 		}
 		paths = append(paths, path)

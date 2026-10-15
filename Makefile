@@ -1,9 +1,12 @@
-.PHONY: all web build test vet fmt clean spikes integration test-privileged
+.PHONY: all web build test vet fmt clean spikes integration test-privileged web-check
 
 all: test
 
 web:
 	cd web && bun install --frozen-lockfile && bun run build
+
+web-check: web
+	cd web && bun run typecheck && bun run test
 
 build: web
 	mkdir -p bin
@@ -33,7 +36,7 @@ test-privileged: build
 	sudo ./bin/builder.test -test.run TestRootBuildResourceProperties -test.v
 	cd tests && sudo ../bin/acceptance.test -test.count=1 -test.v
 
-test: vet build
+test: web-check vet build
 	go test ./...
 	./scripts/tests/cli-ping.sh
 	python3 ./scripts/tests/dashboard.py

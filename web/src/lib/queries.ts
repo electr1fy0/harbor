@@ -52,15 +52,34 @@ export function deploymentJobQueryOptions(id: string) {
     queryKey: ["harbor", "job", id] as const,
     queryFn: () => getDeploymentJob({ data: { id } }),
     staleTime: 1_000,
-    refetchInterval: (query) =>
-      query.state.error ||
-      (query.state.data &&
-        ["SUCCEEDED", "FAILED", "CANCELED"].includes(query.state.data.state))
-        ? false
-        : 1_500,
+    refetchInterval: (query) => deploymentJobRefetchInterval(query.state),
     refetchIntervalInBackground: false,
     retry: false,
   })
+}
+
+export function deploymentJobRefetchInterval(state: {
+  data?: { state: string }
+  error: unknown
+}): number | false {
+  if (
+    state.data &&
+    ["SUCCEEDED", "FAILED", "CANCELED"].includes(state.data.state)
+  ) {
+    return false
+  }
+  // A transient poll failure must not permanently stop status updates. Slow
+  // retries on errors to keep the page useful through brief outages.
+  return state.error ? 5_000 : 1_500
+}
+
+export function deploymentJobStatus(state: {
+  data?: { state: string }
+  error: unknown
+}): string {
+  return state.error && !state.data
+    ? "Status unavailable"
+    : (state.data?.state ?? "Status unavailable")
 }
 
 export function reposQueryOptions(owner: string) {

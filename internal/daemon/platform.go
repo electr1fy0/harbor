@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log"
 	"net"
 	"net/http"
 
 	capacitymetrics "paas/internal/capacity"
 	"paas/internal/config"
+	"paas/internal/contracts"
 	"paas/internal/deployment"
 	"paas/internal/model"
 	"paas/internal/onboarding"
@@ -59,18 +59,11 @@ func NewPlatformServerWithServicesAndBuildUser(socketPath string, service *deplo
 				writeResponse(w, command, Response{Error: "method not allowed"})
 				return
 			}
-			r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-			decoder := json.NewDecoder(r.Body)
-			decoder.DisallowUnknownFields()
+			r.Body = http.MaxBytesReader(w, r.Body, contracts.MaxControlRequestBytes)
 			var input *Request
-			if err := decoder.Decode(&input); err != nil || input == nil {
+			if err := decodeDaemonJSON(r.Body, &input); err != nil || input == nil {
 				w.WriteHeader(400)
 				writeResponse(w, command, Response{Error: "invalid JSON request"})
-				return
-			}
-			if err := decoder.Decode(new(any)); err != io.EOF {
-				w.WriteHeader(400)
-				writeResponse(w, command, Response{Error: "request must contain one JSON object"})
 				return
 			}
 			var output Response
@@ -236,6 +229,9 @@ func validateDeployRequest(input *Request) error {
 	if input.RepoURL == "" {
 		if input.Ref != "" || input.RootDir != "" {
 			return errors.New("Ref and RootDir require RepoURL")
+		}
+		if input.SourceDir == "" {
+			return errors.New("SourceDir or RepoURL is required")
 		}
 		return nil
 	}

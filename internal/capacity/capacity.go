@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -199,6 +200,9 @@ func (c *Collector) Sample(ctx context.Context, runtimes []RuntimeLimit) (Snapsh
 	if c.platform == "linux" {
 		c.sampleBuilds(ctx, now, &snapshot)
 	}
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
 	if snapshot.Host.MemoryTotalBytes != nil && snapshot.Host.MemoryAvailableBytes != nil {
 		reserve := int64(float64(*snapshot.Host.MemoryTotalBytes) * reservePercent / 100)
 		available := *snapshot.Host.MemoryAvailableBytes - reserve
@@ -281,64 +285,90 @@ func (c *Collector) sampleDisk(ctx context.Context, now time.Time, snapshot *Sna
 }
 
 func scanHarborData(ctx context.Context, root string, maxEntries int) (total, releases, cache, logs int64, complete, available bool, err error) {
-	complete = true
-	entries := 0
-	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if walkErr != nil {
-			if path == root && errors.Is(walkErr, os.ErrNotExist) {
-				complete = false
-				return filepath.SkipAll
-			}
-			complete = false
-			return nil
-		}
-		if path == root {
-			available = true
-		}
-		entries++
-		if entries > maxEntries {
-			complete = false
-			return filepath.SkipAll
-		}
-		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		info, infoErr := entry.Info()
-		if infoErr != nil {
-			complete = false
-			return nil
-		}
-		if !info.Mode().IsRegular() || info.Size() < 0 {
-			return nil
-		}
-		total = saturatingAdd(total, info.Size())
-		relative, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			complete = false
-			return nil
-		}
-		topLevel := strings.SplitN(relative, string(filepath.Separator), 2)[0]
-		switch topLevel {
-		case "releases":
-			releases = saturatingAdd(releases, info.Size())
-		case "build-cache":
-			cache = saturatingAdd(cache, info.Size())
-		case "logs":
-			logs = saturatingAdd(logs, info.Size())
-		}
-		return nil
-	})
-	if errors.Is(err, filepath.SkipAll) {
-		err = nil
+	if err := ctx.Err(); err != nil {
+		return 0, 0, 0, 0, false, false, err
 	}
-	if errors.Is(err, os.ErrNotExist) {
+	info, statErr := os.Lstat(root)
+	if statErr != nil || !info.IsDir() {
 		return 0, 0, 0, 0, false, false, nil
 	}
-	if err != nil {
-		return total, releases, cache, logs, false, available, err
+	available, complete = true, true
+	if maxEntries < 1 {
+		return 0, 0, 0, 0, false, true, nil
+	}
+	// WalkDir reads an entire directory before invoking the callback. Read small
+	// batches instead so a single large cache directory cannot bypass the cap.
+	entries := 1 // Include the root, as with the former WalkDir scan.
+	pending := []string{root}
+	for len(pending) > 0 {
+		directory := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if err := ctx.Err(); err != nil {
+			return total, releases, cache, logs, false, available, err
+		}
+		handle, openErr := os.Open(directory)
+		if openErr != nil {
+			complete = false
+			continue
+		}
+		for {
+			if err := ctx.Err(); err != nil {
+				handle.Close()
+				return total, releases, cache, logs, false, available, err
+			}
+			batch, readErr := handle.ReadDir(min(128, max(1, maxEntries-entries+1)))
+			for _, entry := range batch {
+				entries++
+				if entries > maxEntries {
+					handle.Close()
+					return total, releases, cache, logs, false, available, nil
+				}
+				if err := ctx.Err(); err != nil {
+					handle.Close()
+					return total, releases, cache, logs, false, available, err
+				}
+				if entry.Type()&os.ModeSymlink != 0 {
+					continue
+				}
+				path := filepath.Join(directory, entry.Name())
+				if entry.IsDir() {
+					pending = append(pending, path)
+					continue
+				}
+				info, infoErr := entry.Info()
+				if infoErr != nil {
+					complete = false
+					continue
+				}
+				if !info.Mode().IsRegular() || info.Size() < 0 {
+					continue
+				}
+				total = saturatingAdd(total, info.Size())
+				relative, relErr := filepath.Rel(root, path)
+				if relErr != nil {
+					complete = false
+					continue
+				}
+				topLevel := strings.SplitN(relative, string(filepath.Separator), 2)[0]
+				switch topLevel {
+				case "releases":
+					releases = saturatingAdd(releases, info.Size())
+				case "build-cache":
+					cache = saturatingAdd(cache, info.Size())
+				case "logs":
+					logs = saturatingAdd(logs, info.Size())
+				}
+			}
+			if readErr != nil {
+				if !errors.Is(readErr, io.EOF) {
+					complete = false
+				}
+				break
+			}
+		}
+		if err := handle.Close(); err != nil {
+			complete = false
+		}
 	}
 	return total, releases, cache, logs, complete, available, nil
 }
@@ -530,6 +560,7 @@ func findBuildCgroups(ctx context.Context, procRoot string) (map[string]struct{}
 		return map[string]struct{}{}, false
 	}
 	groups := make(map[string]struct{})
+	complete := true
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return groups, false
@@ -539,13 +570,18 @@ func findBuildCgroups(ctx context.Context, procRoot string) (map[string]struct{}
 		}
 		group, err := readCgroupPath(filepath.Join(procRoot, entry.Name(), "cgroup"))
 		if err != nil {
+			// Exiting processes may disappear during a scan; inaccessible or malformed
+			// cgroup metadata means the active-build count cannot be measured reliably.
+			if !errors.Is(err, os.ErrNotExist) {
+				complete = false
+			}
 			continue
 		}
 		if strings.HasPrefix(filepath.Base(group), "paas-build-") && strings.HasSuffix(filepath.Base(group), ".service") {
 			groups[group] = struct{}{}
 		}
 	}
-	return groups, true
+	return groups, complete
 }
 
 func readCgroupPath(path string) (string, error) {

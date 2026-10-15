@@ -42,6 +42,7 @@ import type {
 } from "@/lib/types"
 import {
   deployAppInputSchema,
+  isValidGitHubRepoURL,
   submitOnboardingJobInputSchema,
 } from "@/lib/validation"
 
@@ -55,8 +56,6 @@ type ImportValues = {
 }
 type SourceMode = "browse" | "url"
 
-const githubURLPattern =
-  /^https:\/\/github\.com\/[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:\.git)?$/
 const githubOwnerPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/
 const terminalJobStates = new Set<DeploymentJob["state"]>([
   "SUCCEEDED",
@@ -193,10 +192,10 @@ function ImportProjectPage() {
       )
       setFormError("")
     },
-    onError: (error) =>
-      setFormError(
-        error.message || "Harbor could not inspect this repository."
-      ),
+    onError: (error, values) => {
+      if (projectKey(currentValues.current) !== projectKey(values)) return
+      setFormError(error.message || "Harbor could not inspect this repository.")
+    },
   })
   const deployMutation = useMutation({
     mutationFn: (input: {
@@ -423,6 +422,7 @@ function ImportProjectPage() {
                           setSubmittedOwner("")
                           setRepoSearch("")
                           setSelectedRepo(null)
+                          changeSource("repoURL", "")
                         }}
                         onKeyDown={(event) => {
                           if (event.key === "Enter") {
@@ -602,9 +602,7 @@ function ImportProjectPage() {
                         className="pl-8"
                         aria-invalid={
                           form.state.values.repoURL.length > 0 &&
-                          !githubURLPattern.test(
-                            form.state.values.repoURL.trim()
-                          )
+                          !isValidGitHubRepoURL(form.state.values.repoURL)
                         }
                         autoComplete="url"
                         disabled={Boolean(busy)}

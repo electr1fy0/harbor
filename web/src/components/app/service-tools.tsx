@@ -161,6 +161,7 @@ export function DataServiceTools({
               <Input
                 value={newServiceName}
                 maxLength={128}
+                disabled={createService.isPending}
                 onChange={(event) => setNewServiceName(event.target.value)}
                 required
               />
@@ -573,6 +574,7 @@ export function DataServiceTools({
           Export passphrase (12–1024 bytes)
           <Input
             type="password"
+            disabled={exportArchive.isPending}
             autoComplete="new-password"
             minLength={12}
             maxLength={1024}

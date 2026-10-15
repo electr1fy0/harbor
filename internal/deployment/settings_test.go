@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"paas/internal/model"
+	"paas/internal/sandbox"
 )
 
 func TestConfigureEncryptsSecretsAndRedactsRotationHistory(t *testing.T) {
@@ -110,6 +111,24 @@ func TestConfiguredResourcesApplyToFutureDeployment(t *testing.T) {
 	}
 	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{Environment: map[string]string{"DATABASE_URL": "nope"}}); err == nil {
 		t.Fatal("reserved environment key was accepted")
+	}
+}
+
+func TestRejectedConfigureDoesNotCreateApplication(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	invalidMemory := "not-a-memory-limit"
+	zeroTasks := 0
+	for _, change := range []ConfigureOptions{
+		{Environment: map[string]string{"PORT": "8080"}},
+		{MemoryLimit: &invalidMemory},
+		{TasksLimit: &zeroTasks},
+	} {
+		if _, err := h.service.Configure(context.Background(), "invalid-config", change); err == nil {
+			t.Fatalf("Configure(%+v) succeeded", change)
+		}
+		if _, err := h.db.AppSettings("invalid-config"); err == nil {
+			t.Fatalf("rejected Configure(%+v) left an application behind", change)
+		}
 	}
 }
 
@@ -277,4 +296,229 @@ func TestBuildSecretsRemainRedactedFromRuntimeAndHistoricalLogs(t *testing.T) {
 	if settings.PendingSettings {
 		t.Fatal("redaction-only history change made runtime configuration pending")
 	}
+}
+
+func TestConfiguredSecretCrossingLogTailBoundaryIsRedacted(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	secret := "runtime-boundary-secret-value"
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{
+		Environment: map[string]string{"TOKEN": secret},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The final 1 MiB begins 16 bytes before the secret ends, so the old
+	// tail-first redaction flow received only a secret suffix it could not
+	// match. The lookbehind must preserve the full configured secret.
+	logs := "prefix10!!" + secret + strings.Repeat("x", (1<<20)-16)
+	if err := os.WriteFile(deployment.LogPath, []byte(logs), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, read := range []struct {
+		name string
+		call func() (string, error)
+	}{
+		{name: "all logs", call: func() (string, error) {
+			return h.service.LogsForDeployment("demo", deployment.ID)
+		}},
+		{name: "build logs", call: func() (string, error) {
+			return h.service.LogsBySource("demo", deployment.ID, "build")
+		}},
+	} {
+		got, err := read.call()
+		if err != nil {
+			t.Fatalf("%s: %v", read.name, err)
+		}
+		if strings.Contains(got, secret) || strings.Contains(got, secret[len(secret)-16:]) {
+			t.Fatalf("%s leaked the boundary-spanning secret: suffix=%q", read.name, got[:min(len(got), 96)])
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("%s omitted the redaction marker: %q", read.name, got[:min(len(got), 96)])
+		}
+	}
+}
+
+func TestRedactionShrinkCannotExposeSecretFromBeforeLogTail(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	secret := "runtime-boundary-secret-value"
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{
+		Environment: map[string]string{"TOKEN": secret},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := repeatedSecretTailFixture(secret)
+	if err := os.WriteFile(deployment.LogPath, []byte(logs), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, read := range []struct {
+		name string
+		call func() (string, error)
+	}{
+		{name: "all logs", call: func() (string, error) {
+			return h.service.LogsForDeployment("demo", deployment.ID)
+		}},
+		{name: "build logs", call: func() (string, error) {
+			return h.service.LogsBySource("demo", deployment.ID, "build")
+		}},
+	} {
+		got, err := read.call()
+		if err != nil {
+			t.Fatalf("%s: %v", read.name, err)
+		}
+		for _, fragment := range []string{secret, secret[19:], secret[20:]} {
+			if strings.Contains(got, fragment) {
+				t.Fatalf("%s leaked a secret fragment after redaction shrinkage: %q", read.name, fragment)
+			}
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("%s omitted redaction marker", read.name)
+		}
+	}
+}
+
+func TestSystemdRuntimeLogTailUsesRedactionLookbehind(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	secret := "runtime-boundary-secret-value"
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{
+		Environment: map[string]string{"TOKEN": secret},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit, err := sandbox.SystemdUnitName(deployment.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment.SystemdUnit = unit
+	deployment.SandboxType = "systemd"
+	if err := h.db.UpdateDeployment(*deployment); err != nil {
+		t.Fatal(err)
+	}
+
+	directory := t.TempDir()
+	journalPath := filepath.Join(directory, "journal.log")
+	if err := os.WriteFile(journalPath, []byte(repeatedSecretTailFixture(secret)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(directory, "bin")
+	if err := os.Mkdir(binDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	journalctl := filepath.Join(binDir, "journalctl")
+	if err := os.WriteFile(journalctl, []byte("#!/bin/sh\nexec /bin/cat \"$HARBOR_TEST_JOURNAL_LOG\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	t.Setenv("HARBOR_TEST_JOURNAL_LOG", journalPath)
+
+	for _, read := range []struct {
+		name string
+		call func() (string, error)
+	}{
+		{name: "all logs", call: func() (string, error) {
+			return h.service.LogsForDeployment("demo", deployment.ID)
+		}},
+		{name: "runtime logs", call: func() (string, error) {
+			return h.service.LogsBySource("demo", deployment.ID, "runtime")
+		}},
+	} {
+		got, err := read.call()
+		if err != nil {
+			t.Fatalf("%s: %v", read.name, err)
+		}
+		for _, fragment := range []string{secret, secret[19:], secret[20:]} {
+			if strings.Contains(got, fragment) {
+				t.Fatalf("%s leaked a journal secret fragment: %q", read.name, fragment)
+			}
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("%s omitted redaction marker", read.name)
+		}
+	}
+}
+
+func TestSystemdRuntimeLogRedactsSecretsAcrossJournalRecordLimit(t *testing.T) {
+	h := newServiceHarness(t, testConfig)
+	secret := "journal-secret-first\njournal-secret-middle\njournal-secret-last"
+	if _, err := h.service.Configure(context.Background(), "demo", ConfigureOptions{
+		Environment: map[string]string{"TOKEN": secret},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit, err := sandbox.SystemdUnitName(deployment.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment.SystemdUnit = unit
+	deployment.SandboxType = "systemd"
+	if err := h.db.UpdateDeployment(*deployment); err != nil {
+		t.Fatal(err)
+	}
+
+	directory := t.TempDir()
+	journalPath := filepath.Join(directory, "journal.log")
+	journal := secret + "\n" + strings.Repeat("ordinary journal event\n", 499)
+	if err := os.WriteFile(journalPath, []byte(journal), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(directory, "bin")
+	if err := os.Mkdir(binDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	journalctl := filepath.Join(binDir, "journalctl")
+	script := "#!/bin/sh\nrecords=500\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-n\" ]; then shift; records=\"$1\"; fi\n  shift\ndone\nexec /usr/bin/tail -n \"$records\" \"$HARBOR_TEST_JOURNAL_LOG\"\n"
+	if err := os.WriteFile(journalctl, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	t.Setenv("HARBOR_TEST_JOURNAL_LOG", journalPath)
+
+	for _, read := range []struct {
+		name string
+		call func() (string, error)
+	}{
+		{name: "all logs", call: func() (string, error) {
+			return h.service.LogsForDeployment("demo", deployment.ID)
+		}},
+		{name: "runtime logs", call: func() (string, error) {
+			return h.service.LogsBySource("demo", deployment.ID, "runtime")
+		}},
+	} {
+		got, err := read.call()
+		if err != nil {
+			t.Fatalf("%s: %v", read.name, err)
+		}
+		for _, fragment := range []string{secret, "journal-secret-last"} {
+			if strings.Contains(got, fragment) {
+				t.Fatalf("%s leaked a journal secret fragment: %q", read.name, fragment)
+			}
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("%s omitted the redaction marker", read.name)
+		}
+	}
+}
+
+func repeatedSecretTailFixture(secret string) string {
+	const limit = 1 << 20
+	totalBytes := limit + len(secret) - 1 + 20
+	logs := strings.Repeat(secret, totalBytes/len(secret))
+	if padding := totalBytes - len(logs); padding > 0 {
+		logs += strings.Repeat("x", padding)
+	}
+	return logs
 }

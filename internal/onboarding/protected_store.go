@@ -39,6 +39,7 @@ type storedJob struct {
 	Request            DeployRequest `json:"request"`
 	PreserveSettings   bool          `json:"preserveSettings"`
 	RequireCommitMatch bool          `json:"requireCommitMatch"`
+	ExplicitSelection  bool          `json:"explicitSelection,omitempty"`
 	Terminal           bool          `json:"terminal"`
 }
 
@@ -210,6 +211,9 @@ func (s *protectedStore) readLocked() (protectedState, error) {
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return protectedState{}, errors.New("initialize automation encryption")
+	}
+	if len(envelope.Nonce) != gcm.NonceSize() {
+		return protectedState{}, errors.New("decrypt protected automation state")
 	}
 	plain, err := gcm.Open(nil, envelope.Nonce, envelope.Ciphertext, []byte("paas-automation-v1"))
 	if err != nil {

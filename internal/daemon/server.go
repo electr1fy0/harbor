@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,50 @@ type Server struct {
 	socketGID      int
 	http           *http.Server
 	onboardingJobs *onboarding.Manager
+}
+
+// socketListener keeps the per-path startup lock until the underlying socket
+// is closed and its original filesystem entry has been safely removed.
+type socketListener struct {
+	net.Listener
+	lock       *os.File
+	path       string
+	socketInfo os.FileInfo
+	once       sync.Once
+	err        error
+}
+
+func (l *socketListener) Close() error {
+	l.once.Do(func() {
+		closeErr := l.Listener.Close()
+		removeErr := removeSocketPath(l.path, l.socketInfo)
+		l.err = errors.Join(closeErr, removeErr, releaseSocketLock(l.lock))
+	})
+	return l.err
+}
+
+func removeSocketPath(path string, expected os.FileInfo) error {
+	current, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(expected, current) {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func releaseSocketLock(lock *os.File) error {
+	if lock == nil {
+		return nil
+	}
+	return errors.Join(syscall.Flock(int(lock.Fd()), syscall.LOCK_UN), lock.Close())
 }
 
 // NewServer creates a daemon server. An empty path uses DefaultSocketPath.
@@ -83,6 +128,35 @@ func (s *Server) Listen() (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create daemon socket directory: %w", err)
 	}
+	lockPath := s.socketPath + ".lock"
+	lockInfo, err := os.Lstat(lockPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect daemon socket lock: %w", err)
+	}
+	if err == nil && (!lockInfo.Mode().IsRegular() || lockInfo.Mode().Perm()&0o077 != 0) {
+		return nil, fmt.Errorf("daemon socket lock must be a private regular file: %s", lockPath)
+	}
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open daemon socket lock: %w", err)
+	}
+	lockOwned := true
+	defer func() {
+		if lockOwned {
+			_ = releaseSocketLock(lock)
+		}
+	}()
+	openedInfo, err := lock.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("daemon socket lock must be a private regular file: %s", lockPath)
+	}
+	pathInfo, err := os.Lstat(lockPath)
+	if err != nil || !os.SameFile(openedInfo, pathInfo) {
+		return nil, fmt.Errorf("daemon socket lock path changed while opening: %s", lockPath)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil, fmt.Errorf("daemon already listening or starting on %s: %w", s.socketPath, err)
+	}
 
 	if info, err := os.Lstat(s.socketPath); err == nil {
 		if info.Mode()&os.ModeSocket == 0 {
@@ -96,7 +170,7 @@ func (s *Server) Listen() (net.Listener, error) {
 		if !errors.Is(dialErr, os.ErrNotExist) && !errors.Is(dialErr, syscall.ECONNREFUSED) {
 			return nil, fmt.Errorf("cannot verify stale daemon socket: %w", dialErr)
 		}
-		if err := os.Remove(s.socketPath); err != nil {
+		if err := removeSocketPath(s.socketPath, info); err != nil {
 			return nil, fmt.Errorf("remove stale daemon socket: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -107,27 +181,39 @@ func (s *Server) Listen() (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on daemon socket: %w", err)
 	}
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		_ = listener.Close()
+		return nil, errors.New("daemon listener is not a Unix socket")
+	}
+	unixListener.SetUnlinkOnClose(false)
+	socketInfo, err := os.Lstat(s.socketPath)
+	if err != nil {
+		_ = unixListener.Close()
+		return nil, fmt.Errorf("inspect daemon socket: %w", err)
+	}
 	mode := os.FileMode(0600)
 	if s.socketGID >= 0 {
 		if err := os.Chown(s.socketPath, -1, s.socketGID); err != nil {
 			_ = listener.Close()
-			_ = os.Remove(s.socketPath)
+			_ = removeSocketPath(s.socketPath, socketInfo)
 			return nil, fmt.Errorf("set daemon socket group: %w", err)
 		}
 		mode = 0660
 	}
 	if err := os.Chmod(s.socketPath, mode); err != nil {
 		_ = listener.Close()
-		_ = os.Remove(s.socketPath)
+		_ = removeSocketPath(s.socketPath, socketInfo)
 		return nil, err
 	}
-	return listener, nil
+	lockOwned = false
+	return &socketListener{Listener: unixListener, lock: lock, path: s.socketPath, socketInfo: socketInfo}, nil
 }
 
 // Serve runs the HTTP server on listener. The socket is removed when serving
 // finishes so a stopped daemon does not leave an ambiguous endpoint behind.
 func (s *Server) Serve(listener net.Listener) error {
-	defer func() { _ = os.Remove(s.socketPath) }()
+	defer listener.Close()
 	if err := s.http.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

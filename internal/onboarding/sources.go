@@ -17,6 +17,7 @@ type SourceSettings struct {
 	Ref                 string          `json:"ref"`
 	RootDir             string          `json:"rootDir"`
 	Selection           ConfigSelection `json:"selection"`
+	ExplicitSelection   bool            `json:"explicitSelection,omitempty"`
 	IncludePaths        []string        `json:"includePaths,omitempty"`
 	IgnorePaths         []string        `json:"ignorePaths,omitempty"`
 	BuildTimeoutSeconds int             `json:"buildTimeoutSeconds,omitempty"`
@@ -33,6 +34,9 @@ type sourceStore struct {
 }
 
 func newSourceStore(dataDir string) *sourceStore {
+	if dataDir == "" {
+		return &sourceStore{}
+	}
 	return &sourceStore{path: filepath.Join(dataDir, sourceFileName)}
 }
 
@@ -75,7 +79,36 @@ func (s *sourceStore) save(settings SourceSettings) error {
 	return writeSourceFileAtomic(s.path, data)
 }
 
+// restore writes a previously read source record without changing UpdatedAt.
+// It is used only to roll back a multi-store update that could not commit.
+func (s *sourceStore) restore(settings SourceSettings) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.path == "" {
+		return errors.New("Harbor data directory is unavailable")
+	}
+	all, err := s.read()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if all.Sources == nil {
+		all.Sources = make(map[string]SourceSettings)
+	}
+	all.Sources[settings.Name] = settings
+	data, err := json.MarshalIndent(all, "", "  ")
+	if err != nil || len(data) > 1<<20 {
+		return errors.New("could not encode persisted repository settings")
+	}
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		return errors.New("could not create repository settings storage")
+	}
+	return writeSourceFileAtomic(s.path, data)
+}
+
 func (s *sourceStore) read() (sourceFile, error) {
+	if s.path == "" {
+		return sourceFile{}, errors.New("Harbor data directory is unavailable")
+	}
 	info, err := os.Lstat(s.path)
 	if err != nil {
 		return sourceFile{}, err

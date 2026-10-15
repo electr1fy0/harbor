@@ -27,6 +27,32 @@ func openServiceStore(t *testing.T) *store.Store {
 	return db
 }
 
+func TestLinkUnknownServiceDoesNotCreateApplication(t *testing.T) {
+	state := openServiceStore(t)
+	manager := NewManager(state, t.TempDir())
+	if _, err := manager.Link(context.Background(), "orphaned-app", "missing-service"); err == nil {
+		t.Fatal("Link() succeeded for a missing service")
+	}
+	if _, err := state.AppSettings("orphaned-app"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("failed link created an application: AppSettings error = %v", err)
+	}
+}
+
+func TestLinkInvalidApplicationNameDoesNotCreateApplication(t *testing.T) {
+	state := openServiceStore(t)
+	manager := NewManager(state, t.TempDir())
+	svc, err := manager.AddService(context.Background(), "sqlite", "valid-service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Link(context.Background(), "../invalid-app", svc.Name); err == nil {
+		t.Fatal("Link() accepted an invalid application name")
+	}
+	if _, err := state.AppSettings("../invalid-app"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("rejected link created an invalid application: AppSettings error = %v", err)
+	}
+}
+
 func TestSQLiteServiceLifecycleAndIsolatedPersistentBindings(t *testing.T) {
 	state := openServiceStore(t)
 	dataDir := t.TempDir()
@@ -231,6 +257,9 @@ func TestLinkRejectsDuplicateDatabaseURLAndNonReadyService(t *testing.T) {
 	}
 	if _, err := manager.Link(context.Background(), "other-app", second.Name); err == nil || !strings.Contains(err.Error(), "READY") {
 		t.Fatalf("non-ready binding error = %v", err)
+	}
+	if _, err := state.AppSettings("other-app"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("rejected non-ready link left an application behind: %v", err)
 	}
 }
 
@@ -448,6 +477,9 @@ func TestLinkRejectsLegacyPostgresAndCancellation(t *testing.T) {
 	if _, err := manager.Link(context.Background(), "legacy-app", legacy.Name); err == nil || !strings.Contains(strings.ToLower(err.Error()), "migrate") {
 		t.Fatalf("legacy PostgreSQL link error = %v", err)
 	}
+	if _, err := state.AppSettings("legacy-app"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("rejected legacy-service link left an application behind: %v", err)
+	}
 	if _, err := manager.AddService(context.Background(), "sqlite", "sqlite"); err != nil {
 		t.Fatal(err)
 	}
@@ -572,6 +604,34 @@ func TestAddServiceRecordsOwnershipBeforeStarting(t *testing.T) {
 				t.Fatalf("provider calls = creates:%d starts:%d", provider.creates, provider.starts)
 			}
 		})
+	}
+}
+
+func TestAddServiceRejectsNamesOutsideApplicationSlugContractBeforeProvisioning(t *testing.T) {
+	state := openServiceStore(t)
+	dataDir := t.TempDir()
+	manager := NewManager(state, dataDir)
+	invalidNames := []string{"db with space", "UpperCase", "name\nwith-newline", strings.Repeat("a", 64)}
+	for _, name := range invalidNames {
+		t.Run(name, func(t *testing.T) {
+			if _, err := manager.AddService(context.Background(), "sqlite", name); err == nil {
+				t.Fatalf("AddService accepted invalid identity %q", name)
+			}
+			if _, err := state.GetService(name); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("rejected service identity was persisted: GetService error = %v", err)
+			}
+		})
+	}
+	if _, err := os.Lstat(filepath.Join(dataDir, "volumes")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected identities provisioned service volumes: Lstat error = %v", err)
+	}
+	legacy := model.Service{ID: "svc_legacy", Name: "Legacy DB", Type: "postgres", State: model.ServiceFailed, CreatedAt: time.Now().UTC()}
+	if err := state.CreateService(legacy); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := manager.List(context.Background())
+	if err != nil || len(listed) != 1 || listed[0].Name != legacy.Name {
+		t.Fatalf("legacy service is no longer listable: services=%+v err=%v", listed, err)
 	}
 }
 

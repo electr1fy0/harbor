@@ -67,6 +67,19 @@ type DeploymentIdentity struct {
 }
 
 func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox, routes *router.HostRouter, opts Options) (*Service, error) {
+	return NewWithContext(context.Background(), db, b, runtimeSandbox, routes, opts)
+}
+
+// NewWithContext initializes the deployment manager and bounds startup runtime
+// reconciliation by the caller's startup lifecycle context. The returned
+// service still owns an independent lifetime context, as with New.
+func NewWithContext(startupCtx context.Context, db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox, routes *router.HostRouter, opts Options) (*Service, error) {
+	if startupCtx == nil {
+		return nil, errors.New("deployment startup context must not be nil")
+	}
+	if err := startupCtx.Err(); err != nil {
+		return nil, err
+	}
 	if err := db.InitOperations(); err != nil {
 		return nil, err
 	}
@@ -89,6 +102,10 @@ func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox,
 		return nil, err
 	}
 	for _, d := range all {
+		if err := startupCtx.Err(); err != nil {
+			cancel()
+			return nil, err
+		}
 		if d.State.Active() || needsCleanup(d) {
 			// Transient systemd services outlive the daemon. Reclaim them before
 			// clearing the persisted active state, including legacy v2 records.
@@ -97,9 +114,13 @@ func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox,
 					cancel()
 					return nil, fmt.Errorf("invalid persisted systemd unit for deployment %s", d.ID)
 				}
-				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 6*time.Second)
+				cleanupCtx, cleanupCancel := context.WithTimeout(startupCtx, 6*time.Second)
 				stopErr := sandbox.StopSystemdDeployment(cleanupCtx, d.ID)
 				cleanupCancel()
+				if err := startupCtx.Err(); err != nil {
+					cancel()
+					return nil, err
+				}
 				if stopErr != nil {
 					cancel()
 					return nil, fmt.Errorf("reclaim previous runtime %s: %w", d.ID, stopErr)
@@ -117,6 +138,10 @@ func New(db *store.Store, b contracts.Builder, runtimeSandbox contracts.Sandbox,
 			_ = db.RecordEvent(d.ID, d.AppID, "ReconciledStopped", d.Error)
 		}
 	}
+	if err := startupCtx.Err(); err != nil {
+		cancel()
+		return nil, err
+	}
 	go s.monitor()
 	return s, nil
 }
@@ -129,6 +154,15 @@ type appLock struct {
 // App operations serialize, but canceled callers and shutdown never wait for a
 // long build to release a mutex. Reference counting bounds the lock registry.
 func (s *Service) lockApp(ctx context.Context, name string) (func(), error) {
+	if ctx == nil {
+		return nil, errors.New("application operation context must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.ctx.Err() != nil {
+		return nil, errors.New("daemon shutting down")
+	}
 	s.appLocksMu.Lock()
 	gate := s.appLocks[name]
 	if gate == nil {
@@ -154,6 +188,16 @@ func (s *Service) lockApp(ctx context.Context, name string) (func(), error) {
 		releaseRef()
 		return nil, errors.New("daemon shutting down")
 	case <-gate.token:
+		if err := ctx.Err(); err != nil {
+			gate.token <- struct{}{}
+			releaseRef()
+			return nil, err
+		}
+		if s.ctx.Err() != nil {
+			gate.token <- struct{}{}
+			releaseRef()
+			return nil, errors.New("daemon shutting down")
+		}
 		return func() { gate.token <- struct{}{}; releaseRef() }, nil
 	}
 }
@@ -497,6 +541,9 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 			err = s.db.SaveRelease(app.ID, release)
 		}
 		if err != nil {
+			if release != nil {
+				err = errors.Join(err, s.cleanupUnpersistedRelease(release))
+			}
 			s.recordEvent(d.ID, app.ID, model.EventBuildFailed, err.Error())
 			return s.fail(&d, model.BuildFailed, err)
 		}
@@ -519,11 +566,11 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 	if err = s.state(&d, model.Starting); err != nil {
 		return s.fail(&d, model.StartFailed, err)
 	}
-	s.recordEvent(d.ID, app.ID, model.EventSandboxStarting, "")
 	// PORT-only apps cannot inherit a reserved listener. Retry a bounded number
 	// of starts if a process fails during the loopback port handoff.
 	var handle *contracts.SandboxHandle
 	for attempt := 0; attempt < 3; attempt++ {
+		s.recordEvent(d.ID, app.ID, model.EventSandboxStarting, "")
 		port, portErr := allocatePort()
 		if portErr != nil {
 			return s.fail(&d, model.StartFailed, portErr)
@@ -685,6 +732,25 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 	return &d, nil
 }
 
+func (s *Service) cleanupUnpersistedRelease(release *contracts.Release) error {
+	if release == nil {
+		return nil
+	}
+	stored, lookupErr := s.db.Release(release.ID)
+	if lookupErr == nil && stored.ArtifactDir == release.ArtifactDir {
+		// The release may have become durable despite an ambiguous write error.
+		return nil
+	}
+	if lookupErr != nil && !errors.Is(lookupErr, store.ErrNotFound) {
+		return fmt.Errorf("confirm failed release write before artifact cleanup: %w", lookupErr)
+	}
+	root := filepath.Join(s.opts.DataDir, "releases")
+	if err := removeManagedPath(root, releaseArtifactCleanupPath(release.ArtifactDir)); err != nil {
+		return fmt.Errorf("clean up unpersisted release artifact: %w", err)
+	}
+	return nil
+}
+
 func (s *Service) state(d *model.Deployment, state model.State) error {
 	d.State = state
 	if err := s.db.UpdateDeployment(*d); err != nil {
@@ -737,6 +803,12 @@ func (s *Service) Inspect(name string) (*model.Deployment, error) {
 // LatestDeployment returns the newest attempt, including a failed candidate.
 func (s *Service) LatestDeployment(name string) (*model.Deployment, error) {
 	return s.db.LatestDeployment(name)
+}
+
+// ActiveDeployments returns unfinished deployment attempts for internal
+// observers that must not be limited to the user-facing history page.
+func (s *Service) ActiveDeployments(name string) ([]model.Deployment, error) {
+	return s.db.ActiveDeployments(name)
 }
 
 // DeploymentForApp fetches one attempt while preventing cross-app identity use.
@@ -805,23 +877,20 @@ func (s *Service) LogsForDeployment(name, deploymentID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	buildLogs, err := logTail(d.LogPath)
+	buildLogs, err := s.redactedLogTail(name, d.LogPath)
 	if err != nil {
 		return "", err
 	}
 	if d.SystemdUnit == "" || d.SandboxType != "systemd" {
-		return s.redactText(name, buildLogs)
+		return buildLogs, nil
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
-	runtimeLogs, err := sandbox.JournalLogs(ctx, d.SystemdUnit)
+	runtimeLogs, err := s.redactedJournalTail(ctx, name, d.SystemdUnit)
 	if err != nil {
 		return "", err
 	}
-	logs, err := s.redactText(name, buildLogs+runtimeLogs)
-	if err != nil {
-		return "", err
-	}
+	logs := buildLogs + runtimeLogs
 	if len(logs) > 1<<20 {
 		logs = logs[len(logs)-(1<<20):]
 	}
@@ -829,6 +898,48 @@ func (s *Service) LogsForDeployment(name, deploymentID string) (string, error) {
 }
 
 func logTail(path string) (string, error) {
+	return logTailLimit(path, 1<<20)
+}
+
+func (s *Service) redactedLogTail(name, path string) (string, error) {
+	secrets, err := s.redactionSecrets(name)
+	if err != nil {
+		return "", err
+	}
+	const limit = 1 << 20
+	lookbehind := maxRedactionSecretLength(secrets) - 1
+	if lookbehind < 0 {
+		lookbehind = 0
+	}
+	logs, err := logTailLimit(path, int64(limit+lookbehind))
+	if err != nil {
+		return "", err
+	}
+	return redactBoundedTail(logs, limit, secrets), nil
+}
+
+func (s *Service) redactedJournalTail(ctx context.Context, name, unit string) (string, error) {
+	secrets, err := s.redactionSecrets(name)
+	if err != nil {
+		return "", err
+	}
+	const limit = 1 << 20
+	lookbehind := maxRedactionSecretLength(secrets) - 1
+	if lookbehind < 0 {
+		lookbehind = 0
+	}
+	// journalctl applies its record limit before emitting the byte stream. Ask
+	// for enough earlier records to complete the longest multiline secret, or
+	// an otherwise bounded byte lookbehind could still begin in its suffix.
+	recordLookbehind := maxRedactionSecretNewlines(secrets)
+	logs, err := sandbox.JournalLogsWithLimitAndRecords(ctx, unit, limit+lookbehind, 500+recordLookbehind)
+	if err != nil {
+		return "", err
+	}
+	return redactBoundedTail(logs, limit, secrets), nil
+}
+
+func logTailLimit(path string, limit int64) (string, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
@@ -842,14 +953,17 @@ func logTail(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	offset := stat.Size() - (1 << 20)
+	if limit < 0 || limit > int64(^uint(0)>>1) {
+		return "", errors.New("log tail size is outside the supported range")
+	}
+	offset := stat.Size() - limit
 	if offset < 0 {
 		offset = 0
 	}
 	if _, err = file.Seek(offset, 0); err != nil {
 		return "", err
 	}
-	buf := make([]byte, 1<<20)
+	buf := make([]byte, int(limit))
 	n, err := io.ReadFull(file, buf)
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return "", err
@@ -1071,7 +1185,7 @@ func (s *Service) monitor() {
 					if s.ctx.Err() != nil || s.healthProbes[d.ID] {
 						continue
 					}
-					due, timeoutSeconds, failureThreshold, priorFailures, dueErr := s.healthProbeDue(d, time.Now().UTC())
+					due, healthPolicy, dueErr := s.healthProbeDue(d, time.Now().UTC())
 					if dueErr != nil || !due {
 						continue
 					}
@@ -1085,7 +1199,7 @@ func (s *Service) monitor() {
 					}
 					s.healthProbes[d.ID] = true
 					s.inflight.Add(1)
-					go s.runHealthProbe(*current, timeoutSeconds, failureThreshold, priorFailures)
+					go s.runHealthProbe(*current, healthPolicy)
 				}
 			} else {
 				log.Printf("list deployments for supervision: %v", err)

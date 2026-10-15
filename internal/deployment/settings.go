@@ -93,6 +93,9 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := validateConfigureInput(change); err != nil {
+		return nil, err
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -144,11 +147,8 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 		reserved[binding.EnvKey] = true
 	}
 	for key, value := range change.Environment {
-		if !environmentKeyPattern.MatchString(key) || reserved[key] || strings.HasPrefix(key, "PAAS_") {
+		if reserved[key] {
 			return nil, fmt.Errorf("invalid or reserved environment key %q", key)
-		}
-		if strings.IndexByte(value, 0) >= 0 {
-			return nil, fmt.Errorf("environment value for %q contains a NUL byte", key)
 		}
 		if value != "" {
 			historySet[value] = true
@@ -156,28 +156,16 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 		environment[key] = value
 	}
 	for _, key := range change.RemoveEnvironment {
-		if !environmentKeyPattern.MatchString(key) {
-			return nil, fmt.Errorf("invalid environment key %q", key)
-		}
 		delete(environment, key)
 	}
 
 	if change.MemoryLimit != nil {
-		if _, err := config.ParseMemoryBytes(*change.MemoryLimit); err != nil {
-			return nil, fmt.Errorf("invalid memory limit: %w", err)
-		}
 		stored.MemoryLimit = *change.MemoryLimit
 	}
 	if change.CPUQuota != nil {
-		if *change.CPUQuota <= 0 || math.IsNaN(*change.CPUQuota) || math.IsInf(*change.CPUQuota, 0) {
-			return nil, errors.New("CPU quota must be a finite positive number")
-		}
 		stored.CPUQuota = *change.CPUQuota
 	}
 	if change.TasksLimit != nil {
-		if *change.TasksLimit < 1 {
-			return nil, errors.New("tasks limit must be a positive integer")
-		}
 		stored.TasksLimit = *change.TasksLimit
 	}
 	if !maps.Equal(originalEnvironment, environment) {
@@ -208,6 +196,38 @@ func (s *Service) Configure(ctx context.Context, name string, change ConfigureOp
 		return nil, err
 	}
 	return s.Settings(name)
+}
+
+// validateConfigureInput checks every option that is independent of an
+// application's persisted bindings before Configure can create a new app.
+// Binding-specific environment keys are checked after loading existing state.
+func validateConfigureInput(change ConfigureOptions) error {
+	reserved := map[string]bool{"PORT": true, "PATH": true, "HOME": true, "DATABASE_URL": true}
+	for key, value := range change.Environment {
+		if !environmentKeyPattern.MatchString(key) || reserved[key] || strings.HasPrefix(key, "PAAS_") {
+			return fmt.Errorf("invalid or reserved environment key %q", key)
+		}
+		if strings.IndexByte(value, 0) >= 0 {
+			return fmt.Errorf("environment value for %q contains a NUL byte", key)
+		}
+	}
+	for _, key := range change.RemoveEnvironment {
+		if !environmentKeyPattern.MatchString(key) {
+			return fmt.Errorf("invalid environment key %q", key)
+		}
+	}
+	if change.MemoryLimit != nil {
+		if _, err := config.ParseMemoryBytes(*change.MemoryLimit); err != nil {
+			return fmt.Errorf("invalid memory limit: %w", err)
+		}
+	}
+	if change.CPUQuota != nil && (*change.CPUQuota <= 0 || math.IsNaN(*change.CPUQuota) || math.IsInf(*change.CPUQuota, 0)) {
+		return errors.New("CPU quota must be a finite positive number")
+	}
+	if change.TasksLimit != nil && *change.TasksLimit < 1 {
+		return errors.New("tasks limit must be a positive integer")
+	}
+	return nil
 }
 
 func (s *Service) runtimeEnvironment(appID string) (map[string]string, error) {
@@ -352,22 +372,30 @@ func (s *Service) environmentKey() ([]byte, error) {
 }
 
 func (s *Service) redactText(name, value string) (string, error) {
+	secrets, err := s.redactionSecrets(name)
+	if err != nil {
+		return "", err
+	}
+	return redactSecrets(value, secrets), nil
+}
+
+func (s *Service) redactionSecrets(name string) ([]string, error) {
 	stored, err := s.db.AppSettings(name)
 	if err != nil {
-		return "", errors.New("configured secrets could not be loaded")
+		return nil, errors.New("configured secrets could not be loaded")
 	}
 	environment, err := s.decryptEnvironment(stored.AppID, stored.EncryptedEnvironment)
 	if err != nil {
-		return "", errors.New("configured secrets could not be decrypted")
+		return nil, errors.New("configured secrets could not be decrypted")
 	}
 	history, err := s.decryptRedactionHistory(stored.AppID, stored.EncryptedRedactionHistory)
 	if err != nil {
-		return "", errors.New("configured secrets could not be decrypted")
+		return nil, errors.New("configured secrets could not be decrypted")
 	}
 	secrets := append(history, values(environment)...)
 	bindings, err := s.db.GetBindingsForApp(stored.AppID)
 	if err != nil {
-		return "", errors.New("configured service credentials could not be loaded")
+		return nil, errors.New("configured service credentials could not be loaded")
 	}
 	for _, binding := range bindings {
 		secrets = append(secrets, binding.Password)
@@ -397,12 +425,80 @@ func (s *Service) redactText(name, value string) (string, error) {
 		}
 		return len(secrets[i]) > len(secrets[j])
 	})
+	return secrets, nil
+}
+
+func redactSecrets(value string, secrets []string) string {
 	for _, secret := range secrets {
 		if secret != "" {
 			value = strings.ReplaceAll(value, secret, "[REDACTED]")
 		}
 	}
-	return value, nil
+	return value
+}
+
+func maxRedactionSecretLength(secrets []string) int {
+	longest := 0
+	for _, secret := range secrets {
+		if len(secret) > longest {
+			longest = len(secret)
+		}
+	}
+	return longest
+}
+
+func maxRedactionSecretNewlines(secrets []string) int {
+	maxNewlines := 0
+	for _, secret := range secrets {
+		if newlines := strings.Count(secret, "\n"); newlines > maxNewlines {
+			maxNewlines = newlines
+		}
+	}
+	return maxNewlines
+}
+
+// redactBoundedTail redacts a suffix without letting replacement shrinkage
+// pull bytes from before the caller's original tail boundary back into view.
+// It drops any connected chain of secrets that crosses that boundary, then
+// redacts the remaining suffix where every secret match has full context.
+func redactBoundedTail(raw string, limit int, secrets []string) string {
+	if len(raw) <= limit {
+		value := redactSecrets(raw, secrets)
+		if len(value) > limit {
+			value = value[len(value)-limit:]
+		}
+		return value
+	}
+	tailStart := len(raw) - limit
+	longest := 0
+	for _, secret := range secrets {
+		if len(secret) > longest {
+			longest = len(secret)
+		}
+	}
+	safeStart := tailStart
+	redactedBoundary := false
+	for start := max(0, tailStart-longest+1); start < safeStart; start++ {
+		for _, secret := range secrets {
+			end := start + len(secret)
+			if secret == "" || end <= safeStart || end > len(raw) {
+				continue
+			}
+			if strings.HasPrefix(raw[start:], secret) {
+				safeStart = end
+				redactedBoundary = true
+			}
+		}
+	}
+	suffix := raw[safeStart:]
+	if redactedBoundary {
+		suffix = "[REDACTED]" + suffix
+	}
+	value := redactSecrets(suffix, secrets)
+	if len(value) > limit {
+		value = value[len(value)-limit:]
+	}
+	return value
 }
 
 func (s *Service) redactError(name string, err error) error {

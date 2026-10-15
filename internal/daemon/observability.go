@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -27,7 +28,9 @@ import (
 	"paas/internal/config"
 	"paas/internal/contracts"
 	"paas/internal/deployment"
+	"paas/internal/model"
 	"paas/internal/router"
+	"paas/internal/store"
 )
 
 type observeSettings struct {
@@ -59,6 +62,66 @@ type Observatory struct {
 	lastNotice map[string]time.Time
 	applied    map[string][]string
 	client     *http.Client
+}
+
+const observationTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+func formatObservationTimestamp(value time.Time) string {
+	return value.UTC().Format(observationTimestampLayout)
+}
+
+// normalizeObservationSampleTimes upgrades the bounded legacy sample window
+// from variable-width RFC3339Nano text to fixed-width sortable UTC timestamps.
+func normalizeObservationSampleTimes(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id, at FROM observation_samples ORDER BY id DESC LIMIT 5760`)
+	if err != nil {
+		return err
+	}
+	type sampleTime struct {
+		id int64
+		at string
+	}
+	var samples []sampleTime
+	for rows.Next() {
+		var sample sampleTime
+		if err := rows.Scan(&sample.id, &sample.at); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		samples = append(samples, sample)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	parsed := make([]sampleTime, 0, len(samples))
+	for _, sample := range samples {
+		value, err := time.Parse(time.RFC3339Nano, sample.at)
+		if err != nil {
+			return fmt.Errorf("sample %d has invalid timestamp: %w", sample.id, err)
+		}
+		parsed = append(parsed, sampleTime{id: sample.id, at: formatObservationTimestamp(value)})
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, sample := range parsed {
+		if _, err := tx.Exec(`UPDATE observation_samples SET at=? WHERE id=?`, sample.at, sample.id); err != nil {
+			return err
+		}
+	}
+	// The sampler already retains at most the latest 5760 rows. Prune any
+	// excess before leaving older rows with the legacy variable-width encoding.
+	if _, err := tx.Exec(`DELETE FROM observation_samples WHERE id NOT IN (SELECT id FROM observation_samples ORDER BY id DESC LIMIT 5760)`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func newObservatory(service *deployment.Service) (*Observatory, error) {
@@ -105,6 +168,10 @@ func newObservatory(service *deployment.Service) (*Observatory, error) {
 		db.Close()
 		return nil, err
 	}
+	if err = normalizeObservationSampleTimes(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("normalize observation sample timestamps: %w", err)
+	}
 	if err = os.Chmod(dbPath, 0600); err != nil {
 		db.Close()
 		return nil, err
@@ -114,6 +181,13 @@ func newObservatory(service *deployment.Service) (*Observatory, error) {
 	if settings, err := o.allSettings(); err == nil {
 		for _, s := range settings {
 			o.applyTraffic(s.Settings)
+			// Older persisted settings may predate state baselining. Only apps
+			// with no recorded state need a one-time startup baseline; once the
+			// observer has sampled an app, unknown deployment IDs remain events.
+			var observed int
+			if err := o.db.QueryRow(`SELECT COUNT(*) FROM observation_states WHERE name=?`, s.Settings.Name).Scan(&observed); err == nil && observed == 0 {
+				_ = o.baselineExistingDeployments(s.Settings.Name)
+			}
 		}
 	}
 	go o.run(service.LifetimeContext())
@@ -145,7 +219,7 @@ func (o *Observatory) settings(name string) (storedObserveSettings, error) {
 	return result, err
 }
 func (o *Observatory) allSettings() ([]storedObserveSettings, error) {
-	rows, err := o.db.Query(`SELECT payload FROM observation_settings LIMIT 1000`)
+	rows, err := o.db.Query(`SELECT payload FROM observation_settings`)
 	if err != nil {
 		return nil, err
 	}
@@ -244,37 +318,47 @@ func (o *Observatory) sample(ctx context.Context) {
 		return
 	}
 	// Bounded retention; 5760 samples represent 24 hours at 15 second intervals.
-	if _, err = o.db.Exec(`INSERT INTO observation_samples(at,payload) VALUES(?,?)`, snapshot.SampledAt.Format(time.RFC3339Nano), data); err != nil {
+	if _, err = o.db.Exec(`INSERT INTO observation_samples(at,payload) VALUES(?,?)`, formatObservationTimestamp(snapshot.SampledAt), data); err != nil {
 		return
 	}
-	_, _ = o.db.Exec(`DELETE FROM observation_samples WHERE at < ? OR id NOT IN (SELECT id FROM observation_samples ORDER BY id DESC LIMIT 5760)`, time.Now().UTC().Add(-24*time.Hour).Format(time.RFC3339Nano))
+	_, _ = o.db.Exec(`DELETE FROM observation_samples WHERE at < ? OR id NOT IN (SELECT id FROM observation_samples ORDER BY id DESC LIMIT 5760)`, formatObservationTimestamp(time.Now().UTC().Add(-24*time.Hour)))
 	settings, err := o.allSettings()
 	if err != nil {
 		return
 	}
 	for _, s := range settings {
 		o.applyTraffic(s.Settings)
-		history, err := o.service.History(s.Settings.Name, 20, 0)
+		deployments, err := o.deploymentObservations(s.Settings.Name)
 		if err != nil {
 			continue
 		}
-		for _, entry := range history.Deployments {
+		complete := true
+		for _, entry := range deployments {
 			d := entry.Deployment
 			state := string(d.State)
 			var previous string
 			readErr := o.db.QueryRow(`SELECT state FROM observation_states WHERE name=? AND deployment_id=?`, s.Settings.Name, d.ID).Scan(&previous)
 			if readErr != nil && !errors.Is(readErr, sql.ErrNoRows) {
+				complete = false
 				continue
 			}
 			if previous == state {
 				continue
 			}
 			if _, err = o.db.Exec(`INSERT INTO observation_states(name,deployment_id,state) VALUES(?,?,?) ON CONFLICT(name,deployment_id) DO UPDATE SET state=excluded.state`, s.Settings.Name, d.ID, state); err != nil {
+				complete = false
 				continue
 			}
 			if containsObserve(s.Settings.Events, state) {
 				o.notify(sampleCtx, s, state, "Application entered "+state)
 			}
+		}
+		// Retain only the bounded history page plus active attempts and any
+		// previously active IDs whose terminal state was just observed. Never
+		// prune after an incomplete read/write pass: the omitted ID may still
+		// need its transition delivered on the next sample.
+		if complete && sampleCtx.Err() == nil {
+			_ = o.pruneObservationStates(s.Settings.Name, deployments)
 		}
 		if s.Settings.DiskPercent > 0 && snapshot.Disk.FilesystemUsedBytes != nil && snapshot.Disk.FilesystemTotalBytes != nil && *snapshot.Disk.FilesystemTotalBytes > 0 && 100*float64(*snapshot.Disk.FilesystemUsedBytes)/float64(*snapshot.Disk.FilesystemTotalBytes) >= s.Settings.DiskPercent {
 			o.notify(sampleCtx, s, "DISK_THRESHOLD", "Host disk usage exceeded the configured threshold.")
@@ -284,6 +368,48 @@ func (o *Observatory) sample(ctx context.Context) {
 		}
 	}
 }
+
+func (o *Observatory) pruneObservationStates(name string, deployments []deployment.HistoryEntry) error {
+	keep := make(map[string]struct{}, len(deployments))
+	for _, entry := range deployments {
+		keep[entry.Deployment.ID] = struct{}{}
+	}
+
+	tx, err := o.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT deployment_id FROM observation_states WHERE name=?`, name)
+	if err != nil {
+		return err
+	}
+	var stale []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if _, ok := keep[id]; !ok {
+			stale = append(stale, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range stale {
+		if _, err := tx.Exec(`DELETE FROM observation_states WHERE name=? AND deployment_id=?`, name, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func containsObserve(values []string, target string) bool {
 	for _, v := range values {
 		if v == target {
@@ -292,6 +418,92 @@ func containsObserve(values []string, target string) bool {
 	}
 	return false
 }
+
+func (o *Observatory) baselineExistingDeployments(name string) error {
+	deployments, err := o.deploymentObservations(name)
+	if err != nil {
+		return err
+	}
+	tx, err := o.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, entry := range deployments {
+		d := entry.Deployment
+		if _, err := tx.Exec(`INSERT INTO observation_states(name,deployment_id,state) VALUES(?,?,?) ON CONFLICT(name,deployment_id) DO NOTHING`, name, d.ID, string(d.State)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// deploymentObservations keeps the current production deployment observable
+// even when many newer failed candidates have pushed it out of recent history.
+func (o *Observatory) deploymentObservations(name string) ([]deployment.HistoryEntry, error) {
+	history, err := o.service.History(name, 20, 0)
+	if err != nil {
+		return nil, err
+	}
+	entries := make(map[string]deployment.HistoryEntry, len(history.Deployments))
+	for _, entry := range history.Deployments {
+		entries[entry.Deployment.ID] = entry
+	}
+	// Include every unfinished attempt, not just the current route: a build or
+	// candidate can remain active after newer history rows push it off-page.
+	active, err := o.service.ActiveDeployments(name)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range active {
+		entries[item.ID] = deployment.HistoryEntry{Deployment: item}
+	}
+	// A production runtime can crash and lose its route before this observer's
+	// next sample. Keep every previously observed active ID until we have read
+	// and persisted its terminal transition.
+	rows, err := o.db.Query(`SELECT deployment_id, state FROM observation_states WHERE name=?`, name)
+	if err != nil {
+		return nil, err
+	}
+	var previouslyActive []string
+	for rows.Next() {
+		var id, state string
+		if err := rows.Scan(&id, &state); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if model.State(state).Active() {
+			previouslyActive = append(previouslyActive, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, id := range previouslyActive {
+		if _, ok := entries[id]; ok {
+			continue
+		}
+		item, err := o.service.DeploymentForApp(name, id)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		entries[item.ID] = deployment.HistoryEntry{Deployment: *item}
+	}
+
+	result := make([]deployment.HistoryEntry, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, entry)
+	}
+	return result, nil
+}
+
 func (o *Observatory) notify(ctx context.Context, s storedObserveSettings, event, message string) {
 	if len(s.Webhook) == 0 {
 		return
@@ -421,6 +633,11 @@ func (o *Observatory) dispatch(ctx context.Context, request observeRequest) (any
 		}
 		return map[string]any{"settings": s.Settings, "history": history, "traffic": traffic, "notifications": notices}, nil
 	case "configure":
+		// Keep persistence and policy application ordered with sampling and
+		// forget cleanup. Otherwise a configure already in flight can restore
+		// a policy after forget has removed it.
+		o.sampleMu.Lock()
+		defer o.sampleMu.Unlock()
 		if request.Settings == nil || request.Settings.Name != request.Name {
 			return nil, errors.New("settings must identify the application")
 		}
@@ -444,6 +661,10 @@ func (o *Observatory) dispatch(ctx context.Context, request observeRequest) (any
 		if err != nil {
 			return nil, errors.New("settings unavailable")
 		}
+		deployments, err := o.deploymentObservations(request.Name)
+		if err != nil {
+			return nil, errors.New("application history unavailable")
+		}
 		if request.WebhookURL != nil {
 			target := *request.WebhookURL
 			if target == "" {
@@ -462,7 +683,21 @@ func (o *Observatory) dispatch(ctx context.Context, request observeRequest) (any
 		s.WebhookConfigured = len(stored.Webhook) > 0
 		stored.Settings = s
 		data, _ := json.Marshal(stored)
-		if _, err = o.db.Exec(`INSERT INTO observation_settings(name,payload) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET payload=excluded.payload`, request.Name, data); err != nil {
+		tx, err := o.db.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, errors.New("settings could not be saved")
+		}
+		defer tx.Rollback()
+		if _, err = tx.Exec(`INSERT INTO observation_settings(name,payload) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET payload=excluded.payload`, request.Name, data); err != nil {
+			return nil, errors.New("settings could not be saved")
+		}
+		for _, entry := range deployments {
+			d := entry.Deployment
+			if _, err = tx.Exec(`INSERT INTO observation_states(name,deployment_id,state) VALUES(?,?,?) ON CONFLICT(name,deployment_id) DO NOTHING`, request.Name, d.ID, string(d.State)); err != nil {
+				return nil, errors.New("settings could not be saved")
+			}
+		}
+		if err = tx.Commit(); err != nil {
 			return nil, errors.New("settings could not be saved")
 		}
 		o.applyTraffic(s)
@@ -537,7 +772,7 @@ func (o *Observatory) history(name string, limit int, windows ...string) ([]hist
 	if len(windows) > 0 && windows[0] == "day" {
 		window = 24 * time.Hour
 	}
-	cutoff := time.Now().UTC().Add(-window).Format(time.RFC3339Nano)
+	cutoff := formatObservationTimestamp(time.Now().UTC().Add(-window))
 	var count int
 	if err := o.db.QueryRow(`SELECT COUNT(*) FROM observation_samples WHERE at>=?`, cutoff).Scan(&count); err != nil {
 		return nil, errors.New("metric history unavailable")

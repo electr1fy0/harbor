@@ -8,6 +8,7 @@
 !/web/README.md
 !/deploy/README.md
 !/docs/classroom-demo.md
+!/docs/bug-audit*.md
 
 # Go tooling
 *.test

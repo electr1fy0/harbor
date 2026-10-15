@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"runtime"
@@ -103,6 +104,33 @@ func TestSystemdInspectRecognizesExitedUnitsAndSignals(t *testing.T) {
 		})
 	}
 }
+
+func TestSystemdBoundsCompletedUnitInspectionHistory(t *testing.T) {
+	s := &SystemdSandbox{units: make(map[string]*contracts.SandboxInfo), run: func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("unexpected systemctl invocation for cached unit")
+	}}
+	s.mu.Lock()
+	for i := 0; i < maxCompletedUnitHistory+1; i++ {
+		id := fmt.Sprintf("finished-%d", i)
+		code := i
+		s.rememberCompletedUnit(id, &contracts.SandboxInfo{ID: id, ExitCode: &code})
+	}
+	s.mu.Unlock()
+	if _, ok := s.units["finished-0"]; ok {
+		t.Fatal("oldest completed unit remained cached beyond the history bound")
+	}
+	if len(s.units) != maxCompletedUnitHistory {
+		t.Fatalf("cached completed unit count = %d, want %d", len(s.units), maxCompletedUnitHistory)
+	}
+	latestID := fmt.Sprintf("finished-%d", maxCompletedUnitHistory)
+	latest, err := s.Inspect(context.Background(), latestID)
+	if err != nil {
+		t.Fatalf("latest completed unit inspection: %v", err)
+	}
+	if latest.Running || latest.ExitCode == nil || *latest.ExitCode != maxCompletedUnitHistory {
+		t.Fatalf("latest completed unit snapshot = %+v", latest)
+	}
+}
 func intPtr(value int) *int { return &value }
 
 func TestSystemdInspectManyBatchesUnitsAndKeepsResultsAligned(t *testing.T) {
@@ -148,6 +176,42 @@ func TestSystemdInspectManyBatchesUnitsAndKeepsResultsAligned(t *testing.T) {
 	for i, result := range results {
 		if result.Err != nil || result.Info == nil || !result.Info.Running || result.Info.ID != []string{"alpha", "beta"}[i] {
 			t.Fatalf("result %d = %+v, want running matching unit", i, result)
+		}
+	}
+}
+
+func TestSystemdInspectManyDeduplicatesRepeatedIDsAndKeepsPositions(t *testing.T) {
+	var requested []string
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name != "systemctl" {
+			return nil, errors.New("unexpected command")
+		}
+		showAt := slices.Index(args, "show")
+		for _, arg := range args[showAt+1:] {
+			if arg == "-p" {
+				break
+			}
+			requested = append(requested, arg)
+		}
+		blocks := make([]string, 0, len(requested))
+		for _, unit := range requested {
+			blocks = append(blocks, "Id="+unit+"\n"+runningUnit)
+		}
+		return []byte(strings.Join(blocks, "\n")), nil
+	}
+	sb := &SystemdSandbox{units: make(map[string]*contracts.SandboxInfo), run: runner}
+	ids := []string{"alpha", "alpha", "beta", "alpha"}
+	results := sb.InspectMany(context.Background(), ids)
+	wantUnits := []string{"paas-deploy-alpha.service", "paas-deploy-beta.service"}
+	if !reflect.DeepEqual(requested, wantUnits) {
+		t.Fatalf("requested units = %v, want deduplicated %v", requested, wantUnits)
+	}
+	if len(results) != len(ids) {
+		t.Fatalf("results length = %d, want %d", len(results), len(ids))
+	}
+	for i, result := range results {
+		if result.Err != nil || result.Info == nil || result.Info.ID != ids[i] || !result.Info.Running {
+			t.Fatalf("result %d = %+v, want running info for %q", i, result, ids[i])
 		}
 	}
 }

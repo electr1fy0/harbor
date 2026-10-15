@@ -46,17 +46,8 @@ func (m *BindingManager) Link(ctx context.Context, app *model.Application, svc *
 	if app == nil || app.ID == "" {
 		return nil, errors.New("application identity is required to create a service binding")
 	}
-	if svc == nil || svc.ID == "" {
-		return nil, errors.New("service identity is required to create a service binding")
-	}
-	if svc.Type != "sqlite" {
-		if svc.Type == "postgres" {
-			return nil, legacyPostgresError(svc.Name)
-		}
-		return nil, fmt.Errorf("service type %q does not support database provisioning", svc.Type)
-	}
-	if svc.State != model.ServiceReady {
-		return nil, fmt.Errorf("SQLite service %q is %s; only READY services can be linked", svc.Name, svc.State)
+	if err := validateBindableService(svc); err != nil {
+		return nil, err
 	}
 
 	bindings, err := m.store.GetBindingsForApp(app.ID)
@@ -124,6 +115,22 @@ func (m *BindingManager) Link(ctx context.Context, app *model.Application, svc *
 		return nil, errors.Join(fmt.Errorf("store SQLite binding: %w", err), cleanupErr)
 	}
 	return &binding, nil
+}
+
+func validateBindableService(svc *model.Service) error {
+	if svc == nil || svc.ID == "" {
+		return errors.New("service identity is required to create a service binding")
+	}
+	if svc.Type != "sqlite" {
+		if svc.Type == "postgres" {
+			return legacyPostgresError(svc.Name)
+		}
+		return fmt.Errorf("service type %q does not support database provisioning", svc.Type)
+	}
+	if svc.State != model.ServiceReady {
+		return fmt.Errorf("SQLite service %q is %s; only READY services can be linked", svc.Name, svc.State)
+	}
+	return nil
 }
 
 func (m *BindingManager) cleanupUnboundDatabaseDirectory(path string, created bool, appID, serviceID string) error {

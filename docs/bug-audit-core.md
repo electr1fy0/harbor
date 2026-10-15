@@ -1,0 +1,26 @@
+# Core audit fixes
+
+Each numbered entry describes one defect; input variants and call sites are grouped.
+
+1. **Spoofed forwarding identity** — Router accepted client-supplied forwarding headers and appended the true peer to an attacker-controlled chain. Rebuild these headers from the incoming connection using ReverseProxy.Rewrite. `TestProxyRebuildsForwardedIdentity` checks the application sees trustworthy identity while retaining its virtual host.
+2. **Invalid upstreams replaced healthy routes** — Empty hostname and out-of-range numeric ports passed route validation before durable commits. Shared validation now rejects these before committing or replacing mappings. `TestInvalidUpstreamDoesNotCommitOrReplaceRoute` covers both update paths.
+3. **Absolute DNS names missed routes** — Requests with a valid trailing DNS dot received 404 and deletion used a different key. Host normalization now treats absolute and relative DNS spellings consistently. `TestAbsoluteDNSHostRoutes`.
+4. **Protocol upgrades reported as HTTP 200** — Traffic accounting treated 101 as an interim informational response. It now records 101 as final. `TestTrafficWriterRecordsUpgradeAsFinalStatus`.
+5. **Streaming flush errors disappeared** — The traffic writer's Flush wrapper discarded disconnect and unsupported-operation errors from ResponseController. FlushError now propagates them. `TestTrafficWriterPropagatesFlushErrors`.
+6. **Nil startup-health context panicked** — Check now returns a validation error, consistent with Probe. `TestCheckRejectsNilContext`.
+7. **Submillisecond health timeouts accepted** — Probe accepted durations below its documented 1ms minimum, leading to effectively instant readiness failures. `TestProbeEnforcesMinimumTimeout`.
+8. **Application creation left partial records** — Settings initialization failures left an app visible without settings. CreateApp now wraps identity creation and settings initialization in one transaction. `TestCreateAppRollsBackWhenSettingsInitializationFails` injects a SQLite failure.
+9. **Cross-application release associations persisted** — Foreign keys allowed one application's deployment to launch another application's release. Schema 10 adds insert/update ownership checks. `TestDeploymentCannotUseAnotherApplicationsRelease`.
+10. **Lifecycle events could cross application boundaries** — Independent foreign keys allowed an event's app and deployment to disagree, making private event data visible in the wrong app history. Schema 10 validates the association on insert/update. `TestLifecycleEventsCannotLeakAcrossApplications`.
+11. **Core app deletion depended on optional metadata** — DeleteApp failed with "no such table: app_operations" unless InitOperations had been called. Cascading deletion now handles optional operation rows when present. `TestDeleteAppDoesNotRequireOptionalOperationsSchema`.
+12. **Negative history limits disabled bounds** — SQLite treats LIMIT -1 as unlimited and negative offsets as zero. Both deployment-history readers now validate pagination. `TestDeploymentHistoryRejectsUnboundedPagination`.
+13. **Existing crash loops requested another restart** — A persisted crash-loop plan returned ShouldRun=true on subsequent reads. It now consistently suppresses restart. `TestExistingCrashLoopDoesNotRequestAnotherRestart`.
+14. **Stopped apps lost rollback artifacts** — Retention protected only the latest promoted release after routes were removed, allowing a newer failed build to crowd out the previous successful release. It now retains both distinct successful releases. `TestRetentionKeepsRollbackReleaseOfStoppedApp`.
+15. **Invalid storage roots reported measured sizes** — A regular file or symlink used as the data root was treated as a successfully scanned directory (often reporting zero). Such roots now report unavailable/incomplete metrics. `TestStorageRootMustBeAnActualDirectory`.
+16. **Unreadable proc metadata reported zero active builds** — Non-disappearance cgroup-read errors were silently ignored, producing apparently measured zero counts. These scans now mark build metrics unavailable; processes that exit during scanning remain tolerated. `TestBuildMetricsUnavailableWhenProcessMetadataUnreadable` and `TestBuildScanToleratesProcessesThatExit`.
+
+17. **Storage scan cap did not bound directory reads** — filepath.WalkDir loaded and sorted every entry in a directory before checking the entry budget, so a cache directory could consume unbounded memory despite the advertised cap. The scan now reads at most 128 entries per batch and stops at its budget. Existing bounded-scan tests plus `TestBoundedScanRejectsEmptyBudgetAndHonorsCancellation` cover the result cap and cancellation.
+
+18. **Implicit rollback after stop restarted the same release** — Once routes were removed by stop/crash, PreviousRelease had no current release to exclude and selected the last production release as its own rollback target. It now falls back to the latest promoted deployment when no active route exists. `TestImplicitRollbackAfterStopExcludesLastProductionRelease`.
+
+Additional hardening: capacity sampling checks cancellation after the final build scan. The Makefile test target now runs frontend typechecking and unit tests as well as building its assets.

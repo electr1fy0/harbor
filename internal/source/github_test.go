@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
@@ -182,7 +183,7 @@ func TestCheckoutGitHubRejectsInvalidInputBeforeRunningGit(t *testing.T) {
 		{"ssh URL", "git@github.com:example/app.git", "", ""},
 		{"non-GitHub host", "https://github.example.com/example/app", "", ""},
 		{"credentials", "https://user:pass@github.com/example/app", "", ""},
-		{"port", "https://github.com:443/example/app", "", ""},
+		{"port", "https://github.com:444/example/app", "", ""},
 		{"query", "https://github.com/example/app?ref=main", "", ""},
 		{"fragment", "https://github.com/example/app#source", "", ""},
 		{"extra path", "https://github.com/example/app/tree/main", "", ""},
@@ -209,6 +210,27 @@ func TestCheckoutGitHubRejectsInvalidInputBeforeRunningGit(t *testing.T) {
 				t.Fatalf("invalid request ran git: %#v", git.calls)
 			}
 		})
+	}
+}
+
+func TestCanonicalGitHubURLNormalizesSchemeHostAndDefaultPort(t *testing.T) {
+	for _, raw := range []string{
+		"https://github.com/example/app",
+		"HTTPS://GITHUB.COM/example/app",
+		"https://github.com:443/example/app.git",
+	} {
+		got, err := canonicalGitHubURL(raw)
+		if err != nil {
+			t.Errorf("canonicalGitHubURL(%q): %v", raw, err)
+			continue
+		}
+		want := "https://github.com/example/app"
+		if strings.HasSuffix(raw, ".git") {
+			want += ".git"
+		}
+		if got != want {
+			t.Errorf("canonicalGitHubURL(%q) = %q, want %q", raw, got, want)
+		}
 	}
 }
 
@@ -281,6 +303,43 @@ func TestRunGitRedactsTokenFromCommandOutput(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), token) || !strings.Contains(err.Error(), "[redacted]") {
 		t.Fatalf("Git error was not redacted: %v", err)
+	}
+}
+
+func TestRunGitBoundsCommandOutputAndRedactsPartialTokenAtLimit(t *testing.T) {
+	root := t.TempDir()
+	buildUser := ""
+	if os.Geteuid() == 0 {
+		if _, err := user.Lookup("nobody"); err != nil {
+			t.Skipf("nobody account is unavailable: %v", err)
+		}
+		buildUser = "nobody"
+		if err := os.Chmod(root, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := filepath.Join(root, "git-fake")
+	// The first three bytes of the token land at the retention boundary. The
+	// bounded reader must still drain the child and avoid exposing that suffix.
+	command := fmt.Sprintf("#!/bin/sh\nhead -c %d /dev/zero | tr '\\000' x\nprintf '%%s' \"$GITHUB_TOKEN\" >&2\nexit 1\n", maxGitCommandOutput-3)
+	if err := os.WriteFile(fake, []byte(command), 0755); err != nil {
+		t.Fatal(err)
+	}
+	const token = "ghp_error_secret"
+	err := runGit(context.Background(), fake,
+		[]string{"PATH=" + os.Getenv("PATH"), "GITHUB_TOKEN=" + token}, root, buildUser, "fetch")
+	if err == nil {
+		t.Fatal("fake git unexpectedly succeeded")
+	}
+	message := err.Error()
+	if len(message) > maxGitCommandOutput+128 {
+		t.Fatalf("Git error retained %d bytes, want at most %d", len(message), maxGitCommandOutput+128)
+	}
+	if strings.Contains(message, token) || strings.Contains(message, token[:3]) {
+		t.Fatalf("truncated Git error exposed a token fragment: %q", message[len(message)-64:])
+	}
+	if !strings.Contains(message, "[Git output truncated]") || !strings.Contains(message, "[redacted]") {
+		t.Fatalf("bounded Git error did not identify truncation/redaction: %q", message[len(message)-64:])
 	}
 }
 

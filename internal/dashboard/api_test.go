@@ -174,6 +174,24 @@ func TestAPIEndpointMethodAndBodyValidation(t *testing.T) {
 	}
 }
 
+func TestAPIGetAppReturnsNotFoundWhenNoAppResourcesExist(t *testing.T) {
+	control := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/inspect", "/releases", "/settings", "/diagnostics":
+			dashboardJSON(w, http.StatusNotFound, map[string]string{"error": "Application not found."})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	response := dashboardRequest(NewAPI(control), http.MethodPost, "getApp", `{"name":"missing"}`)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("missing app status=%d body=%s", response.Code, response.Body)
+	}
+	if got := decodeDashboardResponse(t, response.Body.Bytes())["error"]; got != "Harbor resource was not found." {
+		t.Fatalf("missing app error=%v", got)
+	}
+}
+
 func TestAPIMapsCapacityWithoutHostInternals(t *testing.T) {
 	control := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/capacity" {

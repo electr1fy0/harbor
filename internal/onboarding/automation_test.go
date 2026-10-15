@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -147,6 +149,83 @@ func TestSignedPushWebhookPinsCommitAndSuppressesDuplicates(t *testing.T) {
 		t.Fatalf("revoked hook response=%d", revoked.Code)
 	}
 }
+
+func TestCreateHookSerializesWithForget(t *testing.T) {
+	manager, cleanup := newAutomationTestManager(t)
+	defer cleanup()
+	if err := manager.UpdateSource(context.Background(), SourceSettings{
+		Name: "api", RepoURL: "https://github.com/acme/api", Ref: "main",
+	}, nil); err != nil {
+		t.Fatalf("UpdateSource(): %v", err)
+	}
+
+	manager.mu.Lock()
+	createStarted := make(chan struct{})
+	createDone := make(chan error, 1)
+	go func() {
+		close(createStarted)
+		_, _, err := manager.CreateHook(context.Background(), "api", "main")
+		createDone <- err
+	}()
+	<-createStarted
+	select {
+	case err := <-createDone:
+		manager.mu.Unlock()
+		t.Fatalf("CreateHook completed while source transaction lock was held: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	forgetDone := make(chan error, 1)
+	go func() { forgetDone <- manager.Forget("api") }()
+	manager.mu.Unlock()
+	createErr := <-createDone
+	if createErr != nil && !errors.Is(createErr, ErrJobNotFound) {
+		t.Fatalf("CreateHook() error = %v", createErr)
+	}
+	if err := <-forgetDone; err != nil {
+		t.Fatalf("Forget() error = %v", err)
+	}
+	hooks, err := manager.ListHooks("api")
+	if err != nil {
+		t.Fatalf("ListHooks() error = %v", err)
+	}
+	if len(hooks) != 0 {
+		t.Fatalf("Forget left a hook created concurrently: %+v", hooks)
+	}
+	if _, _, err := manager.GetSource("api"); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("GetSource() after Forget error = %v, want ErrJobNotFound", err)
+	}
+}
+
+func TestUnknownGitHubHookDoesNotReadRequestBody(t *testing.T) {
+	manager, cleanup := newAutomationTestManager(t)
+	defer cleanup()
+	body := &countingRequestBody{reader: strings.NewReader("untrusted payload")}
+	request := httptest.NewRequest(http.MethodPost, "/api/hooks/github/hook_00000000000000000000000000000000", nil)
+	request.Body = body
+	request.Header.Set("X-GitHub-Event", "push")
+	request.Header.Set("X-GitHub-Delivery", "delivery-1")
+	response := httptest.NewRecorder()
+	manager.PublicHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", response.Code)
+	}
+	if body.reads != 0 {
+		t.Fatalf("read unknown-hook body %d times", body.reads)
+	}
+}
+
+type countingRequestBody struct {
+	reader io.Reader
+	reads  int
+}
+
+func (body *countingRequestBody) Read(buffer []byte) (int, error) {
+	body.reads++
+	return body.reader.Read(buffer)
+}
+
+func (*countingRequestBody) Close() error { return nil }
 
 func TestBuildOptionsReachLifecycleAndSourceSecretsStayEncrypted(t *testing.T) {
 	h := newOnboardingHarness(t, nil)

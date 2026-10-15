@@ -627,7 +627,7 @@ func mapGitHubRepo(value any) (map[string]any, bool) {
 	} else if ownerData, ownerOK := object(repository["owner"]); ownerOK {
 		owner = safeString(ownerData["login"], 39)
 	}
-	if !githubOwnerPattern.MatchString(owner) || !githubRepoPattern.MatchString(name) {
+	if !githubOwnerPattern.MatchString(owner) || !validGitHubRepoName(name) {
 		return nil, false
 	}
 	description, ok := repository["description"].(string)

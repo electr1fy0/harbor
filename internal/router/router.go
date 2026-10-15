@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,21 +71,9 @@ func (r *HostRouter) SwitchRoutes(hosts []string, upstream string, commit func()
 	if err != nil {
 		return nil, err
 	}
-	target, err := url.Parse(upstream)
+	proxy, target, err := newProxy(upstream)
 	if err != nil {
-		return nil, fmt.Errorf("parse upstream: %w", err)
-	}
-	if target.Scheme != "http" && target.Scheme != "https" {
-		return nil, fmt.Errorf("upstream scheme must be http or https")
-	}
-	if target.Host == "" {
-		return nil, fmt.Errorf("upstream host must not be empty")
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		log.Printf("proxy hosts %v to %s: %v", hosts, target.Redacted(), err)
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		return nil, err
 	}
 
 	// Serialize mutations across the durable commit and route replacement,
@@ -137,22 +126,12 @@ func (r *HostRouter) UpdateRoutes(hosts, remove []string, upstream string, commi
 	var proxy *httputil.ReverseProxy
 	var upstreamIdentity string
 	if len(setHosts) > 0 {
-		target, err := url.Parse(upstream)
+		var target *url.URL
+		proxy, target, err = newProxy(upstream)
 		if err != nil {
-			return fmt.Errorf("parse upstream: %w", err)
+			return err
 		}
-		if target.Scheme != "http" && target.Scheme != "https" {
-			return fmt.Errorf("upstream scheme must be http or https")
-		}
-		if target.Host == "" {
-			return fmt.Errorf("upstream host must not be empty")
-		}
-		proxy = httputil.NewSingleHostReverseProxy(target)
 		upstreamIdentity = target.String()
-		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-			log.Printf("proxy to %s: %v", target.Redacted(), err)
-			http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		}
 	}
 	r.updateMu.Lock()
 	defer r.updateMu.Unlock()
@@ -275,7 +254,38 @@ func normalizeHost(host string) string {
 		return ""
 	}
 	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
-		return strings.Trim(parsedHost, "[]")
+		return strings.TrimSuffix(strings.Trim(parsedHost, "[]"), ".")
 	}
-	return strings.Trim(host, "[]")
+	return strings.TrimSuffix(strings.Trim(host, "[]"), ".")
+}
+
+// Validate before durable commits, so an unusable target cannot replace a live route.
+func newProxy(upstream string) (*httputil.ReverseProxy, *url.URL, error) {
+	target, err := url.Parse(upstream)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse upstream: %w", err)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return nil, nil, fmt.Errorf("upstream scheme must be http or https")
+	}
+	if target.Hostname() == "" {
+		return nil, nil, fmt.Errorf("upstream host must not be empty")
+	}
+	if port := target.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return nil, nil, fmt.Errorf("upstream port must be between 1 and 65535")
+		}
+	}
+	proxy := &httputil.ReverseProxy{Rewrite: func(request *httputil.ProxyRequest) {
+		request.SetURL(target)
+		request.Out.Host = request.In.Host
+		// Forwarding identity comes from the connection, never client-supplied headers.
+		request.SetXForwarded()
+	}}
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		log.Printf("proxy to %s: %v", target.Redacted(), err)
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+	}
+	return proxy, target, nil
 }

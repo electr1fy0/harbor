@@ -413,7 +413,7 @@ func (s *Store) RecordAutomaticRestart(appID string, now time.Time) (model.Resta
 	} else if err != nil {
 		return model.RestartPlan{}, fmt.Errorf("store: read automatic restart state: %w", err)
 	}
-	plan := model.RestartPlan{Attempt: attempt, CrashLoop: crashLoop != 0, ShouldRun: desired != 0 && enabled != 0}
+	plan := model.RestartPlan{Attempt: attempt, CrashLoop: crashLoop != 0, ShouldRun: desired != 0 && enabled != 0 && crashLoop == 0}
 	if desired == 0 || enabled == 0 || crashLoop != 0 {
 		return plan, tx.Commit()
 	}
@@ -472,6 +472,9 @@ func (s *Store) SetNextRestart(appID string, when *time.Time) error {
 }
 
 func (s *Store) DeploymentHistory(name string, limit, offset int) ([]model.Deployment, int, error) {
+	if err := validateHistoryPage(limit, offset); err != nil {
+		return nil, 0, err
+	}
 	var appExists int
 	if err := s.db.QueryRow(`SELECT 1 FROM apps WHERE name = ?`, name).Scan(&appExists); errors.Is(err, sql.ErrNoRows) {
 		return nil, 0, fmt.Errorf("%w: application %q", ErrNotFound, name)
@@ -493,7 +496,21 @@ func (s *Store) DeploymentHistory(name string, limit, offset int) ([]model.Deplo
 	return rows, total, nil
 }
 
+// ActiveDeployments returns every unfinished deployment for an application,
+// including candidates older than the UI history page. Background observers
+// use this to keep pending work visible until it reaches a terminal state.
+func (s *Store) ActiveDeployments(name string) ([]model.Deployment, error) {
+	return s.queryDeployments(deploymentSelect+`WHERE a.name = ? AND d.state IN (?, ?, ?, ?, ?, ?) ORDER BY d.created_at DESC, d.id DESC`,
+		name,
+		string(model.Queued), string(model.Building), string(model.Built),
+		string(model.Starting), string(model.HealthChecking), string(model.Running),
+	)
+}
+
 func (s *Store) DeploymentHistoryAll(limit, offset int) ([]model.Deployment, int, error) {
+	if err := validateHistoryPage(limit, offset); err != nil {
+		return nil, 0, err
+	}
 	var total int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM deployments`).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("store: count deployment history: %w", err)
@@ -641,8 +658,24 @@ func (s *Store) ReleasePruneCandidates(name string, retain int) ([]model.Release
 			return nil, fmt.Errorf("store: read previous release for retention: %w", err)
 		}
 	} else {
-		if err := s.db.QueryRow(`SELECT release_id FROM deployments WHERE app_id = ? AND promoted_at IS NOT NULL ORDER BY promoted_at DESC, created_at DESC, id DESC LIMIT 1`, appID).Scan(&previous); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("store: read latest promoted release for retention: %w", err)
+		promotedRows, err := s.db.Query(`SELECT release_id FROM deployments WHERE app_id = ? AND promoted_at IS NOT NULL AND release_id IS NOT NULL GROUP BY release_id ORDER BY MAX(promoted_at) DESC, MAX(created_at) DESC, release_id DESC LIMIT 2`, appID)
+		if err != nil {
+			return nil, fmt.Errorf("store: read stopped app rollback releases: %w", err)
+		}
+		for promotedRows.Next() {
+			var id string
+			if err := promotedRows.Scan(&id); err != nil {
+				promotedRows.Close()
+				return nil, err
+			}
+			keep[id] = true
+		}
+		if err := promotedRows.Err(); err != nil {
+			promotedRows.Close()
+			return nil, err
+		}
+		if err := promotedRows.Close(); err != nil {
+			return nil, err
 		}
 	}
 	if previous.Valid {
@@ -710,7 +743,6 @@ func (s *Store) DeleteApp(name string) error {
 		`DELETE FROM deployments WHERE app_id = ?`,
 		`DELETE FROM releases WHERE app_id = ?`,
 		`DELETE FROM app_settings WHERE app_id = ?`,
-		`DELETE FROM app_operations WHERE app_id = ?`,
 		`DELETE FROM apps WHERE id = ?`,
 	} {
 		if _, err := tx.Exec(statement, appID); err != nil {
@@ -730,26 +762,39 @@ func boolInt(value bool) int {
 	return 0
 }
 
-// DeploymentTimingEvents returns only the earliest timing boundary per type.
-// Ongoing probe events and repeated runtime failures do not inflate history reads.
+// DeploymentTimingEvents returns the bounded deployment-stage boundaries used
+// for timing summaries. Startup retries may repeat sandbox and readiness
+// events; unrelated ongoing probes and later runtime events are excluded.
 func (s *Store) DeploymentTimingEvents(deploymentID string) ([]model.Event, error) {
-	rows, err := s.db.Query(`SELECT type,MIN(created_at),MIN(id) FROM events WHERE deployment_id=? AND type IN (?,?,?,?,?,?,?,?,?) GROUP BY type ORDER BY MIN(created_at),MIN(id)`, deploymentID, model.EventBuildStarted, model.EventBuildCompleted, model.EventBuildFailed, model.EventSandboxStarting, model.EventSandboxStarted, model.EventHealthCheckPassed, model.EventHealthCheckFailed, model.EventDeploymentSucceeded, model.EventDeploymentFailed)
+	rows, err := s.db.Query(`SELECT id,deployment_id,app_id,type,payload,created_at FROM events
+		WHERE deployment_id=? AND type IN (?,?,?,?,?,?,?,?,?) ORDER BY id ASC LIMIT 32`, deploymentID,
+		model.EventBuildStarted, model.EventBuildCompleted, model.EventBuildFailed, model.EventSandboxStarting,
+		model.EventSandboxStarted, model.EventHealthCheckPassed, model.EventHealthCheckFailed,
+		model.EventDeploymentSucceeded, model.EventDeploymentFailed)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	events := []model.Event{}
+	events := make([]model.Event, 0)
 	for rows.Next() {
 		var event model.Event
-		var at string
-		if err = rows.Scan(&event.Type, &at, &event.ID); err != nil {
+		var kind, createdAt string
+		if err = rows.Scan(&event.ID, &event.DeploymentID, &event.AppID, &kind, &event.Payload, &createdAt); err != nil {
 			return nil, err
 		}
-		event.CreatedAt, err = decodeTime(at)
+		event.Type = model.EventType(kind)
+		event.CreatedAt, err = decodeTime(createdAt)
 		if err != nil {
 			return nil, err
 		}
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+func validateHistoryPage(limit, offset int) error {
+	if limit < 1 || limit > 1_000_000 || offset < 0 || offset > 10_000_000 {
+		return errors.New("store: deployment pagination is out of range")
+	}
+	return nil
 }

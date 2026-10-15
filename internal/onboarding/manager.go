@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"paas/internal/config"
 	"paas/internal/contracts"
@@ -24,10 +25,11 @@ const maxOutstandingJobs = 8
 const maxConcurrentInspections = 2
 
 var (
-	ErrQueueFull     = errors.New("deployment queue is full")
-	ErrJobNotFound   = errors.New("deployment job was not found")
-	ErrManagerClosed = errors.New("deployment manager is shutting down")
-	ErrInspectBusy   = errors.New("project inspection is busy; try again shortly")
+	ErrQueueFull         = errors.New("deployment queue is full")
+	ErrJobNotFound       = errors.New("deployment job was not found")
+	ErrSourceUnavailable = errors.New("saved repository settings are unavailable")
+	ErrManagerClosed     = errors.New("deployment manager is shutting down")
+	ErrInspectBusy       = errors.New("project inspection is busy; try again shortly")
 )
 
 type sourceCheckout func(context.Context, string, string, string, string, string) (string, func(), error)
@@ -54,6 +56,7 @@ type DeployRequest struct {
 	CreateSqlite        bool              `json:"createSqlite,omitempty"`
 	preserveSettings    bool
 	requireCommitMatch  bool
+	explicitSelection   bool
 	dedupKeys           []string
 }
 
@@ -175,6 +178,7 @@ func (m *Manager) restoreJobs(state protectedState) {
 		request := cloneDeployRequest(saved.Request)
 		request.preserveSettings = saved.PreserveSettings
 		request.requireCommitMatch = saved.RequireCommitMatch
+		request.explicitSelection = saved.ExplicitSelection
 		record := &jobRecord{Job: saved.Job, request: request, terminal: saved.Terminal}
 		if !record.terminal && record.Job.State != "QUEUED" {
 			record.terminal = true
@@ -251,20 +255,41 @@ func (m *Manager) GetSource(name string) (SourceSettings, []string, error) {
 	if !config.ValidName(name) {
 		return SourceSettings{}, nil, errors.New("invalid application name")
 	}
-	settings, err := m.sources.get(name)
-	if err != nil {
-		return SourceSettings{}, nil, ErrJobNotFound
-	}
-	state, err := m.protected.read()
+	settings, values, err := m.sourceAndBuildEnvironment(name)
 	if err != nil {
 		return SourceSettings{}, nil, err
 	}
-	keys := make([]string, 0, len(state.BuildEnvironment[name]))
-	for key := range state.BuildEnvironment[name] {
+	keys := make([]string, 0, len(values))
+	for key := range values {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	return settings, keys, nil
+}
+
+// sourceAndBuildEnvironment takes one manager-serialized snapshot of settings
+// persisted across the regular and encrypted stores. UpdateSource writes these
+// stores transactionally under the same lock, so redeploys and webhook jobs
+// cannot combine a source version with a different build-environment version.
+func (m *Manager) sourceAndBuildEnvironment(name string) (SourceSettings, map[string]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	settings, err := m.sources.get(name)
+	if err != nil {
+		return SourceSettings{}, nil, savedSourceLookupError(err)
+	}
+	state, err := m.protected.read()
+	if err != nil {
+		return SourceSettings{}, nil, fmt.Errorf("%w: %w", ErrSourceUnavailable, err)
+	}
+	return settings, cloneStringMap(state.BuildEnvironment[name]), nil
+}
+
+func savedSourceLookupError(err error) error {
+	if errors.Is(err, os.ErrNotExist) {
+		return ErrJobNotFound
+	}
+	return fmt.Errorf("%w: %w", ErrSourceUnavailable, err)
 }
 
 // UpdateSource persists a validated repository and build selection. A nil
@@ -296,21 +321,50 @@ func (m *Manager) UpdateSource(ctx context.Context, settings SourceSettings, bui
 			return err
 		}
 	}
-	if err := m.sources.save(settings); err != nil {
+	settings.ExplicitSelection = !selectionEmpty(settings.Selection)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.saveSourceAndBuildEnvironmentLocked(settings, buildEnvironment); err != nil {
 		return err
 	}
-	if buildEnvironment != nil {
-		values := cloneStringMap(*buildEnvironment)
-		if err := m.protected.update(func(state *protectedState) error {
-			state.BuildEnvironment[settings.Name] = values
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	m.mu.Lock()
 	delete(m.forgotten, settings.Name)
-	m.mu.Unlock()
+	return nil
+}
+
+// saveSourceAndBuildEnvironmentLocked updates the two persisted halves of a
+// source configuration as one logical transaction. Callers hold m.mu so
+// GetSource, Forget, and other source writes cannot observe an intermediate
+// state. If the source file fails after the encrypted environment update, the
+// previous encrypted values are restored before returning the failure.
+func (m *Manager) saveSourceAndBuildEnvironmentLocked(settings SourceSettings, buildEnvironment *map[string]string) error {
+	if buildEnvironment == nil {
+		return m.sources.save(settings)
+	}
+	previous, err := m.protected.read()
+	if err != nil {
+		return err
+	}
+	previousValues, hadPrevious := previous.BuildEnvironment[settings.Name]
+	if err := m.protected.update(func(state *protectedState) error {
+		state.BuildEnvironment[settings.Name] = cloneStringMap(*buildEnvironment)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := m.sources.save(settings); err != nil {
+		rollbackErr := m.protected.update(func(state *protectedState) error {
+			if hadPrevious {
+				state.BuildEnvironment[settings.Name] = cloneStringMap(previousValues)
+			} else {
+				delete(state.BuildEnvironment, settings.Name)
+			}
+			return nil
+		})
+		if rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("restore previous build environment: %w", rollbackErr))
+		}
+		return err
+	}
 	return nil
 }
 
@@ -324,61 +378,90 @@ func (m *Manager) Forget(name string) error {
 		return errors.New("invalid application name")
 	}
 	m.mu.Lock()
-	m.forgotten[name] = true
+	defer m.mu.Unlock()
+	previousSettings, sourceErr := m.sources.get(name)
+	hasPreviousSettings := sourceErr == nil
+	if sourceErr != nil && !errors.Is(sourceErr, os.ErrNotExist) {
+		return sourceErr
+	}
+	removed := make(map[string]struct{})
+	nextJobs := make(map[string]*jobRecord, len(m.jobs))
 	for id, record := range m.jobs {
 		if record.Job.Name != name {
+			nextJobs[id] = record
 			continue
 		}
-		if record.cancel != nil {
-			record.cancel()
-		}
-		if !record.terminal && m.outstanding > 0 {
-			m.outstanding--
-		}
-		delete(m.jobs, id)
+		removed[id] = struct{}{}
 	}
-	kept := m.order[:0]
-	removed := make(map[string]struct{})
+	nextOrder := make([]string, 0, len(m.order))
 	for _, id := range m.order {
-		if _, exists := m.jobs[id]; exists {
-			kept = append(kept, id)
-		} else {
-			removed[id] = struct{}{}
+		if nextJobs[id] != nil {
+			nextOrder = append(nextOrder, id)
 		}
 	}
-	m.order = kept
-	for key, dedup := range m.dedup {
-		if _, exists := removed[dedup.JobID]; exists {
-			delete(m.dedup, key)
+	nextDedup := make(map[string]dedupRecord, len(m.dedup))
+	for key, record := range m.dedup {
+		if _, deleted := removed[record.JobID]; !deleted {
+			nextDedup[key] = record
 		}
-	}
-	jobPersistErr := m.persistLocked()
-	m.mu.Unlock()
-	if jobPersistErr != nil {
-		return jobPersistErr
 	}
 	if err := m.sources.delete(name); err != nil {
 		return err
 	}
-	return m.protected.update(func(state *protectedState) error {
+	storeErr := m.protected.update(func(state *protectedState) error {
+		writePersistedJobState(state, nextJobs, nextOrder, nextDedup)
 		delete(state.BuildEnvironment, name)
 		for id, hook := range state.Hooks {
 			if hook.Metadata.Name == name {
 				delete(state.Hooks, id)
 			}
 		}
-		for key, dedup := range state.Dedup {
-			if _, exists := removed[dedup.JobID]; exists {
-				delete(state.Dedup, key)
-			}
-		}
-		for id := range state.Jobs {
-			if _, exists := removed[id]; exists {
-				delete(state.Jobs, id)
-			}
-		}
 		return nil
 	})
+	if storeErr != nil {
+		if hasPreviousSettings {
+			if rollbackErr := m.sources.restore(previousSettings); rollbackErr != nil {
+				// If the two stores cannot be brought back into sync, prevent this
+				// process from starting forgotten jobs from their in-memory copies.
+				m.applyForgottenJobsLocked(name, removed, nextJobs, nextOrder, nextDedup)
+				cleanupErr := m.protected.update(func(state *protectedState) error {
+					writePersistedJobState(state, nextJobs, nextOrder, nextDedup)
+					delete(state.BuildEnvironment, name)
+					for id, hook := range state.Hooks {
+						if hook.Metadata.Name == name {
+							delete(state.Hooks, id)
+						}
+					}
+					return nil
+				})
+				return errors.Join(storeErr, fmt.Errorf("restore source settings after failed forget: %w", rollbackErr), cleanupErr)
+			}
+		}
+		return storeErr
+	}
+	m.applyForgottenJobsLocked(name, removed, nextJobs, nextOrder, nextDedup)
+	return nil
+}
+
+// applyForgottenJobsLocked updates the in-memory job index only after its
+// protected-store representation has committed. Workers may already have
+// received a queued ID, but they block on m.mu and will observe the deletion.
+func (m *Manager) applyForgottenJobsLocked(name string, removed map[string]struct{}, jobs map[string]*jobRecord, order []string, dedup map[string]dedupRecord) {
+	for id := range removed {
+		if record := m.jobs[id]; record != nil {
+			m.removeQueuedLocked(id)
+			if record.cancel != nil {
+				record.cancel()
+			}
+			if !record.terminal && m.outstanding > 0 {
+				m.outstanding--
+			}
+		}
+	}
+	m.jobs = jobs
+	m.order = order
+	m.dedup = dedup
+	m.forgotten[name] = true
 }
 
 func (m *Manager) Repositories(ctx context.Context) ([]source.GitHubRepository, error) {
@@ -541,9 +624,9 @@ func (m *Manager) RedeployWithOptions(ctx context.Context, name string, clearCac
 	if !config.ValidName(name) {
 		return Job{}, errors.New("invalid application name")
 	}
-	settings, err := m.sources.get(name)
+	settings, buildEnvironment, err := m.sourceAndBuildEnvironment(name)
 	if err != nil {
-		return Job{}, ErrJobNotFound
+		return Job{}, err
 	}
 	if err := source.ValidateGitHubCheckoutRequest(settings.RepoURL, settings.Ref, settings.RootDir); err != nil {
 		return Job{}, errors.New("saved repository settings are invalid")
@@ -553,16 +636,13 @@ func (m *Manager) RedeployWithOptions(ctx context.Context, name string, clearCac
 			return Job{}, errors.New("saved build settings are invalid")
 		}
 	}
-	state, err := m.protected.read()
-	if err != nil {
-		return Job{}, err
-	}
 	if err := ctx.Err(); err != nil {
 		return Job{}, err
 	}
 	job, err := m.enqueue(DeployRequest{Name: name, RepoURL: settings.RepoURL, Ref: settings.Ref, RootDir: settings.RootDir, Config: settings.Selection,
-		BuildEnvironment: cloneStringMap(state.BuildEnvironment[name]), BuildTimeoutSeconds: settings.BuildTimeoutSeconds,
-		ClearCache: clearCache, IncludePaths: append([]string(nil), settings.IncludePaths...), IgnorePaths: append([]string(nil), settings.IgnorePaths...), preserveSettings: true})
+		BuildEnvironment: buildEnvironment, BuildTimeoutSeconds: settings.BuildTimeoutSeconds,
+		ClearCache: clearCache, IncludePaths: append([]string(nil), settings.IncludePaths...), IgnorePaths: append([]string(nil), settings.IgnorePaths...),
+		preserveSettings: true, explicitSelection: settings.ExplicitSelection})
 	if err != nil {
 		return Job{}, err
 	}
@@ -703,7 +783,7 @@ func (m *Manager) Get(id string) (Job, error) {
 	m.mu.Unlock()
 	if job.Deployment != nil && m.service != nil {
 		if logs, err := m.service.LogsForDeployment(job.Name, job.Deployment.ID); err == nil && logs != "" {
-			job.Logs = []string{redactSecrets(tailString(logs, 64<<10), secrets)}
+			job.Logs = []string{safeLogTail(logs, 64<<10, secrets)}
 		}
 	}
 	return job, nil
@@ -736,6 +816,7 @@ func (m *Manager) Cancel(id string) (Job, error) {
 		record.Job.State = "CANCELED"
 		record.Job.Stage = "CANCELED"
 		record.Job.UpdatedAt = time.Now().UTC()
+		m.removeQueuedLocked(id)
 		if m.outstanding > 0 {
 			m.outstanding--
 		}
@@ -748,6 +829,29 @@ func (m *Manager) Cancel(id string) (Job, error) {
 		log.Printf("persist canceled onboarding job: %v", err)
 	}
 	return cloneJob(record.Job), nil
+}
+
+// removeQueuedLocked compacts canceled jobs out of the bounded channel. A
+// worker may receive an item concurrently, so drain only the entries currently
+// available and put the remaining ones back in their original order.
+func (m *Manager) removeQueuedLocked(id string) {
+	if m.queue == nil {
+		return
+	}
+	queued := make([]string, 0, len(m.queue))
+	for count := len(m.queue); count > 0; count-- {
+		select {
+		case queuedID := <-m.queue:
+			if queuedID != id {
+				queued = append(queued, queuedID)
+			}
+		default:
+			count = 0
+		}
+	}
+	for _, queuedID := range queued {
+		m.queue <- queuedID
+	}
 }
 
 func (m *Manager) worker() {
@@ -823,12 +927,22 @@ func (m *Manager) run(id string) {
 	}
 	selection := request.Config
 	storedSelection := request.Config
+	if request.preserveSettings && inspection.ExistingConfig && !request.explicitSelection {
+		// Older saved records may contain inspection defaults in Selection even
+		// though the repository config is authoritative. Only UpdateSource marks
+		// those values as intentional overrides.
+		selection = ConfigSelection{}
+	}
 	if !inspection.ExistingConfig {
 		if selectionEmpty(selection) {
 			selection = selectionFromView(inspection.Config)
 		}
 		storedSelection = selection
-	} else if selectionEmpty(selection) {
+	} else {
+		// The checked-out paas.yaml remains authoritative for later redeploys.
+		// Explicit overrides saved through UpdateSource are stored separately;
+		// do not turn inspection-time values from this initial submit into stale
+		// overrides that hide future repository config changes.
 		storedSelection = ConfigSelection{}
 	}
 	cfg, err := PrepareConfigured(selected, request.Name, selection)
@@ -990,7 +1104,7 @@ func (m *Manager) refreshLogs(id, name, deploymentID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if j := m.jobs[id]; j != nil && !j.terminal {
-		j.Job.Logs = []string{redactSecrets(tailString(logs, 64<<10), buildEnvironmentValues(j.request.BuildEnvironment))}
+		j.Job.Logs = []string{safeLogTail(logs, 64<<10, buildEnvironmentValues(j.request.BuildEnvironment))}
 		j.Job.UpdatedAt = time.Now().UTC()
 		if err := m.persistLocked(); err != nil {
 			log.Printf("persist onboarding job logs: %v", err)
@@ -1025,18 +1139,27 @@ func (m *Manager) finish(id, state, stage, message string, d *model.Deployment) 
 }
 func (m *Manager) pruneLocked() {
 	for len(m.order) > 100 {
-		old := m.order[0]
-		record := m.jobs[old]
-		if record != nil && !record.terminal {
+		// Keep active jobs regardless of age, but do not let one long-running
+		// oldest job prevent pruning newer terminal history indefinitely.
+		removeAt := -1
+		for index, id := range m.order {
+			record := m.jobs[id]
+			if record == nil || record.terminal {
+				removeAt = index
+				break
+			}
+		}
+		if removeAt < 0 {
 			break
 		}
+		old := m.order[removeAt]
 		delete(m.jobs, old)
 		for key, record := range m.dedup {
 			if record.JobID == old {
 				delete(m.dedup, key)
 			}
 		}
-		m.order = m.order[1:]
+		m.order = append(m.order[:removeAt], m.order[removeAt+1:]...)
 	}
 	cutoff := time.Now().UTC().Add(-30 * 24 * time.Hour)
 	for key, record := range m.dedup {
@@ -1051,17 +1174,21 @@ func (m *Manager) persistLocked() error {
 		return errors.New("protected automation storage is unavailable")
 	}
 	return m.protected.update(func(state *protectedState) error {
-		state.Jobs = make(map[string]storedJob, len(m.jobs))
-		for id, record := range m.jobs {
-			state.Jobs[id] = storedJob{Job: cloneJob(record.Job), Request: cloneDeployRequest(record.request), PreserveSettings: record.request.preserveSettings, RequireCommitMatch: record.request.requireCommitMatch, Terminal: record.terminal}
-		}
-		state.Order = append([]string(nil), m.order...)
-		state.Dedup = make(map[string]dedupRecord, len(m.dedup))
-		for key, record := range m.dedup {
-			state.Dedup[key] = record
-		}
+		writePersistedJobState(state, m.jobs, m.order, m.dedup)
 		return nil
 	})
+}
+
+func writePersistedJobState(state *protectedState, jobs map[string]*jobRecord, order []string, dedup map[string]dedupRecord) {
+	state.Jobs = make(map[string]storedJob, len(jobs))
+	for id, record := range jobs {
+		state.Jobs[id] = storedJob{Job: cloneJob(record.Job), Request: cloneDeployRequest(record.request), PreserveSettings: record.request.preserveSettings, RequireCommitMatch: record.request.requireCommitMatch, ExplicitSelection: record.request.explicitSelection, Terminal: record.terminal}
+	}
+	state.Order = append([]string(nil), order...)
+	state.Dedup = make(map[string]dedupRecord, len(dedup))
+	for key, record := range dedup {
+		state.Dedup[key] = record
+	}
 }
 
 func (m *Manager) setSourceMetadata(id string, metadata source.GitMetadata) {
@@ -1084,14 +1211,8 @@ func (m *Manager) saveSourceForCurrentJob(id string, settings SourceSettings, bu
 	if record == nil || record.terminal || m.forgotten[settings.Name] {
 		return errors.New("deployment was canceled")
 	}
-	if err := m.sources.save(settings); err != nil {
-		return err
-	}
 	values := cloneStringMap(buildEnvironment)
-	if err := m.protected.update(func(state *protectedState) error {
-		state.BuildEnvironment[settings.Name] = values
-		return nil
-	}); err != nil {
+	if err := m.saveSourceAndBuildEnvironmentLocked(settings, &values); err != nil {
 		return err
 	}
 	return nil
@@ -1187,6 +1308,10 @@ func redactSecrets(value string, secrets []string) string {
 	return value
 }
 
+func safeLogTail(value string, limit int, secrets []string) string {
+	return tailString(redactSecrets(value, secrets), limit)
+}
+
 func validateDeployBuildOptions(timeout int, includes, ignores []string) error {
 	if timeout != 0 && (timeout < 10 || timeout > 1800) {
 		return errors.New("build timeout must be between 10 and 1800 seconds")
@@ -1265,7 +1390,11 @@ func removeID(values []string, id string) []string {
 }
 func tailString(value string, limit int) string {
 	if len(value) > limit {
-		value = value[len(value)-limit:]
+		start := len(value) - limit
+		for start < len(value) && !utf8.RuneStart(value[start]) {
+			start++
+		}
+		value = value[start:]
 	}
 	return strings.TrimSpace(value)
 }

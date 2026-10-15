@@ -4,8 +4,8 @@ import (
 	"errors"
 	"io/fs"
 	"path"
-	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 func validatePathFilters(includes, ignores []string) error {
@@ -20,56 +20,83 @@ func validatePathFilters(includes, ignores []string) error {
 	return nil
 }
 
-func compileWebhookPathPattern(pattern string) (*regexp.Regexp, error) {
-	if pattern == "" || len(pattern) > 256 || strings.HasPrefix(pattern, "/") || strings.ContainsAny(pattern, "\\\x00") {
+func compileWebhookPathPattern(pattern string) ([]string, error) {
+	if pattern == "" || len(pattern) > 256 || !utf8.ValidString(pattern) || strings.HasPrefix(pattern, "/") || strings.ContainsAny(pattern, "\\\x00") {
 		return nil, errors.New("invalid path pattern")
 	}
-	for _, component := range strings.Split(pattern, "/") {
+	components := strings.Split(pattern, "/")
+	for index, component := range components {
 		if component == "" || component == "." || component == ".." || component == ".git" {
 			return nil, errors.New("invalid path pattern")
 		}
-	}
-	if _, err := path.Match(pattern, "placeholder"); err != nil {
-		return nil, err
-	}
-	var expression strings.Builder
-	expression.WriteByte('^')
-	for i := 0; i < len(pattern); i++ {
-		switch pattern[i] {
-		case '*':
-			if i+1 < len(pattern) && pattern[i+1] == '*' {
-				i++
-				if i+1 < len(pattern) && pattern[i+1] == '/' {
-					expression.WriteString("(?:.*/)?")
-					i++
-				} else {
-					expression.WriteString(".*")
-				}
-			} else {
-				expression.WriteString("[^/]*")
+		// path.Match uses '^' for a negated class; the webhook UI uses the
+		// more familiar '!' spelling. Rewrite only the first class character,
+		// leaving a literal `[!` inside an already-open class untouched.
+		component = normalizeNegatedPathClass(component)
+		components[index] = component
+		if component != "**" {
+			if _, err := path.Match(component, "placeholder"); err != nil {
+				return nil, err
 			}
-		case '?':
-			expression.WriteString("[^/]")
-		case '[':
-			end := strings.IndexByte(pattern[i+1:], ']')
-			if end < 0 {
-				return nil, errors.New("invalid path pattern")
-			}
-			end += i + 1
-			class := pattern[i+1 : end]
-			if strings.HasPrefix(class, "!") {
-				class = "^" + class[1:]
-			}
-			expression.WriteByte('[')
-			expression.WriteString(class)
-			expression.WriteByte(']')
-			i = end
-		default:
-			expression.WriteString(regexp.QuoteMeta(string(pattern[i])))
 		}
 	}
-	expression.WriteByte('$')
-	return regexp.Compile(expression.String())
+	return components, nil
+}
+
+func normalizeNegatedPathClass(pattern string) string {
+	var normalized strings.Builder
+	insideClass := false
+	firstClassCharacter := false
+	for index := 0; index < len(pattern); index++ {
+		character := pattern[index]
+		if !insideClass && character == '[' {
+			insideClass = true
+			firstClassCharacter = true
+			normalized.WriteByte(character)
+			continue
+		}
+		if insideClass && firstClassCharacter && character == '!' {
+			normalized.WriteByte('^')
+			firstClassCharacter = false
+			continue
+		}
+		normalized.WriteByte(character)
+		if insideClass {
+			if character == ']' && !firstClassCharacter {
+				insideClass = false
+			} else {
+				firstClassCharacter = false
+			}
+		}
+	}
+	return normalized.String()
+}
+
+func webhookPathMatches(pattern, file []string) bool {
+	// Dynamic programming over path components gives ** recursive directory
+	// matching without translating classes or wildcard characters to regex.
+	// path.Match handles each component's classes and wildcards, so a negated
+	// class can never consume the separator between components.
+	next := make([]bool, len(file)+1)
+	next[len(file)] = true
+	for patternIndex := len(pattern) - 1; patternIndex >= 0; patternIndex-- {
+		current := make([]bool, len(file)+1)
+		if pattern[patternIndex] == "**" {
+			for fileIndex := len(file); fileIndex >= 0; fileIndex-- {
+				current[fileIndex] = next[fileIndex]
+				if fileIndex < len(file) {
+					current[fileIndex] = current[fileIndex] || current[fileIndex+1]
+				}
+			}
+		} else {
+			for fileIndex := len(file) - 1; fileIndex >= 0; fileIndex-- {
+				matched, _ := path.Match(pattern[patternIndex], file[fileIndex])
+				current[fileIndex] = matched && next[fileIndex+1]
+			}
+		}
+		next = current
+	}
+	return next[0]
 }
 
 func pathFiltersMatch(includes, ignores, changed []string) bool {
@@ -87,7 +114,7 @@ func pathFiltersMatch(includes, ignores, changed []string) bool {
 		included := len(includes) == 0
 		for _, pattern := range includes {
 			matcher, err := compileWebhookPathPattern(pattern)
-			if err == nil && matcher.MatchString(file) {
+			if err == nil && webhookPathMatches(matcher, parts) {
 				included = true
 				break
 			}
@@ -98,7 +125,7 @@ func pathFiltersMatch(includes, ignores, changed []string) bool {
 		ignored := false
 		for _, pattern := range ignores {
 			matcher, err := compileWebhookPathPattern(pattern)
-			if err == nil && matcher.MatchString(file) {
+			if err == nil && webhookPathMatches(matcher, parts) {
 				ignored = true
 				break
 			}

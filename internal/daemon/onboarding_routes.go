@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
+	"paas/internal/contracts"
 	"paas/internal/onboarding"
 )
 
@@ -182,15 +182,9 @@ func registerOnboardingRoutes(mux *http.ServeMux, server *Server) {
 }
 
 func decodeOnboardingRequest(w http.ResponseWriter, r *http.Request, output any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(output); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, contracts.MaxControlRequestBytes)
+	if err := decodeDaemonJSON(r.Body, output); err != nil {
 		writeOnboardingError(w, http.StatusBadRequest, "Invalid JSON request.")
-		return false
-	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
-		writeOnboardingError(w, http.StatusBadRequest, "Request must contain one JSON object.")
 		return false
 	}
 	return true
@@ -200,6 +194,8 @@ func onboardingErrorStatus(err error) int {
 	switch {
 	case errors.Is(err, onboarding.ErrJobNotFound):
 		return http.StatusNotFound
+	case errors.Is(err, onboarding.ErrSourceUnavailable):
+		return http.StatusInternalServerError
 	case errors.Is(err, onboarding.ErrQueueFull):
 		return http.StatusTooManyRequests
 	case errors.Is(err, onboarding.ErrManagerClosed):

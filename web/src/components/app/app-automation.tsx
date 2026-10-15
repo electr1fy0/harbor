@@ -1,10 +1,17 @@
-import { useState } from "react"
+import { useRef, useState } from "react"
 import { useQuery, useMutation } from "@tanstack/react-query"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { FeatureCard, fieldClass, useFeatureAction } from "./feature-card"
-import { featureCall, parseDotEnv } from "@/lib/features"
+import {
+  featureCall,
+  jsonPayloadByteLength,
+  parseDotEnv,
+  savedSourceErrorMessage,
+  sameInspectionSnapshot,
+  shouldClearBuildEnvironmentAfterAction,
+} from "@/lib/features"
 import { formatDate } from "./format"
 import { inspectProject } from "@/lib/harbor.functions"
 
@@ -62,6 +69,7 @@ export function AppAutomation({ name }: { name: string }) {
       featureCall<{ jobs: Job[] }>("automation", { action: "listJobs", name }),
     refetchInterval: 5000,
   })
+  const sourceError = savedSourceErrorMessage(source.error)
   const [branch, setBranch] = useState("")
   const [newSecret, setNewSecret] = useState<{
     hook: Hook
@@ -90,8 +98,19 @@ export function AppAutomation({ name }: { name: string }) {
           <p className="text-sm">
             {source.isPending
               ? "Loading repository configuration…"
-              : "This app has no saved GitHub source. Import a repository to enable automated deployments."}
+              : (sourceError ??
+                "This app has no saved GitHub source. Import a repository to enable automated deployments.")}
           </p>
+          {sourceError && (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={source.isFetching}
+              onClick={() => void source.refetch()}
+            >
+              {source.isFetching ? "Retrying…" : "Retry"}
+            </Button>
+          )}
         </FeatureCard>
       )}
       <FeatureCard
@@ -277,21 +296,46 @@ function SourceForm({
   const [buildEnv, setBuildEnv] = useState("")
   const [replaceEnv, setReplaceEnv] = useState(false)
   const [error, setError] = useState("")
-  const action = useFeatureAction("automation", () => {
-    setBuildEnv("")
-    setReplaceEnv(false)
+  const inspectionSnapshot = {
+    name: source.name,
+    repoURL,
+    ref,
+    rootDir,
+    build,
+    start,
+    health,
+  }
+  const currentInspectionSnapshot = useRef(inspectionSnapshot)
+  currentInspectionSnapshot.current = inspectionSnapshot
+  const action = useFeatureAction("automation", (_data, input) => {
+    if (shouldClearBuildEnvironmentAfterAction(input)) {
+      setBuildEnv("")
+      setReplaceEnv(false)
+    }
   })
   const inspection = useMutation({
-    mutationFn: () =>
-      inspectProject({ data: { name: source.name, repoURL, ref, rootDir } }),
-    onSuccess: (result) => {
+    mutationFn: (input: Record<string, string>) =>
+      inspectProject({
+        data: {
+          name: input.name,
+          repoURL: input.repoURL,
+          ref: input.ref,
+          rootDir: input.rootDir,
+        },
+      }),
+    onSuccess: (result, input) => {
+      if (!sameInspectionSnapshot(input, currentInspectionSnapshot.current))
+        return
       setSelection({ ...result.config })
       setBuild(result.config.buildCommand)
       setStart(result.config.startCommand)
       setHealth(result.config.healthPath)
       setError("")
     },
-    onError: (err) => setError(err.message),
+    onError: (err, input) => {
+      if (sameInspectionSnapshot(input, currentInspectionSnapshot.current))
+        setError(err.message)
+    },
   })
   const paths = (value: string) =>
     value
@@ -316,8 +360,7 @@ function SourceForm({
                 "Build environment imports are limited to 48 KiB."
               )
             const environment = replaceEnv ? parseDotEnv(buildEnv) : undefined
-            setError("")
-            action.mutate({
+            const input = {
               action: "updateSource",
               source: {
                 name: source.name,
@@ -335,7 +378,13 @@ function SourceForm({
                 buildTimeoutSeconds: timeout,
                 ...(environment ? { buildEnvironment: environment } : {}),
               },
-            })
+            }
+            if (jsonPayloadByteLength(input) > 64 * 1024)
+              throw new Error(
+                "Source settings exceed the 64 KiB request limit."
+              )
+            setError("")
+            action.mutate(input)
           } catch (err) {
             setError(
               err instanceof Error ? err.message : "Invalid build environment"
@@ -348,6 +397,7 @@ function SourceForm({
           <Input
             required
             type="url"
+            disabled={action.isPending}
             value={repoURL}
             onChange={(e) => setRepo(e.target.value)}
           />
@@ -355,11 +405,19 @@ function SourceForm({
         <div className="grid gap-3 sm:grid-cols-2">
           <label className={fieldClass}>
             Branch, tag, or commit
-            <Input value={ref} onChange={(e) => setRef(e.target.value)} />
+            <Input
+              disabled={action.isPending}
+              value={ref}
+              onChange={(e) => setRef(e.target.value)}
+            />
           </label>
           <label className={fieldClass}>
             Repository root directory
-            <Input value={rootDir} onChange={(e) => setRoot(e.target.value)} />
+            <Input
+              disabled={action.isPending}
+              value={rootDir}
+              onChange={(e) => setRoot(e.target.value)}
+            />
           </label>
         </div>
         <Button
@@ -367,7 +425,7 @@ function SourceForm({
           variant="outline"
           className="w-fit"
           disabled={inspection.isPending}
-          onClick={() => inspection.mutate()}
+          onClick={() => inspection.mutate({ ...inspectionSnapshot })}
         >
           {inspection.isPending
             ? "Inspecting repository…"
@@ -377,6 +435,7 @@ function SourceForm({
           Build command
           <Input
             required
+            disabled={action.isPending}
             value={build}
             onChange={(e) => setBuild(e.target.value)}
           />
@@ -385,6 +444,7 @@ function SourceForm({
           Start command
           <Input
             required
+            disabled={action.isPending}
             value={start}
             onChange={(e) => setStart(e.target.value)}
           />
@@ -392,12 +452,17 @@ function SourceForm({
         <div className="grid gap-3 sm:grid-cols-2">
           <label className={fieldClass}>
             Health path
-            <Input value={health} onChange={(e) => setHealth(e.target.value)} />
+            <Input
+              disabled={action.isPending}
+              value={health}
+              onChange={(e) => setHealth(e.target.value)}
+            />
           </label>
           <label className={fieldClass}>
             Build timeout (seconds)
             <Input
               type="number"
+              disabled={action.isPending}
               min={10}
               max={1800}
               value={timeout}
@@ -409,6 +474,7 @@ function SourceForm({
           <label className={fieldClass}>
             Include changed paths · one pattern per line
             <Textarea
+              disabled={action.isPending}
               value={include}
               onChange={(e) => setInclude(e.target.value)}
               placeholder="apps/api/**"
@@ -417,6 +483,7 @@ function SourceForm({
           <label className={fieldClass}>
             Ignore changed paths · one pattern per line
             <Textarea
+              disabled={action.isPending}
               value={ignore}
               onChange={(e) => setIgnore(e.target.value)}
               placeholder="docs/**"
@@ -429,6 +496,7 @@ function SourceForm({
         <label className="flex items-center gap-2 text-xs">
           <input
             type="checkbox"
+            disabled={action.isPending}
             checked={replaceEnv}
             onChange={(e) => setReplaceEnv(e.target.checked)}
           />
@@ -439,6 +507,7 @@ function SourceForm({
             Build .env document · empty removes all build variables
             <Textarea
               autoComplete="off"
+              disabled={action.isPending}
               value={buildEnv}
               onChange={(e) => setBuildEnv(e.target.value)}
               placeholder="PUBLIC_API_URL=https://api.example.com"

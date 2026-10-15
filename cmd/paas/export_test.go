@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,5 +65,13 @@ func TestOfflineExportDecryptionAuthenticatesAndNeverOverwrites(t *testing.T) {
 	after, _ := os.ReadFile(output)
 	if !bytes.Equal(before, after) {
 		t.Fatal("existing archive changed")
+	}
+
+	failedOutput := filepath.Join(dir, "archive-with-closed-stdout.tar.gz")
+	var stderr bytes.Buffer
+	stdout := &failAfterWrites{err: errors.New("output closed")}
+	status := runWithInput([]string{"export-decrypt", input, failedOutput, "--passphrase-stdin"}, strings.NewReader("synthetic-passphrase\n"), stdout, &stderr)
+	if status != 1 || !strings.Contains(stderr.String(), "write confirmation: output closed") {
+		t.Fatalf("failed success message status=%d stderr=%q", status, stderr.String())
 	}
 }

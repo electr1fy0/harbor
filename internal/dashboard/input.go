@@ -5,13 +5,21 @@ import (
 	"encoding/json"
 	"reflect"
 	"strings"
+
+	"paas/internal/strictjson"
 )
 
 // encoding/json matches struct fields without regard to case. The browser
 // contract uses exact JSON names, and raw-field validation must inspect the
 // same keys that decoding consumes (especially for optional/null fields).
 func exactInputKeys[T any](body []byte) bool {
-	return inputObjectKeysMatch(body, reflect.TypeFor[T]())
+	return strictjson.Validate(body) == nil && inputObjectKeysMatch(body, reflect.TypeFor[T]())
+}
+
+// strictJSONInvalid rejects malformed, ambiguous, or trailing JSON before
+// raw-map validation. The standard library otherwise collapses duplicate names.
+func strictJSONInvalid(body []byte) bool {
+	return strictjson.Validate(body) != nil
 }
 
 func inputObjectKeysMatch(body []byte, inputType reflect.Type) bool {

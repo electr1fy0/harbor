@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,6 +20,7 @@ const (
 	DefaultMemory = "128Mi"
 	DefaultCPU    = 0.5
 	DefaultTasks  = 64
+	maxConfigSize = 1 << 20
 )
 
 // Config describes how to build and start one application.
@@ -73,7 +75,12 @@ type yamlResources struct {
 // resource defaults, and validates the resulting configuration.
 func Load(sourceDir string) (*Config, error) {
 	path := filepath.Join(sourceDir, "paas.yaml")
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxConfigSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
@@ -86,6 +93,9 @@ func LoadBytes(data []byte) (*Config, error) {
 }
 
 func loadBytes(data []byte, path string) (*Config, error) {
+	if len(data) > maxConfigSize {
+		return nil, fmt.Errorf("decode %s: configuration exceeds %d bytes", path, maxConfigSize)
+	}
 	var document configDocument
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
@@ -155,8 +165,11 @@ func Validate(cfg *Config) error {
 	if cfg.Resources.Tasks < 1 {
 		return fmt.Errorf("resources.tasks must be a positive integer")
 	}
-	if cfg.Health.Path != "" && !strings.HasPrefix(cfg.Health.Path, "/") {
-		return fmt.Errorf("health.path must be empty or start with /")
+	if cfg.Health.Path != "" {
+		parsed, err := url.Parse(cfg.Health.Path)
+		if err != nil || !strings.HasPrefix(cfg.Health.Path, "/") || parsed.IsAbs() || parsed.Opaque != "" || parsed.Host != "" {
+			return fmt.Errorf("health.path must be empty or a valid absolute path on the application")
+		}
 	}
 	return nil
 }

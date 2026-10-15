@@ -28,10 +28,10 @@ function DeploymentsPage() {
     refetchInterval: 5000,
   })
   if (query.isPending) return <PageLoading rows={5} />
-  if (query.isError)
+  if (query.isError && !query.data)
     return (
       <PageError
-        message={query.error.message}
+        message={query.error?.message ?? "Deployment history is unavailable."}
         onRetry={() => void query.refetch()}
       />
     )
@@ -46,6 +46,11 @@ function DeploymentsPage() {
   return (
     <>
       <PageHeader title="Deployments" />
+      {query.isError ? (
+        <p role="status" className="mb-3 text-xs text-amber-800">
+          Latest deployment data could not be refreshed: {query.error?.message}
+        </p>
+      ) : null}
       <p className="mb-4 text-sm text-muted-foreground">
         All attempts across your projects, including failed builds, canceled
         candidates, restarts, and rollbacks.

@@ -3,7 +3,17 @@ import { useQuery } from "@tanstack/react-query"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { FeatureCard } from "./feature-card"
-import { downloadText, featureCall, type LogDelta } from "@/lib/features"
+import {
+  beginLogCursorRequest,
+  completeLogCursorRequest,
+  downloadText,
+  featureCall,
+  findTextMatches,
+  mergeLogOutput,
+  type LogCursorEntry,
+  type LogDelta,
+  type LogOutput,
+} from "@/lib/features"
 
 export function AdvancedLogs({
   name,
@@ -20,23 +30,34 @@ export function AdvancedLogs({
   const [follow, setFollow] = useState(true)
   const [search, setSearch] = useState("")
   const [matchIndex, setMatchIndex] = useState(0)
-  const [output, setOutput] = useState({ identity: "", text: "" })
-  const cursor = useRef({ identity: "", value: "" })
+  const [output, setOutput] = useState<LogOutput>({ identity: "", text: "" })
+  const cursors = useRef(new Map<string, LogCursorEntry>())
+  const cursorRequestID = useRef(0)
   const pre = useRef<HTMLPreElement>(null)
   const identity = `${name}:${deploymentId}:${source}`
   const query = useQuery({
     queryKey: ["harbor", "log-stream", name, deploymentId, source],
     queryFn: async () => {
-      if (cursor.current.identity !== identity)
-        cursor.current = { identity, value: "" }
+      const requestID = ++cursorRequestID.current
+      const requestCursor = beginLogCursorRequest(
+        cursors.current,
+        identity,
+        requestID,
+        output.identity !== identity
+      )
       const result = await featureCall<LogDelta>("observe", {
         action: "logs",
         name,
         deploymentId,
         source,
-        cursor: cursor.current.value,
+        cursor: requestCursor,
       })
-      cursor.current = { identity, value: result.cursor }
+      completeLogCursorRequest(
+        cursors.current,
+        identity,
+        requestID,
+        result.cursor
+      )
       return { ...result, identity }
     },
     enabled: !paused,
@@ -47,38 +68,33 @@ export function AdvancedLogs({
   useEffect(() => {
     if (!query.data || query.data.identity !== identity) return
     const result = query.data
-    setOutput((previous) => ({
-      identity,
-      text: (result.reset || previous.identity !== identity
-        ? result.text
-        : previous.text + result.text
-      ).slice(-1_048_576),
-    }))
+    setOutput((previous) => mergeLogOutput(previous, identity, result))
   }, [query.dataUpdatedAt, identity])
   useEffect(() => {
     if (follow && pre.current) pre.current.scrollTop = pre.current.scrollHeight
   }, [output, follow])
   const text = output.identity === identity ? output.text : ""
   const segments: Array<{ text: string; match: boolean; index: number }> = []
-  let count = 0
-  if (search) {
+  const matches = findTextMatches(text, search)
+  const count = matches.length
+  if (count) {
     let start = 0
-    let found = text.toLowerCase().indexOf(search.toLowerCase())
-    while (found >= 0 && count < 2000) {
+    for (const [index, match] of matches.entries()) {
       segments.push({
-        text: text.slice(start, found),
+        text: text.slice(start, match.start),
         match: false,
-        index: count,
+        index,
       })
       segments.push({
-        text: text.slice(found, found + search.length),
+        text: text.slice(match.start, match.end),
         match: true,
-        index: count++,
+        index,
       })
-      start = found + search.length
-      found = text.toLowerCase().indexOf(search.toLowerCase(), start)
+      start = match.end
     }
     segments.push({ text: text.slice(start), match: false, index: count })
+  } else if (search) {
+    segments.push({ text, match: false, index: 0 })
   }
   useEffect(() => {
     if (search)

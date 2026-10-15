@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
+	"paas/internal/config"
 	"paas/internal/contracts"
 	"paas/internal/model"
 	"paas/internal/service/sqlite"
@@ -44,8 +44,8 @@ func (m *Manager) AddService(ctx context.Context, serviceType, name string) (*mo
 	if serviceType != "sqlite" {
 		return nil, fmt.Errorf("unsupported service type %q: only sqlite is supported", serviceType)
 	}
-	if strings.TrimSpace(name) == "" {
-		return nil, errors.New("service name must not be empty")
+	if !config.ValidName(name) {
+		return nil, fmt.Errorf("invalid service name %q", name)
 	}
 
 	if existing, err := m.store.GetService(name); err == nil && existing != nil {
@@ -118,14 +118,20 @@ func (m *Manager) Link(ctx context.Context, appName, serviceName string) (*model
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	app, err := m.store.CreateApp(appName)
-	if err != nil {
-		return nil, fmt.Errorf("find application %q: %w", appName, err)
+	if !config.ValidName(appName) {
+		return nil, fmt.Errorf("invalid application name %q", appName)
 	}
-
 	svc, err := m.store.GetService(serviceName)
 	if err != nil {
 		return nil, fmt.Errorf("find service %q: %w", serviceName, err)
+	}
+	if err := validateBindableService(svc); err != nil {
+		return nil, fmt.Errorf("link application %q to service %q: %w", appName, serviceName, err)
+	}
+
+	app, err := m.store.CreateApp(appName)
+	if err != nil {
+		return nil, fmt.Errorf("find application %q: %w", appName, err)
 	}
 
 	binding, err := m.bindingMgr.Link(ctx, app, svc)

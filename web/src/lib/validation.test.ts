@@ -5,6 +5,7 @@ import {
   explainFailureInputSchema,
   getCapacityInputSchema,
   getAppInputSchema,
+  isValidGitHubRepoURL,
   parseGitHubRepoURL,
   parseInput,
   submitOnboardingJobInputSchema,
@@ -33,6 +34,22 @@ describe("Harbor input validation", () => {
       ref: "",
       rootDir: "",
     })
+  })
+
+  it("accepts GitHub URLs with normalized host casing and explicit HTTPS port", () => {
+    const repoURL = "HTTPS://GITHUB.COM:443/Harbor/Example.git"
+    expect(
+      parseInput(deployAppInputSchema, { name: "harbor-web", repoURL }).repoURL
+    ).toBe(repoURL)
+    expect(parseGitHubRepoURL(repoURL)).toEqual({
+      owner: "Harbor",
+      repo: "Example",
+    })
+  })
+
+  it("uses the same GitHub repository-name rules in URL field feedback", () => {
+    expect(isValidGitHubRepoURL("https://github.com/octo/.github")).toBe(true)
+    expect(isValidGitHubRepoURL("https://github.com/octo/.." )).toBe(false)
   })
 
   it("rejects names that the Go daemon would reject", () => {
@@ -106,6 +123,52 @@ describe("Harbor input validation", () => {
     ).toThrow("Invalid request data.")
   })
 
+  it("accepts valid Unicode Git refs that the daemon supports", () => {
+    expect(
+      parseInput(deployAppInputSchema, {
+        name: "harbor-web",
+        repoURL: "https://github.com/harbor/example",
+        ref: "修复/naïve",
+      }).ref
+    ).toBe("修复/naïve")
+  })
+
+  it("limits Git ref length in UTF-8 bytes like the daemon", () => {
+    expect(
+      parseInput(deployAppInputSchema, {
+        name: "harbor-web",
+        repoURL: "https://github.com/harbor/example",
+        ref: "修".repeat(85),
+      }).ref
+    ).toBe("修".repeat(85))
+    expect(() =>
+      parseInput(deployAppInputSchema, {
+        name: "harbor-web",
+        repoURL: "https://github.com/harbor/example",
+        ref: "修".repeat(86),
+      })
+    ).toThrow("Invalid request data.")
+  })
+
+  it("limits environment values in UTF-8 bytes like the daemon", () => {
+    const value = "😀".repeat(20_000)
+    expect(value.length).toBeLessThan(65_536)
+    expect(new TextEncoder().encode(value).length).toBeGreaterThan(65_536)
+    expect(
+      configureAppInputSchema.safeParse({
+        name: "harbor-web",
+        environment: { APP_TEXT: value },
+      }).success
+    ).toBe(false)
+    expect(
+      submitOnboardingJobInputSchema.safeParse({
+        name: "harbor-web",
+        repoURL: "https://github.com/harbor/example",
+        environment: { APP_TEXT: value },
+      }).success
+    ).toBe(false)
+  })
+
   it("extracts only a validated GitHub repository path", () => {
     expect(parseGitHubRepoURL("https://github.com/Harbor/Example.git")).toEqual(
       {
@@ -113,6 +176,23 @@ describe("Harbor input validation", () => {
         repo: "Example",
       }
     )
+  })
+
+  it("accepts valid GitHub repository names beginning with punctuation", () => {
+    for (const repo of [".github", "_repo", "-repo"]) {
+      const repoURL = `https://github.com/harbor/${repo}`
+      expect(
+        parseInput(deployAppInputSchema, { name: "harbor-web", repoURL })
+          .repoURL
+      ).toBe(repoURL)
+      expect(parseGitHubRepoURL(repoURL)).toEqual({ owner: "harbor", repo })
+    }
+    expect(() =>
+      parseInput(deployAppInputSchema, {
+        name: "harbor-web",
+        repoURL: "https://github.com/harbor/..git",
+      })
+    ).toThrow("Invalid request data.")
   })
 
   it("accepts SQLite service selections and rejects obsolete PostgreSQL fields", () => {

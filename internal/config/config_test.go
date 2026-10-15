@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,18 +64,20 @@ start:
   command: /app/server
 `
 	cases := map[string]string{
-		"unknown top-level field": base + "port: 8080\n",
-		"unknown nested field":    strings.Replace(base, "  command: build", "  command: build\n  extra: true", 1),
-		"unsupported runtime":     strings.Replace(base, "runtime: go", "runtime: python", 1),
-		"invalid name":            strings.Replace(base, "name: demo", "name: Demo", 1),
-		"trailing name hyphen":    strings.Replace(base, "name: demo", "name: demo-", 1),
-		"empty build":             strings.Replace(base, "  command: build", "  command: '  '", 1),
-		"empty start":             strings.Replace(base, "  command: /app/server", "  command: ''", 1),
-		"bad health path":         base + "health:\n  path: ready\n",
-		"invalid memory":          base + "resources:\n  memory: huge\n",
-		"zero CPU":                base + "resources:\n  cpu: 0\n",
-		"zero tasks":              base + "resources:\n  tasks: 0\n",
-		"multiple documents":      base + "---\nname: other\n",
+		"unknown top-level field":              base + "port: 8080\n",
+		"unknown nested field":                 strings.Replace(base, "  command: build", "  command: build\n  extra: true", 1),
+		"unsupported runtime":                  strings.Replace(base, "runtime: go", "runtime: python", 1),
+		"invalid name":                         strings.Replace(base, "name: demo", "name: Demo", 1),
+		"trailing name hyphen":                 strings.Replace(base, "name: demo", "name: demo-", 1),
+		"empty build":                          strings.Replace(base, "  command: build", "  command: '  '", 1),
+		"empty start":                          strings.Replace(base, "  command: /app/server", "  command: ''", 1),
+		"bad health path":                      base + "health:\n  path: ready\n",
+		"health path with a network authority": base + "health:\n  path: //example.com/ready\n",
+		"health path with an invalid escape":   base + "health:\n  path: /ready%zz\n",
+		"invalid memory":                       base + "resources:\n  memory: huge\n",
+		"zero CPU":                             base + "resources:\n  cpu: 0\n",
+		"zero tasks":                           base + "resources:\n  tasks: 0\n",
+		"multiple documents":                   base + "---\nname: other\n",
 	}
 	for name, contents := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -84,6 +87,45 @@ start:
 				t.Fatal("Load accepted invalid configuration")
 			}
 		})
+	}
+}
+
+func TestValidateRejectsHealthPathsThatCannotBeProbedLocally(t *testing.T) {
+	base := &Config{
+		Name: "demo", Runtime: "go", Build: Build{Command: "build"}, Start: Start{Command: "/app/server"},
+		Resources: Resources{Memory: DefaultMemory, CPU: DefaultCPU, Tasks: DefaultTasks},
+	}
+	for _, path := range []string{"//example.com/ready", "/ready%zz", "/ready\x00"} {
+		t.Run(path, func(t *testing.T) {
+			cfg := *base
+			cfg.Health.Path = path
+			if err := Validate(&cfg); err == nil {
+				t.Fatalf("Validate accepted health path %q", path)
+			}
+		})
+	}
+	for _, path := range []string{"/", "/ready", "/ready?full=1", "/ready#ignored-by-http"} {
+		t.Run("valid "+path, func(t *testing.T) {
+			cfg := *base
+			cfg.Health.Path = path
+			if err := Validate(&cfg); err != nil {
+				t.Fatalf("Validate rejected health path %q: %v", path, err)
+			}
+		})
+	}
+}
+
+func TestLoadBoundsConfigurationFileSize(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "paas.yaml")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), maxConfigSize+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(root); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("Load() error = %v, want configuration size error", err)
+	}
+	if _, err := LoadBytes(bytes.Repeat([]byte("x"), maxConfigSize+1)); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("LoadBytes() error = %v, want configuration size error", err)
 	}
 }
 

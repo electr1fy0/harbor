@@ -350,10 +350,14 @@ func (m *Manager) SetBackupPolicy(ctx context.Context, serviceName, frequency st
 // StartBackups starts the scheduled snapshot loop exactly once and ties its
 // lifetime to the daemon's context.
 func (m *Manager) StartBackups(ctx context.Context) {
-	if ctx == nil {
+	if ctx == nil || ctx.Err() != nil {
 		return
 	}
 	m.backupLoopMu.Lock()
+	if ctx.Err() != nil {
+		m.backupLoopMu.Unlock()
+		return
+	}
 	if m.backupLoopStarted {
 		m.backupLoopMu.Unlock()
 		return
@@ -404,14 +408,21 @@ func (m *Manager) RunScheduledBackups(ctx context.Context) error {
 			if err := ctx.Err(); err != nil {
 				return errors.Join(append(failures, err)...)
 			}
-			backups, err := m.store.DataBackups(svc.ID)
+			backups, err := m.store.ScheduledDataBackups(svc.ID, binding.AppID)
 			if err != nil {
 				failures = append(failures, err)
 				continue
 			}
 			latest := time.Time{}
 			for _, backup := range backups {
-				if backup.Scheduled && backup.AppName == appNames[binding.AppID] && backup.CreatedAt.After(latest) {
+				// Corrupt or missing snapshots do not satisfy the active policy.
+				// Refresh only cheap file metadata here; full SQLite integrity checks
+				// remain an explicit verification operation.
+				backup = m.refreshBackupMetadata(backup, svc)
+				if backup.Verification == "failed" {
+					continue
+				}
+				if backup.CreatedAt.After(latest) {
 					latest = backup.CreatedAt
 				}
 			}
@@ -812,9 +823,11 @@ func serviceBackupDir(svc *model.Service, create bool) (string, error) {
 	backupDir := filepath.Join(volumeDir, "backups")
 	info, err := os.Lstat(backupDir)
 	if errors.Is(err, os.ErrNotExist) && create {
-		if err := os.Mkdir(backupDir, 0700); err != nil {
+		if err := os.Mkdir(backupDir, 0700); err != nil && !errors.Is(err, os.ErrExist) {
 			return "", fmt.Errorf("create SQLite backup directory: %w", err)
 		}
+		// Another backup request for this service may have created the shared
+		// directory after our first Lstat. Always validate the winner's entry.
 		info, err = os.Lstat(backupDir)
 	}
 	if err != nil {
@@ -921,10 +934,13 @@ func copyRegularFile(ctx context.Context, source, destination string, maxBytes i
 	if err != nil {
 		return err
 	}
-	copied, copyErr := io.Copy(out, io.LimitReader(in, maxBytes+1))
+	copied, copyErr := copyWithContext(ctx, out, io.LimitReader(in, maxBytes+1))
 	closeErr := out.Close()
 	if copyErr != nil || closeErr != nil || copied != info.Size() || copied > maxBytes {
 		_ = os.Remove(destination)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return errors.Join(copyErr, closeErr, errors.New("source file size changed while copying"))
 	}
 	if err := ctx.Err(); err != nil {
@@ -932,6 +948,31 @@ func copyRegularFile(ctx context.Context, source, destination string, maxBytes i
 		return err
 	}
 	return nil
+}
+
+// copyWithContext stops long backup/restore/export copies promptly when their
+// caller is canceled. Checking only after io.Copy would leave multi-gigabyte
+// restore files consuming disk I/O after the request was abandoned.
+func copyWithContext(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
+	if ctx == nil {
+		return 0, errors.New("file copy context must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return io.Copy(destination, contextReader{ctx: ctx, reader: source})
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(buffer)
 }
 
 func backupFrequencyDuration(frequency string) (time.Duration, error) {
@@ -948,7 +989,7 @@ func backupFrequencyDuration(frequency string) (time.Duration, error) {
 }
 
 func (m *Manager) pruneScheduledBackups(svc *model.Service, appID string, retention int) error {
-	bindings, appNames, err := m.store.BindingsForService(svc.ID)
+	_, appNames, err := m.store.BindingsForService(svc.ID)
 	if err != nil {
 		return err
 	}
@@ -958,18 +999,11 @@ func (m *Manager) pruneScheduledBackups(svc *model.Service, appID string, retent
 		// unlinked; keep snapshots in that case rather than guessing ownership.
 		return nil
 	}
-	backups, err := m.store.DataBackups(svc.ID)
+	backups, err := m.store.ScheduledDataBackups(svc.ID, appID)
 	if err != nil {
 		return err
 	}
-	filtered := make([]model.DataBackup, 0)
-	for _, backup := range backups {
-		if backup.Scheduled && backup.AppName == appName {
-			filtered = append(filtered, backup)
-		}
-	}
-	sort.Slice(filtered, func(i, j int) bool { return filtered[i].CreatedAt.After(filtered[j].CreatedAt) })
-	for _, backup := range filtered[min(retention, len(filtered)):] {
+	for _, backup := range backups[min(retention, len(backups)):] {
 		path, err := backupSnapshotPath(svc, backup.ID)
 		if err != nil {
 			return err
@@ -988,7 +1022,6 @@ func (m *Manager) pruneScheduledBackups(svc *model.Service, appID string, retent
 			return err
 		}
 	}
-	_ = bindings
 	return nil
 }
 
@@ -1073,10 +1106,20 @@ func makeBoundedArchive(ctx context.Context, entries map[string]string, limit in
 			_ = file.Close()
 			return nil, err
 		}
-		copied, copyErr := io.Copy(tarWriter, io.LimitReader(file, info.Size()))
+		copied, copyErr := copyWithContext(ctx, tarWriter, io.LimitReader(file, info.Size()))
 		closeErr := file.Close()
 		if copyErr != nil || closeErr != nil || copied != info.Size() {
+			if err := ctx.Err(); err != nil {
+				_ = tarWriter.Close()
+				_ = gzipWriter.Close()
+				return nil, err
+			}
 			return nil, errors.Join(copyErr, closeErr, fmt.Errorf("export member %q changed while copying", name))
+		}
+		if err := ctx.Err(); err != nil {
+			_ = tarWriter.Close()
+			_ = gzipWriter.Close()
+			return nil, err
 		}
 		if output.exceeded {
 			return nil, errors.New("export archive exceeds the 48 MiB size limit")

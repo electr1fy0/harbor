@@ -62,6 +62,8 @@ func runExportDecrypt(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return fail(errors.New("could not close decrypted archive"))
 	}
 	good = true
-	fmt.Fprintf(stdout, "Decrypted archive: %s\n", args[1])
+	if _, err := fmt.Fprintf(stdout, "Decrypted archive: %s\n", args[1]); err != nil {
+		return fail(fmt.Errorf("write confirmation: %w", err))
+	}
 	return 0
 }

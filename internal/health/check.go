@@ -21,6 +21,9 @@ const (
 // Check polls a loopback TCP port or HTTP path until it responds or attempts
 // are exhausted. Redirect responses are accepted without following them.
 func Check(ctx context.Context, port int, path string) error {
+	if ctx == nil {
+		return errors.New("health check context must not be nil")
+	}
 	if port < 1 || port > 65535 {
 		return fmt.Errorf("invalid health check port %d", port)
 	}
@@ -86,7 +89,7 @@ func Probe(ctx context.Context, port int, path string, timeout time.Duration) er
 	if port < 1 || port > 65535 {
 		return fmt.Errorf("invalid health check port %d", port)
 	}
-	if timeout <= 0 || timeout > 30*time.Second {
+	if timeout < time.Millisecond || timeout > 30*time.Second {
 		return errors.New("health probe timeout must be between 1ms and 30s")
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)

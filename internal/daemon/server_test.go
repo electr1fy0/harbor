@@ -9,9 +9,34 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
+
+type delayedUnixListener struct {
+	*net.UnixListener
+	closed        chan struct{}
+	continueClose chan struct{}
+}
+
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("/tmp", "ps-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	return filepath.Join(directory, "s.sock")
+}
+
+func (l *delayedUnixListener) Close() error {
+	err := l.UnixListener.Close()
+	close(l.closed)
+	<-l.continueClose
+	return err
+}
 
 func TestPingOverUnixSocket(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "paasd.sock")
@@ -57,6 +82,152 @@ func TestServerDoesNotOverwriteRegularFile(t *testing.T) {
 	}
 	if string(body) != "keep me" {
 		t.Fatalf("regular file changed to %q", body)
+	}
+}
+
+func TestConcurrentListenersSerializeStaleSocketReplacement(t *testing.T) {
+	socketPath := shortSocketPath(t)
+	stale, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.(*net.UnixListener).SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewServer(socketPath)
+	const callers = 8
+	listeners := make(chan net.Listener, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			listener, err := server.Listen()
+			if err == nil {
+				listeners <- listener
+			}
+		}()
+	}
+	wg.Wait()
+	close(listeners)
+	var winners []net.Listener
+	for listener := range listeners {
+		winners = append(winners, listener)
+	}
+	if len(winners) != 1 {
+		for _, listener := range winners {
+			listener.Close()
+		}
+		t.Fatalf("concurrent Listen calls created %d listeners, want exactly one", len(winners))
+	}
+	if err := winners[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSocketLockLivesThroughCloseAndUnlink(t *testing.T) {
+	socketPath := shortSocketPath(t)
+	server := NewServer(socketPath)
+	listener, err := server.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned := listener.(*socketListener)
+	unixListener := owned.Listener.(*net.UnixListener)
+	owned.Listener = &delayedUnixListener{UnixListener: unixListener, closed: make(chan struct{}), continueClose: make(chan struct{})}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- owned.Close() }()
+	delayed := owned.Listener.(*delayedUnixListener)
+	<-delayed.closed // The old socket is closed but its stale path still exists.
+
+	listenDone := make(chan error, 1)
+	go func() {
+		candidate, listenErr := NewServer(socketPath).Listen()
+		if candidate != nil {
+			_ = candidate.Close()
+		}
+		listenDone <- listenErr
+	}()
+	select {
+	case err := <-listenDone:
+		if err == nil {
+			t.Fatal("a second listener acquired the path before old close/unlink completed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("competing Listen did not fail promptly while the socket lock was held")
+	}
+	close(delayed.continueClose)
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+
+	newListener, err := NewServer(socketPath).Listen()
+	if err != nil {
+		t.Fatalf("Listen after old close completed: %v", err)
+	}
+	if err := newListener.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListenRejectsSymlinkedOrPublicSocketLock(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(root, "symlink.sock")
+	if err := os.Symlink(target, socketPath+".lock"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewServer(socketPath).Listen(); err == nil {
+		t.Fatal("Listen accepted a symlinked lock file")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "preserve" {
+		t.Fatalf("lock target changed to %q, err=%v", data, err)
+	}
+	if err := os.Remove(socketPath + ".lock"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socketPath+".lock", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewServer(socketPath).Listen(); err == nil {
+		t.Fatal("Listen accepted a publicly accessible lock file")
+	}
+}
+
+func TestServeDoesNotRemoveReplacementSocketPath(t *testing.T) {
+	socketPath := shortSocketPath(t)
+	server := NewServer(socketPath)
+	listener, err := server.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	if _, err := Ping(context.Background(), socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(socketPath, socketPath+".original"); err != nil {
+		t.Fatal(err)
+	}
+	const replacement = "replacement belongs to another process"
+	if err = os.WriteFile(socketPath, []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = server.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(socketPath)
+	if err != nil || string(data) != replacement {
+		t.Fatalf("replacement path content = %q, err=%v", data, err)
 	}
 }
 

@@ -8,10 +8,12 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -300,6 +302,237 @@ func TestScheduledBackupsAndRetentionArePersisted(t *testing.T) {
 	}
 }
 
+func TestScheduledBackupDecisionsIgnoreServiceWideBackupPageLimit(t *testing.T) {
+	state := openServiceStore(t)
+	manager := NewManager(state, t.TempDir())
+	ctx := context.Background()
+	svc, err := manager.AddService(ctx, "sqlite", "scheduled-page-limit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentBinding, err := manager.Link(ctx, "recent-scheduled-app", svc.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dueBinding, err := manager.Link(ctx, "due-scheduled-app", svc.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noiseBinding, err := manager.Link(ctx, "manual-noise-app", svc.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SetBackupPolicy(ctx, svc.Name, "hourly", 1, true); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	backupDir, err := serviceBackupDir(svc, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, backup := range []struct {
+		id        string
+		appID     string
+		createdAt time.Time
+	}{
+		{id: "bkp_0000000000000001", appID: recentBinding.AppID, createdAt: now.Add(-30 * time.Minute)},
+		{id: "bkp_0000000000000002", appID: dueBinding.AppID, createdAt: now.Add(-2 * time.Hour)},
+	} {
+		path := filepath.Join(backupDir, backup.id+".sqlite")
+		if err := os.WriteFile(path, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		database, err := sql.Open("sqlite3", databaseURI(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Exec(`CREATE TABLE fixture (value TEXT)`); err != nil {
+			_ = database.Close()
+			t.Fatal(err)
+		}
+		if err := database.Close(); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		verifiedAt := now
+		if err := state.CreateDataBackup(model.DataBackup{
+			ID: backup.id, ServiceID: svc.ID, SizeBytes: info.Size(), CreatedAt: backup.createdAt,
+			Scheduled: true, Verification: "verified", VerifiedAt: &verifiedAt,
+		}, backup.appID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The public service-wide listing is capped at 100 for UI use. Fill it
+	// with newer manual records from another binding so neither scheduled
+	// record is returned by that page.
+	for i := 0; i < 101; i++ {
+		backup := model.DataBackup{
+			ID: fmt.Sprintf("bkp_%016x", i+3), ServiceID: svc.ID, SizeBytes: 1,
+			CreatedAt: now.Add(-time.Duration(i) * time.Second), Verification: "verified",
+		}
+		if err := state.CreateDataBackup(backup, noiseBinding.AppID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := state.DataBackups(svc.ID)
+	if err != nil || len(page) != 100 {
+		t.Fatalf("service backup page = %d records, %v; want recent page of 100", len(page), err)
+	}
+	for _, backup := range page {
+		if backup.ID == "bkp_0000000000000001" || backup.ID == "bkp_0000000000000002" {
+			t.Fatalf("scheduled record unexpectedly appeared in recent service page: %+v", backup)
+		}
+	}
+
+	if err := manager.RunScheduledBackups(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recentBackups, err := state.ScheduledDataBackups(svc.ID, recentBinding.AppID)
+	if err != nil || len(recentBackups) != 1 || recentBackups[0].ID != "bkp_0000000000000001" {
+		t.Fatalf("recent binding scheduled backups = %+v, %v; want no overscheduled snapshot", recentBackups, err)
+	}
+	dueBackups, err := state.ScheduledDataBackups(svc.ID, dueBinding.AppID)
+	if err != nil || len(dueBackups) != 1 || dueBackups[0].ID == "bkp_0000000000000002" {
+		t.Fatalf("due binding scheduled backups = %+v, %v; want fresh snapshot and pruned old snapshot", dueBackups, err)
+	}
+}
+
+func TestScheduledBackupsDoNotTreatFailedOrMissingSnapshotsAsRecent(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		missing bool
+	}{
+		{name: "failed verification"},
+		{name: "missing file", missing: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := openServiceStore(t)
+			manager := NewManager(state, t.TempDir())
+			ctx := context.Background()
+			svc, err := manager.AddService(ctx, "sqlite", "backup-health")
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding, err := manager.Link(ctx, "backup-health-app", svc.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.SetBackupPolicy(ctx, svc.Name, "hourly", 5, true); err != nil {
+				t.Fatal(err)
+			}
+			old, err := manager.CreateBackup(ctx, "backup-health-app", svc.Name, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.missing {
+				path, err := backupSnapshotPath(svc, old.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := state.UpdateDataBackupVerification(old.ID, "failed", "integrity check failed", nil); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := manager.RunScheduledBackups(ctx); err != nil {
+				t.Fatal(err)
+			}
+			backups, err := state.ScheduledDataBackups(svc.ID, binding.AppID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(backups) != 2 || backups[0].ID == old.ID || backups[0].Verification != "verified" {
+				t.Fatalf("scheduler did not replace unusable recent backup: %+v", backups)
+			}
+			if backups[1].ID != old.ID || backups[1].Verification != "failed" {
+				t.Fatalf("old unusable backup metadata = %+v; want retained failure record", backups[1])
+			}
+		})
+	}
+}
+
+func TestConcurrentFirstBackupsShareDirectoryInitialization(t *testing.T) {
+	state := openServiceStore(t)
+	manager := NewManager(state, t.TempDir())
+	svc, err := manager.AddService(context.Background(), "sqlite", "concurrent-backups")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callers = 64
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			path, err := serviceBackupDir(svc, true)
+			if err == nil && filepath.Base(path) != "backups" {
+				err = fmt.Errorf("serviceBackupDir() = %q, want backups directory", path)
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent first backup directory initialization failed: %v", err)
+		}
+	}
+}
+
+type cancelCopyWriter struct {
+	cancel context.CancelFunc
+	wrote  int
+}
+
+func (w *cancelCopyWriter) Write(data []byte) (int, error) {
+	w.cancel()
+	w.wrote += len(data)
+	return len(data), nil
+}
+
+func TestCopyWithContextStopsWhenCanceledDuringWrite(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 1<<20)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	destination := &cancelCopyWriter{cancel: cancel}
+
+	copied, err := copyWithContext(ctx, destination, bytes.NewReader(data))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copyWithContext() error = %v, want context cancellation", err)
+	}
+	if copied != int64(destination.wrote) || copied == 0 || copied >= int64(len(data)) {
+		t.Fatalf("copyWithContext() copied %d bytes (writer saw %d of %d), want a partial copy", copied, destination.wrote, len(data))
+	}
+}
+
+func TestCopyRegularFileRemovesDestinationWhenContextIsCanceled(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source.sqlite")
+	destination := filepath.Join(directory, "destination.sqlite")
+	if err := os.WriteFile(source, bytes.Repeat([]byte("x"), 1024), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := copyRegularFile(ctx, source, destination, 1<<20)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copyRegularFile() error = %v, want context cancellation", err)
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled file copy left a destination behind: %v", err)
+	}
+}
+
 func TestStartBackupsRunsOnAndStopsWithLifecycleContext(t *testing.T) {
 	state := openServiceStore(t)
 	manager := NewManager(state, t.TempDir())
@@ -335,6 +568,46 @@ func TestStartBackupsRunsOnAndStopsWithLifecycleContext(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("background backup loop did not create its due snapshot")
+}
+
+func TestStartBackupsDoesNotLatchAnAlreadyCanceledContext(t *testing.T) {
+	state := openServiceStore(t)
+	manager := NewManager(state, t.TempDir())
+	svc, err := manager.AddService(context.Background(), "sqlite", "background-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Link(context.Background(), "background-retry-app", svc.Name); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SetBackupPolicy(context.Background(), svc.Name, "hourly", 1, true); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancelFirst := context.WithCancel(context.Background())
+	cancelFirst()
+	manager.StartBackups(canceled)
+	manager.backupLoopMu.Lock()
+	started := manager.backupLoopStarted
+	manager.backupLoopMu.Unlock()
+	if started {
+		t.Fatal("StartBackups latched an already-canceled lifecycle context")
+	}
+
+	lifecycle, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager.StartBackups(lifecycle)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		backups, err := state.DataBackups(svc.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(backups) == 1 && backups[0].Scheduled {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("backup loop did not start after an earlier canceled call")
 }
 
 func TestEncryptedHarborExportSnapshotsSelectedDataAndRequiredKeys(t *testing.T) {

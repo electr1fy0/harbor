@@ -2,11 +2,10 @@ package daemon
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 
+	"paas/internal/contracts"
 	"paas/internal/deployment"
 	"paas/internal/store"
 )
@@ -22,18 +21,11 @@ func registerDiagnosticsRoute(mux *http.ServeMux, service *deployment.Service, c
 			writeResponse(w, "diagnostics", Response{Error: "method not allowed"})
 			return
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-		decoder := json.NewDecoder(r.Body)
-		decoder.DisallowUnknownFields()
+		r.Body = http.MaxBytesReader(w, r.Body, contracts.MaxControlRequestBytes)
 		var input *Request
-		if err := decoder.Decode(&input); err != nil || input == nil {
+		if err := decodeDaemonJSON(r.Body, &input); err != nil || input == nil {
 			w.WriteHeader(http.StatusBadRequest)
 			writeResponse(w, "diagnostics", Response{Error: "invalid JSON request"})
-			return
-		}
-		if err := decoder.Decode(new(any)); err != io.EOF {
-			w.WriteHeader(http.StatusBadRequest)
-			writeResponse(w, "diagnostics", Response{Error: "request must contain one JSON object"})
 			return
 		}
 		if service == nil {

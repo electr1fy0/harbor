@@ -96,3 +96,15 @@ func portFromAddress(t *testing.T, address net.Addr) int {
 	}
 	return port
 }
+
+func TestCheckRejectsNilContext(t *testing.T) {
+	if err := Check(nil, 8080, ""); err == nil {
+		t.Fatal("nil context accepted")
+	}
+}
+
+func TestProbeEnforcesMinimumTimeout(t *testing.T) {
+	if err := Probe(context.Background(), 8080, "", time.Nanosecond); err == nil || err.Error() != "health probe timeout must be between 1ms and 30s" {
+		t.Fatalf("invalid timeout error=%v", err)
+	}
+}

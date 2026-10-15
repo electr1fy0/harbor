@@ -52,6 +52,11 @@ type Inspection struct {
 	Warnings        []string      `json:"warnings,omitempty"`
 }
 
+type packageManifest struct {
+	Scripts        map[string]string `json:"scripts"`
+	PackageManager string            `json:"packageManager"`
+}
+
 // Inspect suggests supported Go/Node settings without writing to the checkout.
 func Inspect(sourceDir, appName string, selection ConfigSelection) (Inspection, error) {
 	if !config.ValidName(appName) {
@@ -171,9 +176,54 @@ func PrepareConfigured(sourceDir, appName string, selection ConfigSelection) (*c
 		if err != nil {
 			return nil, err
 		}
-		return applySelection(cfg, selection)
+		cfg, err = applySelection(cfg, selection)
+		if err != nil {
+			return nil, err
+		}
+		if !selectionEmpty(selection) {
+			if err := writePreparedConfig(sourceDir, cfg); err != nil {
+				return nil, err
+			}
+		}
+		return cfg, nil
 	}
 	return Prepare(sourceDir, appName, selection)
+}
+
+// writePreparedConfig persists the selected effective config into the
+// disposable checkout so the deployment service's later config.Load sees the
+// same settings PrepareConfigured validated and returned.
+func writePreparedConfig(sourceDir string, cfg *config.Config) error {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return errors.New("could not encode prepared paas.yaml")
+	}
+	path := filepath.Join(sourceDir, "paas.yaml")
+	tmp, err := os.CreateTemp(sourceDir, ".paas.yaml-*")
+	if err != nil {
+		return fmt.Errorf("create prepared paas.yaml: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return errors.New("could not set permissions on prepared paas.yaml")
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return errors.New("could not write prepared paas.yaml")
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return errors.New("could not sync prepared paas.yaml")
+	}
+	if err := tmp.Close(); err != nil {
+		return errors.New("could not close prepared paas.yaml")
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace prepared paas.yaml: %w", err)
+	}
+	return nil
 }
 
 func configFromSelection(name string, selection ConfigSelection) (*config.Config, error) {
@@ -256,16 +306,12 @@ func detectConfig(sourceDir, appName string) (*config.Config, []string, error) {
 		}, nil, nil
 	}
 	if nodeProject {
-		var manifest struct {
-			Scripts        map[string]string `json:"scripts"`
-			PackageManager string            `json:"packageManager"`
-		}
+		var manifest packageManifest
 		file, err := os.Open(packagePath)
 		if err != nil {
 			return nil, nil, fmt.Errorf("read package.json: %w", err)
 		}
-		decoder := json.NewDecoder(io.LimitReader(file, maxPackageJSONBytes))
-		err = decoder.Decode(&manifest)
+		manifest, err = decodePackageManifest(io.LimitReader(file, maxPackageJSONBytes+1))
 		_ = file.Close()
 		if err != nil {
 			return nil, nil, errors.New("package.json is invalid")
@@ -291,7 +337,89 @@ func detectConfig(sourceDir, appName string) (*config.Config, []string, error) {
 	return nil, nil, errors.New("unsupported project: add paas.yaml or provide a Go or Node project")
 }
 
+func decodePackageManifest(reader io.Reader) (packageManifest, error) {
+	var manifest packageManifest
+	data, err := io.ReadAll(io.LimitReader(reader, maxPackageJSONBytes+1))
+	if err != nil {
+		return manifest, err
+	}
+	if len(data) > maxPackageJSONBytes {
+		return manifest, errors.New("package.json exceeds size limit")
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return manifest, err
+	}
+	return manifest, nil
+}
+
 func nodePackageManager(sourceDir, declared string) (manager, install string, err error) {
+	// packageManager is the repository's explicit toolchain selection. A lock
+	// from another package manager must not silently override it: running that
+	// tool can ignore the declared runtime and install a different dependency
+	// graph (or fail only after deployment has already been queued).
+	if declared != "" {
+		manager, version, found := strings.Cut(declared, "@")
+		manager = strings.ToLower(manager)
+		if !found || version == "" {
+			return "", "", errors.New("package.json has an unsupported packageManager value")
+		}
+		switch manager {
+		case "npm", "pnpm", "yarn", "bun":
+		default:
+			return "", "", errors.New("package.json has an unsupported packageManager value")
+		}
+
+		locked := false
+		switch manager {
+		case "npm":
+			locked, err = regularFileExists(filepath.Join(sourceDir, "package-lock.json"))
+		case "pnpm":
+			locked, err = regularFileExists(filepath.Join(sourceDir, "pnpm-lock.yaml"))
+		case "yarn":
+			locked, err = regularFileExists(filepath.Join(sourceDir, "yarn.lock"))
+		case "bun":
+			locked, err = regularFileExists(filepath.Join(sourceDir, "bun.lock"))
+			if err == nil && !locked {
+				locked, err = regularFileExists(filepath.Join(sourceDir, "bun.lockb"))
+			}
+		}
+		if err != nil {
+			return "", "", err
+		}
+		switch manager {
+		case "npm":
+			if locked {
+				return manager, "npm ci", nil
+			}
+			return manager, "npm install", nil
+		case "pnpm":
+			if locked {
+				return manager, "pnpm install --frozen-lockfile", nil
+			}
+			return manager, "pnpm install", nil
+		case "yarn":
+			if !locked {
+				return manager, "yarn install", nil
+			}
+			if strings.HasPrefix(strings.ToLower(version), "1.") {
+				return manager, "yarn install --frozen-lockfile", nil
+			}
+			classic, checkErr := classicYarnLock(sourceDir)
+			if checkErr != nil {
+				return "", "", checkErr
+			}
+			if classic {
+				return manager, "yarn install --frozen-lockfile", nil
+			}
+			return manager, "yarn install --immutable", nil
+		case "bun":
+			if locked {
+				return manager, "bun install --frozen-lockfile", nil
+			}
+			return manager, "bun install", nil
+		}
+	}
+
 	locks := []struct{ file, manager, install string }{
 		{"bun.lock", "bun", "bun install --frozen-lockfile"},
 		{"bun.lockb", "bun", "bun install --frozen-lockfile"},
@@ -314,25 +442,6 @@ func nodePackageManager(sourceDir, declared string) (manager, install string, er
 			}
 			return lock.manager, lock.install, nil
 		}
-	}
-	if declared != "" {
-		manager, _, found := strings.Cut(declared, "@")
-		if found && (manager == "npm" || manager == "pnpm" || manager == "yarn" || manager == "bun") {
-			switch manager {
-			case "npm":
-				return manager, "npm install", nil
-			case "pnpm":
-				return manager, "pnpm install", nil
-			case "yarn":
-				if strings.HasPrefix(strings.ToLower(declared), "yarn@1.") {
-					return manager, "yarn install --frozen-lockfile", nil
-				}
-				return manager, "yarn install --immutable", nil
-			case "bun":
-				return manager, "bun install", nil
-			}
-		}
-		return "", "", errors.New("package.json has an unsupported packageManager value")
 	}
 	return "npm", "npm install", nil
 }
@@ -442,8 +551,9 @@ func readEnvironmentKeys(sourceDir string) ([]string, []string, error) {
 		if err != nil {
 			return nil, nil, fmt.Errorf("read %s: %w", name, err)
 		}
-		scanner := bufio.NewScanner(io.LimitReader(file, maxEnvSampleBytes+1))
-		scanner.Buffer(make([]byte, 1024), maxEnvSampleBytes)
+		limited := &io.LimitedReader{R: file, N: maxEnvSampleBytes + 1}
+		scanner := bufio.NewScanner(limited)
+		scanner.Buffer(make([]byte, 1024), maxEnvSampleBytes+1)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if strings.HasPrefix(line, "export ") {
@@ -474,6 +584,9 @@ func readEnvironmentKeys(sourceDir string) ([]string, []string, error) {
 		_ = file.Close()
 		if scanErr != nil && !errors.Is(scanErr, bufio.ErrTooLong) {
 			return nil, nil, fmt.Errorf("read %s: %w", name, scanErr)
+		}
+		if errors.Is(scanErr, bufio.ErrTooLong) || limited.N == 0 {
+			warnings = appendUnique(warnings, name+" exceeded its read limit; remaining environment names were skipped")
 		}
 	}
 	if truncated {

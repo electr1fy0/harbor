@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"regexp"
 	"time"
 
 	"paas/internal/config"
+	"paas/internal/contracts"
 	"paas/internal/deployment"
 	"paas/internal/model"
 	"paas/internal/store"
@@ -345,15 +345,9 @@ func operationDeployment(service *deployment.Service, appName string, d *model.D
 }
 
 func decodeOperationsRequest(w http.ResponseWriter, r *http.Request, output any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(output); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, contracts.MaxControlRequestBytes)
+	if err := decodeDaemonJSON(r.Body, output); err != nil {
 		writeOperationsError(w, http.StatusBadRequest, "Invalid JSON request.")
-		return false
-	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
-		writeOperationsError(w, http.StatusBadRequest, "Request must contain one JSON object.")
 		return false
 	}
 	return true

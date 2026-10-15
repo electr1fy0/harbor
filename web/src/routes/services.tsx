@@ -56,10 +56,10 @@ function ServicesPage() {
       {overview.data.connected ? (
         dataServices.isPending ? (
           <PageLoading rows={3} />
-        ) : dataServices.isError ? (
+        ) : dataServices.isError && !dataServices.data ? (
           <FeatureCard title="Data services are unavailable">
             <p role="alert" className="text-sm text-red-700">
-              {dataServices.error.message}
+              {dataServices.error?.message}
             </p>
             <button
               className="text-xs font-medium underline"
@@ -69,10 +69,18 @@ function ServicesPage() {
             </button>
           </FeatureCard>
         ) : (
-          <DataServiceTools
-            services={dataServices.data.services}
-            apps={overview.data.apps}
-          />
+          <>
+            {dataServices.isError ? (
+              <p role="status" className="mb-3 text-xs text-amber-800">
+                Latest service data could not be refreshed:{" "}
+                {dataServices.error?.message}
+              </p>
+            ) : null}
+            <DataServiceTools
+              services={dataServices.data.services}
+              apps={overview.data.apps}
+            />
+          </>
         )
       ) : null}
     </>

@@ -143,7 +143,7 @@ func (w *trafficWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return conn, buffer, err
 }
 func (w *trafficWriter) WriteHeader(status int) {
-	if status >= 100 && status < 200 {
+	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
 		w.ResponseWriter.WriteHeader(status)
 		return
 	}
@@ -161,9 +161,10 @@ func (w *trafficWriter) Write(data []byte) (int, error) {
 	w.bytes += int64(n)
 	return n, err
 }
-func (w *trafficWriter) Flush() {
+func (w *trafficWriter) Flush() { _ = w.FlushError() }
+func (w *trafficWriter) FlushError() error {
 	if w.status == 0 {
 		w.WriteHeader(http.StatusOK)
 	}
-	_ = http.NewResponseController(w.ResponseWriter).Flush()
+	return http.NewResponseController(w.ResponseWriter).Flush()
 }

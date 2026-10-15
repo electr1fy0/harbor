@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+// MaxControlRequestBytes is the JSON body limit shared by the local daemon
+// control API and its CLI/dashboard callers. Keeping clients on the same
+// envelope limit prevents valid field values from becoming oversized after
+// they are wrapped in a control request object.
+const MaxControlRequestBytes = 64 << 10
+
 // Builder turns an application source directory into an immutable release.
 type Builder interface {
 	Build(context.Context, BuildRequest) (*Release, error)

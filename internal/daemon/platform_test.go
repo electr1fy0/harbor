@@ -20,7 +20,12 @@ import (
 
 func TestPlatformRejectsMalformedRequests(t *testing.T) {
 	server := NewPlatformServer("", nil)
-	for _, body := range []string{"", "null", `{"unknown":true}`, `{} {}`, `{} garbage`, strings.Repeat(" ", 65<<10)} {
+	for _, body := range []string{
+		"", "null", `{"unknown":true}`, `{} {}`, `{} garbage`,
+		`{"Name":"first","Name":"second"}`,
+		`{"Environment":{"TOKEN":null},"Environment":{"SAFE":"ok"}}`,
+		strings.Repeat(" ", 65<<10),
+	} {
 		recorder := httptest.NewRecorder()
 		server.http.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/deploy", strings.NewReader(body)))
 		if recorder.Code != http.StatusBadRequest {
@@ -118,6 +123,7 @@ func TestPlatformDeployAcceptsGitHubFieldsAndRejectsMixedSources(t *testing.T) {
 		`{"SourceDir":"./app","RepoURL":"https://github.com/example/app"}`,
 		`{"Ref":"main"}`,
 		`{"RootDir":"web"}`,
+		`{}`,
 	} {
 		recorder := httptest.NewRecorder()
 		server.http.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/deploy", strings.NewReader(body)))

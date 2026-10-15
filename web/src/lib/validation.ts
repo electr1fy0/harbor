@@ -7,6 +7,13 @@ const appName = z
 const environmentKey = z
   .string()
   .regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/, "Invalid request data.")
+const environmentValue = z
+  .string()
+  .max(65_536)
+  .refine(
+    (value) => new TextEncoder().encode(value).length <= 65_536,
+    "Invalid request data."
+  )
 
 const githubOwner = z
   .string()
@@ -16,23 +23,41 @@ const githubOwner = z
     "Invalid request data."
   )
 
+const githubRepoUrlPattern =
+  /^https:\/\/github\.com(?::443)?\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)\/([A-Za-z0-9._-]{1,100}(?:\.git)?)$/i
 const githubRepoUrl = z
   .string()
   .trim()
-  .regex(
-    /^https:\/\/github\.com\/[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:\.git)?$/,
-    "Invalid request data."
-  )
+  .refine((value) => {
+    const match = githubRepoUrlPattern.exec(value)
+    if (!match) return false
+    const repo = match[2].endsWith(".git") ? match[2].slice(0, -4) : match[2]
+    return repo !== "" && repo !== "." && repo !== ".."
+  }, "Invalid request data.")
 
 const gitRef = z
   .string()
   .max(255)
+  .refine(
+    (value) => new TextEncoder().encode(value).length <= 255,
+    "Invalid request data."
+  )
   .refine((value) => {
     if (value === "") return true
-    if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)) return false
+    if (
+      value === "@" ||
+      value.startsWith("-") ||
+      /[~^:?*]/u.test(value) ||
+      value.includes("[") ||
+      value.includes("\\") ||
+      /[\p{White_Space}\p{Cc}]/u.test(value)
+    ) {
+      return false
+    }
     const parts = value.split("/")
     return (
       !value.includes("..") &&
+      !value.includes("@{") &&
       !value.includes("//") &&
       !value.endsWith("/") &&
       !value.endsWith(".") &&
@@ -122,7 +147,7 @@ export const submitOnboardingJobInputSchema = z
     ref: gitRef.optional().default(""),
     rootDir: repositoryRoot.optional().default(""),
     config: onboardingConfigSchema.optional(),
-    environment: z.record(environmentKey, z.string().max(65_536)).optional(),
+    environment: z.record(environmentKey, environmentValue).optional(),
     sqliteService: appName.optional(),
     createSqlite: z.boolean().optional(),
   })
@@ -143,7 +168,7 @@ export const explainFailureInputSchema = z
 export const configureAppInputSchema = z
   .object({
     name: appName,
-    environment: z.record(environmentKey, z.string().max(65_536)).optional(),
+    environment: z.record(environmentKey, environmentValue).optional(),
     removeEnvironment: z.array(environmentKey).max(100).optional(),
     memoryLimit: z
       .string()
@@ -199,12 +224,15 @@ export function parseGitHubRepoURL(repoURL: string): {
   repo: string
 } {
   const parsed = parseInput(githubRepoUrl, repoURL)
-  const [, owner, rawRepo] =
-    parsed.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)$/) ?? []
+  const [, owner, rawRepo] = parsed.match(githubRepoUrlPattern) ?? []
   if (!owner || !rawRepo) throw new Error("Invalid request data.")
 
   return {
     owner,
     repo: rawRepo.endsWith(".git") ? rawRepo.slice(0, -4) : rawRepo,
   }
+}
+
+export function isValidGitHubRepoURL(repoURL: string): boolean {
+  return githubRepoUrl.safeParse(repoURL).success
 }

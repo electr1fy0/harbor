@@ -29,3 +29,33 @@ func TestStartupFailureKeepsOnlyObservedTimings(t *testing.T) {
 		t.Fatalf("failed startup timings=%+v", result)
 	}
 }
+
+func TestStageDurationsAggregateStartupRetryAttempts(t *testing.T) {
+	start := time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC)
+	event := func(kind model.EventType, milliseconds int) model.Event {
+		return model.Event{Type: kind, CreatedAt: start.Add(time.Duration(milliseconds) * time.Millisecond)}
+	}
+	events := []model.Event{
+		event(model.EventSandboxStarting, 1000),
+		event(model.EventSandboxStarted, 1500),
+		event(model.EventHealthCheckFailed, 2200),
+		event(model.EventSandboxStarting, 2300),
+		event(model.EventSandboxStarted, 2800),
+		event(model.EventHealthCheckPassed, 3500),
+		event(model.EventDeploymentSucceeded, 4000),
+	}
+	result := stageDurations(model.Deployment{CreatedAt: start}, events)
+	for label, pair := range map[string]struct {
+		value *int64
+		want  int64
+	}{
+		"startup":   {result.StartupMilliseconds, 1000},
+		"readiness": {result.ReadinessMilliseconds, 1400},
+		"promotion": {result.PromotionMilliseconds, 500},
+		"total":     {result.TotalMilliseconds, 4000},
+	} {
+		if pair.value == nil || *pair.value != pair.want {
+			t.Errorf("%s=%v expected %d", label, pair.value, pair.want)
+		}
+	}
+}

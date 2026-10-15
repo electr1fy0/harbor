@@ -62,14 +62,21 @@ export function OperationsPanel({ name }: { name: string }) {
   const query = useOperations(name)
   if (query.isPending)
     return <p className="text-sm">Loading application controls…</p>
-  if (query.isError)
+  if (query.isError && !query.data)
     return (
       <p role="alert" className="text-red-700">
-        {query.error.message}
+        {query.error?.message}
       </p>
     )
   return (
-    <OperationForms key={name} name={name} initial={query.data.operations} />
+    <>
+      {query.isError ? (
+        <p role="status" className="mb-3 text-xs text-amber-800">
+          Latest settings could not be refreshed: {query.error?.message}
+        </p>
+      ) : null}
+      <OperationForms key={name} name={name} initial={query.data.operations} />
+    </>
   )
 }
 function OperationForms({

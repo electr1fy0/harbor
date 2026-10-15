@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -18,6 +19,8 @@ import (
 )
 
 const usage = "usage: paas [-socket PATH] {ping|deploy SOURCE [--name NAME]|apps|inspect NAME|logs NAME|stop NAME|releases NAME|rollback NAME [--release ID]|settings NAME|configure NAME [--env-stdin] [--remove-env KEY] [--memory LIMIT] [--cpu N] [--tasks N]|add TYPE --name NAME|link APP SERVICE|services|export-decrypt INPUT OUTPUT --passphrase-stdin}"
+
+const maxCLIEnvironmentInputBytes = 64 << 10
 
 func main() {
 	os.Exit(runWithInput(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -51,12 +54,13 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	if err != nil {
 		return reportUsageError(stderr, err)
 	}
-
-	timeout := 5 * time.Second
-	if command == "deploy" || command == "rollback" || command == "add" || command == "configure" {
-		timeout = 6 * time.Minute
+	if command == "configure" {
+		if err := daemon.ValidateRequestSize(request); err != nil {
+			return reportUsageError(stderr, err)
+		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+
+	ctx, cancel := requestContextForCommand(command)
 	defer cancel()
 
 	if command == "ping" {
@@ -109,11 +113,17 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		}
 	case "add":
 		if response != nil && response.Service != nil {
-			fmt.Fprintf(stdout, "✓ %s READY (%s)\n", response.Service.Name, response.Service.Type)
+			if _, err := fmt.Fprintf(stdout, "✓ %s READY (%s)\n", response.Service.Name, response.Service.Type); err != nil {
+				fmt.Fprintf(stderr, "write add confirmation: %v\n", err)
+				return 1
+			}
 		}
 	case "link":
 		if response != nil && response.Binding != nil {
-			fmt.Fprintf(stdout, "✓ Injected %s into %s\n", response.Binding.EnvKey, request.AppName)
+			if _, err := fmt.Fprintf(stdout, "✓ Injected %s into %s\n", response.Binding.EnvKey, request.AppName); err != nil {
+				fmt.Fprintf(stderr, "write link confirmation: %v\n", err)
+				return 1
+			}
 		}
 	case "services":
 		if err := printServices(stdout, response.Services); err != nil {
@@ -129,6 +139,19 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		}
 	}
 	return 0
+}
+
+func requestContextForCommand(command string) (context.Context, context.CancelFunc) {
+	// The daemon's configured build timeout is authoritative for deploys and may
+	// exceed the CLI's timeout for ordinary control operations.
+	if command == "deploy" {
+		return context.WithCancel(context.Background())
+	}
+	timeout := 5 * time.Second
+	if command == "rollback" || command == "add" || command == "configure" {
+		timeout = 6 * time.Minute
+	}
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 func reportUsageError(stderr io.Writer, err error) int {
@@ -555,7 +578,7 @@ func parseCommandRequest(command string, args []string) (daemon.Request, error) 
 			return request, fmt.Errorf("add requires --name")
 		}
 	case "link":
-		if len(args) < 2 || args[0] == "" || args[1] == "" || strings.HasPrefix(args[0], "-") || strings.HasPrefix(args[1], "-") {
+		if len(args) != 2 || args[0] == "" || args[1] == "" || strings.HasPrefix(args[0], "-") || strings.HasPrefix(args[1], "-") {
 			return request, fmt.Errorf("link requires APP and SERVICE")
 		}
 		request.AppName = args[0]
@@ -574,9 +597,17 @@ func hasArg(args []string, value string) bool {
 }
 
 func readEnvironment(input io.Reader) (map[string]string, error) {
+	body, err := io.ReadAll(io.LimitReader(input, maxCLIEnvironmentInputBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read environment input: %w", err)
+	}
+	if len(body) > maxCLIEnvironmentInputBytes {
+		return nil, fmt.Errorf("environment input exceeds %d bytes", maxCLIEnvironmentInputBytes)
+	}
+
 	values := make(map[string]string)
-	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	scanner.Buffer(make([]byte, 64*1024), maxCLIEnvironmentInputBytes+1)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {

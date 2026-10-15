@@ -1,10 +1,10 @@
-import { useState } from "react"
+import { useMemo, useState } from "react"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { configureApp } from "@/lib/harbor.functions"
-import { parseDotEnv } from "@/lib/features"
+import { createLatestAsyncDraftGuard, parseDotEnv } from "@/lib/features"
 import { FeatureCard } from "./feature-card"
 
 export function EnvironmentImport({
@@ -17,6 +17,8 @@ export function EnvironmentImport({
   const [text, setText] = useState("")
   const [error, setError] = useState("")
   const [values, setValues] = useState<Record<string, string> | null>(null)
+  const [readingFile, setReadingFile] = useState(false)
+  const fileReadGuard = useMemo(() => createLatestAsyncDraftGuard(), [])
   const client = useQueryClient()
   const save = useMutation({
     mutationFn: () =>
@@ -38,23 +40,42 @@ export function EnvironmentImport({
         type="file"
         accept=".env,text/plain"
         aria-label="Choose environment file"
+        disabled={save.isPending}
         onChange={async (e) => {
           const file = e.target.files?.[0]
           if (!file) return
+          const requestGeneration = fileReadGuard.begin()
+          e.target.value = ""
+          setValues(null)
+          setText("")
+          setError("")
+          setReadingFile(true)
           if (file.size > 60000) {
             setError("File is limited to 60 KB.")
+            setReadingFile(false)
             return
           }
-          setText(await file.text())
-          setValues(null)
-          setError("")
+          try {
+            const contents = await file.text()
+            if (!fileReadGuard.isCurrent(requestGeneration)) return
+            setText(contents)
+          } catch {
+            if (!fileReadGuard.isCurrent(requestGeneration)) return
+            setError("Could not read the selected environment file.")
+          } finally {
+            if (fileReadGuard.isCurrent(requestGeneration))
+              setReadingFile(false)
+          }
         }}
       />
       <Textarea
         aria-label="Environment document"
         className="min-h-28 font-mono text-xs"
+        disabled={save.isPending}
         value={text}
         onChange={(e) => {
+          fileReadGuard.invalidate()
+          setReadingFile(false)
           setText(e.target.value)
           setValues(null)
         }}
@@ -62,6 +83,7 @@ export function EnvironmentImport({
       />
       <Button
         variant="outline"
+        disabled={save.isPending || readingFile}
         onClick={() => {
           try {
             setValues(parseDotEnv(text))

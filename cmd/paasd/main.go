@@ -46,6 +46,10 @@ func main() {
 		}
 		return
 	}
+	// Catch termination before restoring services or recovering applications;
+	// those phases can each run for minutes and must remain cancellable.
+	startupCtx, stopSignals := startupSignalContext()
+	defer stopSignals()
 	if *buildTimeout <= 0 {
 		log.Fatal("build-timeout must be positive")
 	}
@@ -118,8 +122,12 @@ func main() {
 		log.Fatalf("initialize %s sandbox: %v", *sandboxType, err)
 	}
 	log.Printf("runtime sandbox=%s", sb.Kind())
-	deploySvc, err := deployment.New(db, builder.New(builder.Options{DataDir: dataDir, BuildUser: *buildUser, Timeout: *buildTimeout}), sb, hostRouter, deployment.Options{DataDir: dataDir, RuntimeUser: *runtimeUser})
+	deploySvc, err := deployment.NewWithContext(startupCtx, db, builder.New(builder.Options{DataDir: dataDir, BuildUser: *buildUser, Timeout: *buildTimeout}), sb, hostRouter, deployment.Options{DataDir: dataDir, RuntimeUser: *runtimeUser})
 	if err != nil {
+		if startupCtx.Err() != nil {
+			log.Printf("shutdown requested during startup; shutting down")
+			return
+		}
 		log.Fatal(err)
 	}
 	routerListener, err := net.Listen("tcp", *listen)
@@ -138,49 +146,42 @@ func main() {
 	if webListener != nil {
 		defer webListener.Close()
 	}
-	serviceCtx, serviceCancel := context.WithTimeout(context.Background(), time.Minute)
-	serviceRestoreErr := svcManager.Restore(serviceCtx)
-	serviceCancel()
+	serviceRestoreErr, recoveryErr := restoreAndRecover(startupCtx, svcManager.Restore, deploySvc.Recover)
 	if serviceRestoreErr != nil {
 		log.Printf("restore managed services: %v", serviceRestoreErr)
 	}
-	// Recover every independent app even when a managed-service restore failed.
-	// Deployment checks each binding's persisted READY state, so dependent apps
-	// keep desired_running set and record a failed recovery candidate for retry.
-	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	if err := deploySvc.Recover(recoveryCtx); err != nil {
-		log.Printf("recover applications: %v", err)
+	if recoveryErr != nil {
+		log.Printf("recover applications: %v", recoveryErr)
 	}
-	recoveryCancel()
 	routerServer := &http.Server{Handler: hostRouter, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(listener) }()
-
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(signals)
-	routerDone := make(chan error, 1)
-	go func() { routerDone <- routerServer.Serve(routerListener) }()
-	var webDone chan error
-	if webServer != nil {
-		webDone = make(chan error, 1)
-		go func() { webDone <- webServer.Serve(webListener) }()
-		log.Printf("dashboard ready: http://%s", webListener.Addr())
-	}
-	log.Printf("paasd ready: socket=%s router=http://%s data=%s", server.SocketPath(), routerListener.Addr(), dataDir)
-
-	select {
-	case err := <-serveDone:
-		if err != nil {
-			log.Printf("daemon: %v", err)
+	if startupCtx.Err() == nil {
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- server.Serve(listener) }()
+		routerDone := make(chan error, 1)
+		go func() { routerDone <- routerServer.Serve(routerListener) }()
+		var webDone chan error
+		if webServer != nil {
+			webDone = make(chan error, 1)
+			go func() { webDone <- webServer.Serve(webListener) }()
+			log.Printf("dashboard ready: http://%s", webListener.Addr())
 		}
-	case err := <-routerDone:
-		log.Printf("router: %v", err)
-	case err := <-webDone:
-		log.Printf("dashboard: %v", err)
-	case sig := <-signals:
-		log.Printf("received %s; shutting down", sig)
+		log.Printf("paasd ready: socket=%s router=http://%s data=%s", server.SocketPath(), routerListener.Addr(), dataDir)
+
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				log.Printf("daemon: %v", err)
+			}
+		case err := <-routerDone:
+			log.Printf("router: %v", err)
+		case err := <-webDone:
+			log.Printf("dashboard: %v", err)
+		case <-startupCtx.Done():
+			log.Printf("shutdown requested; shutting down")
+		}
+	} else {
+		log.Printf("shutdown requested during startup; shutting down")
 	}
 	// Stop accepting dashboard requests before closing the deployment engine.
 	// Close also cancels active requests, including synchronous deployment calls.
@@ -201,4 +202,25 @@ func main() {
 		fmt.Fprintf(os.Stderr, "shutdown daemon: %v\n", err)
 	}
 	_ = routerServer.Shutdown(ctx)
+}
+
+func startupSignalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+}
+
+func restoreAndRecover(ctx context.Context, restore func(context.Context) error, recover func(context.Context) error) (error, error) {
+	serviceCtx, serviceCancel := context.WithTimeout(ctx, time.Minute)
+	serviceRestoreErr := restore(serviceCtx)
+	serviceCancel()
+	if ctx.Err() != nil {
+		return serviceRestoreErr, ctx.Err()
+	}
+
+	// Recover every independent app even when a managed-service restore failed.
+	// Deployment checks each binding's persisted READY state, so dependent apps
+	// keep desired_running set and record a failed recovery candidate for retry.
+	recoveryCtx, recoveryCancel := context.WithTimeout(ctx, 10*time.Minute)
+	recoveryErr := recover(recoveryCtx)
+	recoveryCancel()
+	return serviceRestoreErr, recoveryErr
 }

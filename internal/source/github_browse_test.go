@@ -89,3 +89,56 @@ func TestGitHubBrowsePaginationAndOptionalBranches(t *testing.T) {
 		t.Fatalf("metadata lost on optional branches failure: %+v %v", repo, err)
 	}
 }
+
+func TestGitHubRepositoryListReportsWhenPageCapWouldTruncateResults(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		overflow  bool
+		wantCount int
+		wantErr   bool
+	}{
+		{name: "exactly at cap", wantCount: 1000},
+		{name: "above cap", overflow: true, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var pages int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				page := 0
+				_, _ = fmt.Sscanf(r.URL.Query().Get("page"), "%d", &page)
+				pages++
+				count := 100
+				if page == 11 {
+					count = 0
+					if test.overflow {
+						count = 1
+					}
+				}
+				repositories := make([]map[string]any, count)
+				for i := range repositories {
+					repositories[i] = map[string]any{
+						"full_name":      fmt.Sprintf("org/repo-%d-%d", page, i),
+						"default_branch": "main",
+					}
+				}
+				_ = json.NewEncoder(w).Encode(repositories)
+			}))
+			defer server.Close()
+			api := NewGitHubAPI()
+			api.BaseURL, api.Client = server.URL, server.Client()
+			repositories, err := api.PublicRepositories(context.Background(), "org", "")
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error=%v, wantErr=%t", err, test.wantErr)
+			}
+			if test.wantErr {
+				if !strings.Contains(err.Error(), "1,000-repository limit") {
+					t.Fatalf("unexpected overflow error: %v", err)
+				}
+			} else if len(repositories) != test.wantCount {
+				t.Fatalf("repository count=%d, want %d", len(repositories), test.wantCount)
+			}
+			if pages != 11 {
+				t.Fatalf("requested %d pages, want 11", pages)
+			}
+		})
+	}
+}

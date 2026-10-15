@@ -63,6 +63,36 @@ func TestParseArgsRejectsUnknownOptionAndExtraArgument(t *testing.T) {
 	}
 }
 
+func TestRequestContextLeavesDeployDeadlineToDaemon(t *testing.T) {
+	deployCtx, cancelDeploy := requestContextForCommand("deploy")
+	if _, hasDeadline := deployCtx.Deadline(); hasDeadline {
+		cancelDeploy()
+		t.Fatal("deploy request has a client deadline that can undercut the daemon build timeout")
+	}
+	cancelDeploy()
+	if deployCtx.Err() != context.Canceled {
+		t.Fatalf("deploy request cancellation = %v, want context.Canceled", deployCtx.Err())
+	}
+
+	for _, command := range []string{"ping", "rollback", "add", "configure"} {
+		ctx, cancel := requestContextForCommand(command)
+		deadline, ok := ctx.Deadline()
+		cancel()
+		if !ok {
+			t.Errorf("%s request has no deadline", command)
+			continue
+		}
+		remaining := time.Until(deadline)
+		want := 5 * time.Second
+		if command != "ping" {
+			want = 6 * time.Minute
+		}
+		if remaining < want-time.Second || remaining > want {
+			t.Errorf("%s deadline remaining=%s, want approximately %s", command, remaining, want)
+		}
+	}
+}
+
 func TestRunPingSupportsSocketOptionsAroundCommand(t *testing.T) {
 	socket := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/ping" {
@@ -372,6 +402,7 @@ func TestRunReturnsUsageStatusForInvalidArguments(t *testing.T) {
 		{"logs", "--name", "sample"},
 		{"stop"},
 		{"stop", "sample", "extra"},
+		{"link", "sample", "database", "extra"},
 		{"ping", "--socket="},
 	} {
 		var stdout, stderr bytes.Buffer
@@ -381,6 +412,36 @@ func TestRunReturnsUsageStatusForInvalidArguments(t *testing.T) {
 		if stdout.Len() != 0 {
 			t.Errorf("run(%q) stdout = %q, want empty", args, stdout.String())
 		}
+	}
+}
+
+func TestReadEnvironmentRejectsAggregateInputBeyondDaemonRequestLimit(t *testing.T) {
+	valid, err := readEnvironment(strings.NewReader("TOKEN=small\n"))
+	if err != nil || valid["TOKEN"] != "small" {
+		t.Fatalf("readEnvironment() = %#v, %v", valid, err)
+	}
+
+	tooLarge := "TOKEN=" + strings.Repeat("x", maxCLIEnvironmentInputBytes)
+	if _, err := readEnvironment(strings.NewReader(tooLarge)); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("readEnvironment accepted oversized input: %v", err)
+	}
+}
+
+func TestRunConfigureRejectsSerializedRequestAboveDaemonLimitBeforeConnecting(t *testing.T) {
+	// The plaintext dotenv document is below its aggregate read limit and the
+	// value is below the per-value cap, but the JSON request envelope adds the
+	// app name, field names, and quotes to that value.
+	input := "TOKEN=" + strings.Repeat("x", 65_500) + "\n"
+	if len(input) > maxCLIEnvironmentInputBytes {
+		t.Fatalf("fixture input size=%d exceeds raw input limit", len(input))
+	}
+	var stdout, stderr bytes.Buffer
+	code := runWithInput(
+		[]string{"configure", "demo", "--env-stdin", "--socket", filepath.Join(t.TempDir(), "missing.sock")},
+		strings.NewReader(input), &stdout, &stderr,
+	)
+	if code != 2 || !strings.Contains(stderr.String(), "request exceeds") {
+		t.Fatalf("runWithInput() code=%d stdout=%q stderr=%q; want early request-size usage error", code, stdout.String(), stderr.String())
 	}
 }
 
@@ -410,6 +471,33 @@ func TestRunReturnsFailureForDaemonErrors(t *testing.T) {
 			}
 			if stderr.Len() == 0 {
 				t.Fatal("stderr is empty, want daemon error")
+			}
+		})
+	}
+}
+
+func TestRunReportsConfirmationWriterFailuresForServiceCommands(t *testing.T) {
+	for _, test := range []struct {
+		command string
+		args    []string
+		output  daemon.Response
+		message string
+	}{
+		{command: "add", args: []string{"add", "postgres", "--name", "db"}, output: daemon.Response{Service: &model.Service{Name: "db", Type: "postgres"}}, message: "write add confirmation"},
+		{command: "link", args: []string{"link", "demo", "db"}, output: daemon.Response{Binding: &model.Binding{EnvKey: "DATABASE_URL"}}, message: "write link confirmation"},
+	} {
+		t.Run(test.command, func(t *testing.T) {
+			socket := startFakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(test.output)
+			}))
+			var stderr bytes.Buffer
+			stdout := &failAfterWrites{err: errors.New("output closed")}
+			if code := run(append(test.args, "--socket", socket), stdout, &stderr); code != 1 {
+				t.Fatalf("run() code=%d stderr=%q, want output failure", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), test.message+": output closed") {
+				t.Fatalf("stderr=%q, want %q", stderr.String(), test.message)
 			}
 		})
 	}

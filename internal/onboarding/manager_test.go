@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"paas/internal/contracts"
 	"paas/internal/deployment"
@@ -71,6 +72,32 @@ func TestManagerSubmitReturnsBeforeCheckoutAndSurvivesRequestCancellation(t *tes
 	close(release)
 	if got := awaitJobTerminal(t, h.manager, job.ID); got.State != "SUCCEEDED" {
 		t.Fatalf("accepted job did not survive request cancellation: %+v", got)
+	}
+}
+
+func TestGetSourceDistinguishesMissingSettingsFromUnavailableStorage(t *testing.T) {
+	h := newOnboardingHarness(t, nil)
+	if _, _, err := h.manager.GetSource("missing-app"); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("GetSource() for absent settings error = %v, want ErrJobNotFound", err)
+	}
+	settings := SourceSettings{
+		Name:    "saved-app",
+		RepoURL: "https://github.com/example/saved-app",
+		Ref:     "main",
+	}
+	if err := h.manager.UpdateSource(context.Background(), settings, nil); err != nil {
+		t.Fatalf("UpdateSource() error = %v", err)
+	}
+	if err := os.WriteFile(h.manager.sources.path, []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.manager.GetSource("saved-app"); !errors.Is(err, ErrSourceUnavailable) {
+		t.Fatalf("GetSource() for corrupt settings error = %v, want ErrSourceUnavailable", err)
+	} else if errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("corrupt settings were misclassified as absent: %v", err)
+	}
+	if _, _, err := h.manager.CreateHook(context.Background(), "saved-app", "main"); !errors.Is(err, ErrSourceUnavailable) {
+		t.Fatalf("CreateHook() for corrupt settings error = %v, want ErrSourceUnavailable", err)
 	}
 }
 
@@ -213,6 +240,12 @@ func TestManagerQueueBoundAndJobHistoryLimit(t *testing.T) {
 			t.Fatalf("cancel queued job %+v: %v", got, err)
 		}
 	}
+	if got := len(queueManager.queue); got != 0 {
+		t.Fatalf("canceling queued jobs left %d queue entries", got)
+	}
+	if _, err := queueManager.Submit(context.Background(), deployRequest("queue-app", "https://github.com/example/queue-app", authoritativeSelection("go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi"))); err != nil {
+		t.Fatalf("Submit after canceling queued jobs: %v", err)
+	}
 
 	historyManager := &Manager{service: &deployment.Service{}, ctx: context.Background(), queue: make(chan string, maxOutstandingJobs), jobs: make(map[string]*jobRecord)}
 	var oldest string
@@ -239,6 +272,180 @@ func TestManagerQueueBoundAndJobHistoryLimit(t *testing.T) {
 	}
 	if got, err := historyManager.Get(newest); err != nil || got.ID != newest {
 		t.Fatalf("newest retained job = %+v, err=%v", got, err)
+	}
+}
+
+func TestPruneKeepsActiveOldestJobAndRemovesOldTerminalHistory(t *testing.T) {
+	manager := &Manager{
+		jobs:  make(map[string]*jobRecord),
+		order: []string{"active-oldest"},
+		dedup: make(map[string]dedupRecord),
+	}
+	manager.jobs["active-oldest"] = &jobRecord{Job: Job{ID: "active-oldest", State: "RUNNING"}}
+	for i := 0; i < 120; i++ {
+		id := fmt.Sprintf("terminal-%03d", i)
+		manager.order = append(manager.order, id)
+		manager.jobs[id] = &jobRecord{Job: Job{ID: id, State: "CANCELED"}, terminal: true}
+		manager.dedup[id] = dedupRecord{JobID: id, CreatedAt: time.Now().UTC()}
+	}
+
+	manager.pruneLocked()
+	if len(manager.order) != 100 || len(manager.jobs) != 100 {
+		t.Fatalf("retained order/jobs = %d/%d, want 100/100", len(manager.order), len(manager.jobs))
+	}
+	if manager.jobs["active-oldest"] == nil || manager.jobs["active-oldest"].terminal {
+		t.Fatal("pruning removed the oldest active job")
+	}
+	if manager.jobs["terminal-000"] != nil || manager.dedup["terminal-000"].JobID != "" {
+		t.Fatal("pruning retained the oldest terminal job or its deduplication record")
+	}
+	if manager.jobs["terminal-119"] == nil {
+		t.Fatal("pruning removed the newest terminal job")
+	}
+}
+
+func TestForgetRemovesQueuedJobsFromBoundedQueue(t *testing.T) {
+	dataDir := t.TempDir()
+	manager := &Manager{
+		ctx:         context.Background(),
+		queue:       make(chan string, maxOutstandingJobs),
+		jobs:        make(map[string]*jobRecord),
+		order:       []string{"job-forgotten", "job-retained"},
+		outstanding: 2,
+		dedup:       make(map[string]dedupRecord),
+		forgotten:   make(map[string]bool),
+		sources:     newSourceStore(dataDir),
+		protected:   newProtectedStore(dataDir),
+	}
+	if err := manager.sources.save(SourceSettings{Name: "forgotten-app", RepoURL: "https://github.com/example/forgotten-app"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.protected.update(func(state *protectedState) error {
+		state.BuildEnvironment["forgotten-app"] = map[string]string{"API_TOKEN": "secret"}
+		state.Hooks["hook_forgotten"] = storedHook{Metadata: HookMetadata{ID: "hook_forgotten", Name: "forgotten-app"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		id, name string
+	}{
+		{id: "job-forgotten", name: "forgotten-app"},
+		{id: "job-retained", name: "retained-app"},
+	} {
+		manager.jobs[item.id] = &jobRecord{
+			Job:     Job{ID: item.id, Name: item.name, State: "QUEUED", Stage: "QUEUED"},
+			request: deployRequest(item.name, "https://github.com/example/"+item.name, authoritativeSelection("go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi")),
+		}
+		manager.queue <- item.id
+	}
+
+	if err := manager.Forget("forgotten-app"); err != nil {
+		t.Fatalf("Forget(): %v", err)
+	}
+	if got := len(manager.queue); got != 1 {
+		t.Fatalf("queue length after Forget = %d, want 1", got)
+	}
+	if got := <-manager.queue; got != "job-retained" {
+		t.Fatalf("remaining queued job = %q, want job-retained", got)
+	}
+	if manager.outstanding != 1 {
+		t.Fatalf("outstanding after Forget = %d, want 1", manager.outstanding)
+	}
+	if _, err := manager.sources.get("forgotten-app"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source settings after Forget error = %v, want not found", err)
+	}
+	state, err := manager.protected.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := state.BuildEnvironment["forgotten-app"]; exists {
+		t.Fatal("Forget retained encrypted build environment")
+	}
+	if _, exists := state.Hooks["hook_forgotten"]; exists {
+		t.Fatal("Forget retained webhook secret")
+	}
+	if _, exists := state.Jobs["job-forgotten"]; exists {
+		t.Fatal("Forget retained the persisted job")
+	}
+}
+
+func TestManagerConcurrentQueuedCancelSubmitAndWorkerStart(t *testing.T) {
+	h := newOnboardingHarness(t, nil)
+	fixture := authoritativeGoFixture(t, "concurrent-queue-app", "go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi")
+	checkoutRoot := t.TempDir()
+	firstCheckout := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var checkoutCount atomic.Int32
+	h.manager.checkout = func(ctx context.Context, _, _, _, _, _ string) (string, func(), error) {
+		if checkoutCount.Add(1) == 1 {
+			close(firstCheckout)
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return "", nil, ctx.Err()
+			}
+		}
+		path, err := copyFixture(checkoutRoot, fixture)
+		if err != nil {
+			return "", nil, err
+		}
+		return path, func() {}, nil
+	}
+
+	selection := authoritativeSelection("go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi")
+	submit := func() Job {
+		job, err := h.manager.Submit(context.Background(), deployRequest("concurrent-queue-app", "https://github.com/example/concurrent-queue-app", selection))
+		if err != nil {
+			t.Fatalf("Submit(): %v", err)
+		}
+		return job
+	}
+	first := submit()
+	waitSignal(t, firstCheckout, "first checkout")
+	queued := submit()
+
+	startRacers := make(chan struct{})
+	cancelResult := make(chan Job, 1)
+	cancelError := make(chan error, 1)
+	go func() {
+		<-startRacers
+		job, err := h.manager.Cancel(queued.ID)
+		cancelResult <- job
+		cancelError <- err
+	}()
+	submitted := make(chan Job, 1)
+	submitError := make(chan error, 1)
+	go func() {
+		<-startRacers
+		job, err := h.manager.Submit(context.Background(), deployRequest("concurrent-queue-app", "https://github.com/example/concurrent-queue-app", selection))
+		submitted <- job
+		submitError <- err
+	}()
+
+	// Release the worker at the same time as queue compaction and enqueue. The
+	// canceled item may still be dequeued, but it must never block later work.
+	close(releaseFirst)
+	close(startRacers)
+	canceled := <-cancelResult
+	if err := <-cancelError; err != nil {
+		t.Fatalf("Cancel(): %v", err)
+	}
+	if canceled.State != "CANCELED" && canceled.State != "CANCELLING" {
+		t.Fatalf("concurrent cancel state=%s, want CANCELED or CANCELLING", canceled.State)
+	}
+	third := <-submitted
+	if err := <-submitError; err != nil {
+		t.Fatalf("concurrent Submit(): %v", err)
+	}
+	if got := awaitJobTerminal(t, h.manager, first.ID); got.State != "SUCCEEDED" {
+		t.Fatalf("first job = %+v", got)
+	}
+	if got := awaitJobTerminal(t, h.manager, queued.ID); got.State != "CANCELED" {
+		t.Fatalf("canceled queued job = %+v", got)
+	}
+	if got := awaitJobTerminal(t, h.manager, third.ID); got.State != "SUCCEEDED" {
+		t.Fatalf("newly submitted job was lost behind canceled queue item: %+v", got)
 	}
 }
 
@@ -277,6 +484,32 @@ func TestManagerGetKeepsLogsPinnedToDeploymentAttempt(t *testing.T) {
 	}
 }
 
+func TestSafeLogTailRedactsSecretsBeforeTruncating(t *testing.T) {
+	const limit = 64 << 10
+	secret := "build-secret-that-crosses-the-log-tail-boundary"
+	logs := strings.Repeat("p", 10) + secret + strings.Repeat("x", limit-16)
+	got := safeLogTail(logs, limit, []string{secret})
+	if len(got) > limit {
+		t.Fatalf("safe log tail has %d bytes, limit is %d", len(got), limit)
+	}
+	if strings.Contains(got, secret) || strings.Contains(got, secret[len(secret)-16:]) {
+		t.Fatalf("log tail exposed part of a truncated secret: %q", got[len(got)-40:])
+	}
+	if !strings.Contains(got, "[redacted]") {
+		t.Fatalf("redacted secret placeholder is missing: %q", got[len(got)-40:])
+	}
+}
+
+func TestTailStringDoesNotSplitUTF8AtLimit(t *testing.T) {
+	got := tailString("éxxy", 4)
+	if !utf8.ValidString(got) {
+		t.Fatalf("tail is not valid UTF-8: %q", got)
+	}
+	if got != "xxy" {
+		t.Fatalf("tail=%q, want rune-aligned suffix %q", got, "xxy")
+	}
+}
+
 func TestManagerRedeployUsesSavedSourceAndPreservesConfiguredSettings(t *testing.T) {
 	h := newOnboardingHarness(t, nil)
 	fixture := authoritativeGoFixture(t, "retry-app", "go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi")
@@ -290,6 +523,18 @@ func TestManagerRedeployUsesSavedSourceAndPreservesConfiguredSettings(t *testing
 	first := awaitJobTerminal(t, h.manager, initial.ID)
 	if first.State != "SUCCEEDED" {
 		t.Fatalf("initial deployment = %+v", first)
+	}
+	// Pre-override versions persisted inspection defaults as a non-empty
+	// selection. Simulate that legacy source record to ensure the compatibility
+	// flag defaults to repository-authoritative behavior after an upgrade.
+	legacySettings, err := h.manager.sources.get("retry-app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySettings.Selection = selection
+	legacySettings.ExplicitSelection = false
+	if err := h.manager.sources.save(legacySettings); err != nil {
+		t.Fatalf("save legacy source settings fixture: %v", err)
 	}
 
 	memory, cpu, tasks := "300Mi", 1.25, 24
@@ -336,6 +581,44 @@ func TestManagerRedeployUsesSavedSourceAndPreservesConfiguredSettings(t *testing
 	settings, err := h.service.Settings("retry-app")
 	if err != nil || settings.MemoryLimit != memory || len(settings.EnvironmentKeys) != 1 || settings.EnvironmentKeys[0] != "API_TOKEN" {
 		t.Fatalf("persisted settings after retry = %+v, err=%v", settings, err)
+	}
+}
+
+func TestManagerRedeployAppliesExplicitSavedSourceOverrides(t *testing.T) {
+	h := newOnboardingHarness(t, nil)
+	fixture := authoritativeGoFixture(t, "override-app", "go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi")
+	h.manager.checkout = singleFixtureCheckout(t, fixture)
+	selection := authoritativeSelection("go build -o \"$PAAS_OUT/server\" .", "/app/server", "128Mi")
+	first, err := h.manager.Submit(context.Background(), deployRequest("override-app", "https://github.com/example/override-app", selection))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := awaitJobTerminal(t, h.manager, first.ID); result.State != "SUCCEEDED" {
+		t.Fatalf("initial deployment = %+v", result)
+	}
+
+	settings := SourceSettings{
+		Name: "override-app", RepoURL: "https://github.com/example/override-app", Ref: "main",
+		Selection: authoritativeSelection("go build -o \"$PAAS_OUT/server\" ./cmd/custom", "/app/custom-server", "128Mi"),
+	}
+	settings.Selection.HealthPath = "/ready"
+	if err := h.manager.UpdateSource(context.Background(), settings, nil); err != nil {
+		t.Fatalf("UpdateSource(): %v", err)
+	}
+
+	job, err := h.manager.Redeploy(context.Background(), "override-app")
+	if err != nil {
+		t.Fatalf("Redeploy(): %v", err)
+	}
+	if result := awaitJobTerminal(t, h.manager, job.ID); result.State != "SUCCEEDED" {
+		t.Fatalf("redeployment = %+v", result)
+	}
+	requests := h.builder.Requests()
+	if len(requests) != 2 || requests[1].BuildCommand != settings.Selection.BuildCommand || requests[1].StartCommand != settings.Selection.StartCommand {
+		t.Fatalf("redeploy ignored explicit source overrides: %+v", requests)
+	}
+	if !h.sandbox.HasCommand(settings.Selection.StartCommand) {
+		t.Fatalf("sandbox did not start with the selected command %q", settings.Selection.StartCommand)
 	}
 }
 

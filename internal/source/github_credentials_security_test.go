@@ -155,6 +155,40 @@ func TestGitHubCredentialDisconnectRemovesStoredFiles(t *testing.T) {
 	}
 }
 
+func TestGitHubCredentialStoreWithEmptyDataDirectoryNeverUsesWorkingDirectory(t *testing.T) {
+	workingDir := t.TempDir()
+	for _, name := range []string{githubTokenFile, githubKeyFile} {
+		if err := os.WriteFile(filepath.Join(workingDir, name), []byte("leave me alone"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workingDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+
+	store := NewGitHubCredentialStore("", nil)
+	if _, err := store.Token(); err == nil {
+		t.Fatal("Token unexpectedly read credentials from the working directory")
+	}
+	if err := store.Disconnect(); err == nil {
+		t.Fatal("Disconnect unexpectedly succeeded without a data directory")
+	}
+	for _, name := range []string{githubTokenFile, githubKeyFile} {
+		if contents, err := os.ReadFile(name); err != nil || string(contents) != "leave me alone" {
+			t.Fatalf("working-directory file %q was changed: contents=%q err=%v", name, contents, err)
+		}
+	}
+}
+
 func TestGitHubCredentialStorePreservesSharedDataDirectoryPermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("directory permission bits are not enforced consistently on Windows")

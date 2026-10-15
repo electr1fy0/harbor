@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -246,14 +245,8 @@ func safeBinding(binding *model.Binding, appName string) dataServiceBindingRespo
 
 func decodeDataServiceRequest(w http.ResponseWriter, r *http.Request, output *dataServiceRequest) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(output); err != nil {
+	if err := decodeDaemonJSON(r.Body, output); err != nil {
 		writeDataServiceError(w, http.StatusBadRequest, "Invalid data-service request.")
-		return false
-	}
-	if decoder.Decode(new(any)) != io.EOF {
-		writeDataServiceError(w, http.StatusBadRequest, "The request must contain one JSON object.")
 		return false
 	}
 	return true

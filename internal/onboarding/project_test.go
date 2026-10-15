@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"paas/internal/config"
 )
 
 func TestInspectGoAndExtractsOnlyAllowedEnvironmentNames(t *testing.T) {
@@ -70,6 +72,45 @@ func TestYarnLockfileUsesClassicOrBerryInstallMode(t *testing.T) {
 				t.Fatalf("manager=%q install=%q want=%q", gotManager, gotInstall, tc.want)
 			}
 		})
+	}
+}
+
+func TestDeclaredNodePackageManagerWinsOverOtherLockfiles(t *testing.T) {
+	for _, tc := range []struct {
+		name, declared, matchingLock, otherLock, wantManager, wantInstall string
+	}{
+		{"npm ignores pnpm lock", "npm@10.5.0", "", "pnpm-lock.yaml", "npm", "npm install"},
+		{"npm uses its lock", "npm@10.5.0", "package-lock.json", "pnpm-lock.yaml", "npm", "npm ci"},
+		{"pnpm ignores npm lock", "pnpm@9.1.0", "", "package-lock.json", "pnpm", "pnpm install"},
+		{"pnpm uses its lock", "pnpm@9.1.0", "pnpm-lock.yaml", "package-lock.json", "pnpm", "pnpm install --frozen-lockfile"},
+		{"classic yarn without lock", "yarn@1.22.22", "", "package-lock.json", "yarn", "yarn install"},
+		{"modern yarn without lock", "yarn@4.3.1", "", "package-lock.json", "yarn", "yarn install"},
+		{"modern yarn with lock", "yarn@4.3.1", "yarn.lock", "package-lock.json", "yarn", "yarn install --immutable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.matchingLock != "" {
+				writeProjectFile(t, dir, tc.matchingLock, "lock\n")
+			}
+			if tc.otherLock != "" {
+				writeProjectFile(t, dir, tc.otherLock, "lock\n")
+			}
+			manager, install, err := nodePackageManager(dir, tc.declared)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if manager != tc.wantManager || install != tc.wantInstall {
+				t.Fatalf("manager=%q install=%q; want %q, %q", manager, install, tc.wantManager, tc.wantInstall)
+			}
+		})
+	}
+}
+
+func TestUnsupportedDeclaredNodePackageManagerIsNotHiddenByLockfile(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectFile(t, dir, "package-lock.json", "{}")
+	if _, _, err := nodePackageManager(dir, "unsupported@1.0.0"); err == nil {
+		t.Fatal("unsupported packageManager was ignored because package-lock.json exists")
 	}
 }
 
@@ -142,8 +183,15 @@ resources:
 	if cfg.Build.Command != selection.BuildCommand || cfg.Health.Path != selection.HealthPath || cfg.Start.Command != "/app/server" || cfg.Resources.Memory != "128Mi" || cfg.Resources.CPU != 0.5 || cfg.Resources.Tasks != 64 {
 		t.Fatalf("persisted selection did not override repository config: %+v", cfg)
 	}
+	deployedCfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("config.Load after PrepareConfigured(): %v", err)
+	}
+	if deployedCfg.Build.Command != selection.BuildCommand || deployedCfg.Health.Path != selection.HealthPath {
+		t.Fatalf("deployment reload lost persisted selection: %+v", deployedCfg)
+	}
 	if _, err := Inspect(dir, "repo-app", ConfigSelection{}); err != nil {
-		t.Fatalf("repository config was modified or invalid: %v", err)
+		t.Fatalf("prepared checkout config became invalid: %v", err)
 	}
 }
 
@@ -156,6 +204,21 @@ func TestUnsupportedNodeAndAmbiguousRuntimeFailClearly(t *testing.T) {
 	writeProjectFile(t, dir, "go.mod", "module example\n")
 	if _, err := Inspect(dir, "node-app", ConfigSelection{}); err == nil || !strings.Contains(err.Error(), "both go.mod and package.json") {
 		t.Fatalf("ambiguous runtime err=%v", err)
+	}
+}
+
+func TestInspectRejectsTrailingPackageJSONData(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectFile(t, dir, "package.json", `{"scripts":{"start":"node server.js"}} {"scripts":{"start":"node attacker.js"}}`)
+	if _, err := Inspect(dir, "node-app", ConfigSelection{}); err == nil || !strings.Contains(err.Error(), "package.json is invalid") {
+		t.Fatalf("package.json with trailing JSON was accepted: %v", err)
+	}
+}
+
+func TestPackageManifestDecoderRejectsDataPastSizeLimit(t *testing.T) {
+	input := `{"scripts":{"start":"node server.js"}}` + strings.Repeat(" ", maxPackageJSONBytes) + "junk"
+	if _, err := decodePackageManifest(strings.NewReader(input)); err == nil {
+		t.Fatal("package.json content beyond the size limit was silently ignored")
 	}
 }
 
@@ -172,6 +235,22 @@ func TestEnvironmentSampleIsBounded(t *testing.T) {
 	}
 	if len(got.EnvironmentKeys) != 0 || len(got.Warnings) == 0 {
 		t.Fatalf("inspection=%+v", got)
+	}
+}
+
+func TestEnvironmentSampleAcceptsSingleLineAtSizeLimit(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectFile(t, dir, "go.mod", "module example\n")
+	writeProjectFile(t, dir, "main.go", "package main\n")
+	sample := "API_TOKEN=" + strings.Repeat("x", maxEnvSampleBytes-len("API_TOKEN="))
+	writeProjectFile(t, dir, ".env.example", sample)
+
+	got, err := Inspect(dir, "sample-app", ConfigSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(got.EnvironmentKeys, "API_TOKEN") {
+		t.Fatalf("environment sample dropped its valid key: %+v", got)
 	}
 }
 

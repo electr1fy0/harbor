@@ -6,17 +6,23 @@ import { FeatureCard, fieldClass, useFeatureAction } from "./feature-card"
 import {
   downloadText,
   featureCall,
+  observeHistoryRequest,
+  type ObserveHistoryWindow,
   type ObserveSettings,
   type ObserveView,
 } from "@/lib/features"
 import { formatDate } from "./format"
 
 export function AppObservability({ name }: { name: string }) {
-  const [historyWindow, setHistoryWindow] = useState("hour")
+  const [historyWindow, setHistoryWindow] =
+    useState<ObserveHistoryWindow>("hour")
   const query = useQuery({
     queryKey: ["harbor", "observe", name, historyWindow],
     queryFn: () =>
-      featureCall<ObserveView>("observe", { action: "get", name, limit: 120 }),
+      featureCall<ObserveView>(
+        "observe",
+        observeHistoryRequest(name, historyWindow)
+      ),
     refetchInterval: 15000,
   })
   const bundle = useFeatureAction<Record<string, unknown>>("observe", (data) =>
@@ -28,7 +34,7 @@ export function AppObservability({ name }: { name: string }) {
   )
   if (query.isPending)
     return <p className="text-sm">Loading metrics and routing settings…</p>
-  if (query.isError)
+  if (query.isError && !query.data)
     return (
       <p role="alert" className="text-sm text-red-700">
         {query.error.message}
@@ -42,6 +48,12 @@ export function AppObservability({ name }: { name: string }) {
   }))
   return (
     <div className="grid gap-4">
+      {query.isError ? (
+        <p role="status" className="text-xs text-amber-800">
+          Latest observability data could not be refreshed:{" "}
+          {query.error?.message}
+        </p>
+      ) : null}
       <FeatureCard
         title="Memory history"
         description="Measurements persist on this server. Missing measurements are left unavailable."
@@ -51,7 +63,9 @@ export function AppObservability({ name }: { name: string }) {
           <select
             className="h-9 w-fit rounded-md border px-2"
             value={historyWindow}
-            onChange={(e) => setHistoryWindow(e.target.value)}
+            onChange={(e) =>
+              setHistoryWindow(e.target.value as ObserveHistoryWindow)
+            }
           >
             <option value="hour">Last hour</option>
             <option value="day">Last 24 hours</option>
@@ -185,6 +199,7 @@ function ObserveForm({ initial }: { initial: ObserveSettings }) {
         <label className="flex items-center gap-2 text-sm">
           <input
             type="checkbox"
+            disabled={save.isPending}
             checked={settings.maintenance}
             onChange={(e) => update("maintenance", e.target.checked)}
           />
@@ -194,6 +209,7 @@ function ObserveForm({ initial }: { initial: ObserveSettings }) {
           Maintenance message
           <Input
             value={settings.maintenanceMessage}
+            disabled={save.isPending}
             maxLength={1024}
             onChange={(e) => update("maintenanceMessage", e.target.value)}
           />
@@ -203,6 +219,7 @@ function ObserveForm({ initial }: { initial: ObserveSettings }) {
             Host memory alert (%)
             <Input
               type="number"
+              disabled={save.isPending}
               min={0}
               max={100}
               value={settings.memoryPercent}
@@ -213,6 +230,7 @@ function ObserveForm({ initial }: { initial: ObserveSettings }) {
             Disk alert (%)
             <Input
               type="number"
+              disabled={save.isPending}
               min={0}
               max={100}
               value={settings.diskPercent}
@@ -223,6 +241,7 @@ function ObserveForm({ initial }: { initial: ObserveSettings }) {
             Notification cooldown (seconds)
             <Input
               type="number"
+              disabled={save.isPending}
               min={30}
               max={86400}
               value={settings.cooldownSeconds}
@@ -238,6 +257,7 @@ function ObserveForm({ initial }: { initial: ObserveSettings }) {
         <label className="flex items-center gap-2 text-xs">
           <input
             type="checkbox"
+            disabled={save.isPending}
             checked={changeWebhook}
             onChange={(e) => setChangeWebhook(e.target.checked)}
           />
@@ -251,6 +271,7 @@ function ObserveForm({ initial }: { initial: ObserveSettings }) {
             HTTPS webhook URL · leave empty to remove
             <Input
               type="password"
+              disabled={save.isPending}
               autoComplete="off"
               value={webhook}
               onChange={(e) => setWebhook(e.target.value)}
@@ -271,6 +292,7 @@ function ObserveForm({ initial }: { initial: ObserveSettings }) {
             <label key={event} className="flex items-center gap-1 text-xs">
               <input
                 type="checkbox"
+                disabled={save.isPending}
                 checked={settings.events.includes(event)}
                 onChange={(e) =>
                   update(

@@ -423,3 +423,21 @@ func TestFeatureGatewayAutomationSourceAndPublicHooks(t *testing.T) {
 		t.Fatalf("revoked generic CI hook remained active: status=%d body=%q", response.Code, response.Body.String())
 	}
 }
+
+func TestAutomationGetSourceDistinguishesMissingSettingsFromCorruptStorage(t *testing.T) {
+	f := newFeatureGatewayFixture(t)
+
+	status, body := f.dashboardCall(t, "automation", `{"action":"getSource","name":"missing-app"}`)
+	if status != http.StatusNotFound {
+		t.Fatalf("missing source status=%d body=%s, want 404", status, body)
+	}
+
+	path := filepath.Join(f.appService.DataDir(), "onboarding-sources.json")
+	if err := os.WriteFile(path, []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, body = f.dashboardCall(t, "automation", `{"action":"getSource","name":"saved-app"}`)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("corrupt source storage status=%d body=%s, want 500", status, body)
+	}
+}

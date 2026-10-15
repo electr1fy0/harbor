@@ -27,13 +27,13 @@ export function FeatureCard({
 }
 export function useFeatureAction<T = Record<string, unknown>>(
   area: FeatureArea,
-  onSuccess?: (data: T) => void
+  onSuccess?: (data: T, input: Record<string, unknown>) => void
 ) {
   const client = useQueryClient()
   return useMutation({
     mutationFn: (input: Record<string, unknown>) => featureCall<T>(area, input),
-    onSuccess: (data) => {
-      onSuccess?.(data)
+    onSuccess: (data, input) => {
+      onSuccess?.(data, input)
       toast.success("Changes applied")
     },
     onError: (error) => toast.error(error.message),

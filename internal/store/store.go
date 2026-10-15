@@ -19,7 +19,7 @@ import (
 
 var ErrNotFound = errors.New("store: not found")
 
-const schemaVersion = 9
+const schemaVersion = 10
 
 const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
@@ -71,8 +71,13 @@ func (s *Store) CreateApp(name string) (*model.Application, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: generate application id: %w", err)
 	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("store: begin application creation: %w", err)
+	}
+	defer tx.Rollback()
 	createdAt := time.Now().UTC()
-	_, err = s.db.Exec(`
+	_, err = tx.Exec(`
 		INSERT INTO apps (id, name, created_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(name) DO NOTHING`, id, name, encodeTime(createdAt))
@@ -82,16 +87,19 @@ func (s *Store) CreateApp(name string) (*model.Application, error) {
 
 	app := &model.Application{}
 	var storedTime string
-	if err := s.db.QueryRow(`SELECT id, name, created_at FROM apps WHERE name = ?`, name).
+	if err := tx.QueryRow(`SELECT id, name, created_at FROM apps WHERE name = ?`, name).
 		Scan(&app.ID, &app.Name, &storedTime); err != nil {
 		return nil, fmt.Errorf("store: read application after create: %w", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO app_settings (app_id) VALUES (?) ON CONFLICT(app_id) DO NOTHING`, app.ID); err != nil {
+	if _, err := tx.Exec(`INSERT INTO app_settings (app_id) VALUES (?) ON CONFLICT(app_id) DO NOTHING`, app.ID); err != nil {
 		return nil, fmt.Errorf("store: initialize application settings: %w", err)
 	}
 	app.CreatedAt, err = decodeTime(storedTime)
 	if err != nil {
 		return nil, fmt.Errorf("store: decode application creation time: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store: commit application creation: %w", err)
 	}
 	return app, nil
 }
@@ -577,6 +585,14 @@ func (s *Store) PreviousRelease(appName string) (*contracts.Release, error) {
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
+	if active == nil {
+		// A stop or crash removes routes, but it does not change which successful
+		// release rollback must move away from.
+		active, err = s.LatestPromotedDeployment(appName)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+	}
 	currentID := ""
 	if active != nil {
 		currentID = active.ReleaseID
@@ -983,6 +999,35 @@ func migrate(db *sql.DB) error {
 		for _, statement := range statements {
 			if _, err := tx.Exec(statement); err != nil {
 				return fmt.Errorf("store: retire custom domains: %w", err)
+			}
+		}
+	}
+	if version < 10 {
+		// Foreign keys alone do not enforce that a release and its deployment,
+		// or an event and its deployment, belong to the same application.
+		for _, statement := range []string{
+			`CREATE TRIGGER IF NOT EXISTS deployments_release_owner_insert BEFORE INSERT ON deployments
+    WHEN EXISTS (SELECT 1 FROM apps WHERE id = NEW.app_id) AND EXISTS (SELECT 1 FROM releases WHERE id = NEW.release_id AND app_id != NEW.app_id)
+    BEGIN SELECT RAISE(ABORT, 'deployment release belongs to another application'); END`,
+			`CREATE TRIGGER IF NOT EXISTS deployments_release_owner_update BEFORE UPDATE OF app_id, release_id ON deployments
+    WHEN EXISTS (SELECT 1 FROM apps WHERE id = NEW.app_id) AND EXISTS (SELECT 1 FROM releases WHERE id = NEW.release_id AND app_id != NEW.app_id)
+    BEGIN SELECT RAISE(ABORT, 'deployment release belongs to another application'); END`,
+			`CREATE TRIGGER IF NOT EXISTS releases_application_immutable BEFORE UPDATE OF app_id ON releases
+    WHEN NEW.app_id != OLD.app_id AND EXISTS (SELECT 1 FROM apps WHERE id = NEW.app_id)
+    BEGIN SELECT RAISE(ABORT, 'release application is immutable'); END`,
+			`CREATE TRIGGER IF NOT EXISTS deployments_application_immutable BEFORE UPDATE OF app_id ON deployments
+    WHEN NEW.app_id != OLD.app_id AND EXISTS (SELECT 1 FROM apps WHERE id = NEW.app_id)
+    BEGIN SELECT RAISE(ABORT, 'deployment application is immutable'); END`,
+			`CREATE TRIGGER IF NOT EXISTS events_deployment_owner_insert BEFORE INSERT ON events
+    WHEN EXISTS (SELECT 1 FROM apps WHERE id = NEW.app_id) AND EXISTS (SELECT 1 FROM deployments WHERE id = NEW.deployment_id AND app_id != NEW.app_id)
+    BEGIN SELECT RAISE(ABORT, 'event deployment belongs to another application'); END`,
+			`CREATE TRIGGER IF NOT EXISTS events_deployment_owner_update BEFORE UPDATE OF app_id, deployment_id ON events
+    WHEN EXISTS (SELECT 1 FROM apps WHERE id = NEW.app_id) AND EXISTS (SELECT 1 FROM deployments WHERE id = NEW.deployment_id AND app_id != NEW.app_id)
+    BEGIN SELECT RAISE(ABORT, 'event deployment belongs to another application'); END`,
+			`PRAGMA user_version = 10`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return fmt.Errorf("store: enforce application ownership: %w", err)
 			}
 		}
 	}

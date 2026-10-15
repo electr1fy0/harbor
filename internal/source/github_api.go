@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -136,6 +137,16 @@ func (api *GitHubAPI) Repositories(ctx context.Context, token string) ([]GitHubR
 	return api.listRepositories(ctx, token, "/user/repos?visibility=all&affiliation=owner%2Ccollaborator%2Corganization_member")
 }
 
+// verifyRepositoryAccess checks the scope needed to browse repositories
+// without enumerating an account's full list during credential setup.
+func (api *GitHubAPI) verifyRepositoryAccess(ctx context.Context, token string) error {
+	var response []githubRepositoryResponse
+	return api.request(ctx, token,
+		"/user/repos?visibility=all&affiliation=owner%2Ccollaborator%2Corganization_member&per_page=1&page=1&sort=updated",
+		&response,
+	)
+}
+
 // PublicRepositories supports browsing before a GitHub account is connected.
 func (api *GitHubAPI) PublicRepositories(ctx context.Context, owner, token string) ([]GitHubRepository, error) {
 	if !validGitHubLogin(owner) {
@@ -170,8 +181,9 @@ func mapRepository(repo githubRepositoryResponse) (GitHubRepository, bool) {
 
 func (api *GitHubAPI) listRepositories(ctx context.Context, token, basePath string) ([]GitHubRepository, error) {
 	const pageSize = 100
+	const maxPages = 10
 	result := make([]GitHubRepository, 0)
-	for page := 1; page <= 10; page++ {
+	for page := 1; page <= maxPages; page++ {
 		path := fmt.Sprintf("%s&per_page=%d&page=%d&sort=updated", basePath, pageSize, page)
 		var response []githubRepositoryResponse
 		if err := api.request(ctx, token, path, &response); err != nil {
@@ -183,7 +195,20 @@ func (api *GitHubAPI) listRepositories(ctx context.Context, token, basePath stri
 			}
 		}
 		if len(response) < pageSize {
-			break
+			return result, nil
+		}
+	}
+	// The UI intentionally caps very large repository lists. Probe one page
+	// beyond the cap so an account with more than 1,000 repositories gets an
+	// explicit error instead of a plausible but incomplete picker.
+	path := fmt.Sprintf("%s&per_page=%d&page=%d&sort=updated", basePath, pageSize, maxPages+1)
+	var overflow []githubRepositoryResponse
+	if err := api.request(ctx, token, path, &overflow); err != nil {
+		return nil, err
+	}
+	for _, repo := range overflow {
+		if _, ok := mapRepository(repo); ok {
+			return nil, errors.New("GitHub repository list exceeds the 1,000-repository limit")
 		}
 	}
 	return result, nil
@@ -250,7 +275,11 @@ func validRepositoryFullName(fullName string) bool {
 func boundedText(value string, limit int) string {
 	value = strings.TrimSpace(value)
 	if len(value) > limit {
-		return value[:limit]
+		end := limit
+		for end > 0 && end < len(value) && !utf8.RuneStart(value[end]) {
+			end--
+		}
+		return value[:end]
 	}
 	return value
 }

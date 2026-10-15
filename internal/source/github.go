@@ -14,11 +14,13 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
 
 const defaultCheckoutTimeout = 2 * time.Minute
+const maxGitCommandOutput = 64 << 10
 
 // gitRunner runs one git command. Keeping this seam private lets tests exercise
 // checkout behavior without making network requests.
@@ -292,6 +294,9 @@ func runGit(ctx context.Context, executable string, env []string, directory, bui
 	cmd.Dir = directory
 	cmd.Env = env
 	cmd.WaitDelay = 5 * time.Second
+	var output boundedGitCommandOutput
+	cmd.Stdout = &output
+	cmd.Stderr = &output
 	if err := configureGitCommand(cmd, buildUser); err != nil {
 		return err
 	}
@@ -301,15 +306,25 @@ func runGit(ctx context.Context, executable string, env []string, directory, bui
 		}
 		return killGitProcessGroup(cmd.Process.Pid)
 	}
-	if output, err := cmd.CombinedOutput(); err != nil {
+	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		message := strings.TrimSpace(string(output))
+		outputBytes, truncated := output.snapshot()
+		message := strings.TrimSpace(string(outputBytes))
 		for _, value := range env {
 			if strings.HasPrefix(value, "GITHUB_TOKEN=") {
-				message = strings.ReplaceAll(message, strings.TrimPrefix(value, "GITHUB_TOKEN="), "[redacted]")
+				token := strings.TrimPrefix(value, "GITHUB_TOKEN=")
+				if token != "" {
+					message = strings.ReplaceAll(message, token, "[redacted]")
+					if truncated {
+						message = redactPartialTokenSuffix(message, token)
+					}
+				}
 			}
+		}
+		if truncated {
+			message += "\n[Git output truncated]"
 		}
 		if message != "" {
 			return fmt.Errorf("%w: %s", err, message)
@@ -319,12 +334,60 @@ func runGit(ctx context.Context, executable string, env []string, directory, bui
 	return nil
 }
 
+// boundedGitCommandOutput drains both child streams while retaining only a
+// bounded prefix for error reporting. Git can emit attacker-controlled remote
+// diagnostics, so CombinedOutput could otherwise grow with an untrusted stream.
+type boundedGitCommandOutput struct {
+	mu        sync.Mutex
+	buffer    bytes.Buffer
+	truncated bool
+}
+
+func (w *boundedGitCommandOutput) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	remaining := maxGitCommandOutput - w.buffer.Len()
+	if remaining > 0 {
+		if len(data) > remaining {
+			_, _ = w.buffer.Write(data[:remaining])
+			w.truncated = true
+		} else {
+			_, _ = w.buffer.Write(data)
+		}
+	} else if len(data) > 0 {
+		w.truncated = true
+	}
+	return len(data), nil
+}
+
+func (w *boundedGitCommandOutput) snapshot() ([]byte, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.buffer.Bytes()...), w.truncated
+}
+
+// If the bounded prefix ends in the beginning of a token, redact that partial
+// suffix too so truncation cannot expose a fragment of the credential.
+func redactPartialTokenSuffix(message, token string) string {
+	max := len(token) - 1
+	if len(message) < max {
+		max = len(message)
+	}
+	for length := max; length > 0; length-- {
+		if strings.HasSuffix(message, token[:length]) {
+			return message[:len(message)-length] + "[redacted]"
+		}
+	}
+	return message
+}
+
 func canonicalGitHubURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", fmt.Errorf("invalid GitHub repository URL: %w", err)
 	}
-	if u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.Opaque != "" ||
+	if !strings.EqualFold(u.Scheme, "https") || !strings.EqualFold(u.Hostname(), "github.com") || (u.Port() != "" && u.Port() != "443") || u.User != nil || u.Opaque != "" ||
 		u.RawQuery != "" || u.ForceQuery || strings.Contains(raw, "#") || u.Fragment != "" || u.RawPath != "" {
 		return "", errors.New("RepoURL must be an HTTPS github.com owner/repository URL")
 	}

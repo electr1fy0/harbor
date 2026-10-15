@@ -183,11 +183,32 @@ func (s *Store) DataBackup(id string) (*model.DataBackup, string, error) {
 
 // DataBackups lists recent backup records for a service.
 func (s *Store) DataBackups(serviceID string) ([]model.DataBackup, error) {
+	return s.dataBackups(serviceID, "", false)
+}
+
+// ScheduledDataBackups lists all scheduled snapshots for a single binding.
+// Scheduler and retention decisions must not use the service-wide recent UI
+// page, which can be filled entirely by another application's backups.
+func (s *Store) ScheduledDataBackups(serviceID, appID string) ([]model.DataBackup, error) {
+	return s.dataBackups(serviceID, appID, true)
+}
+
+func (s *Store) dataBackups(serviceID, appID string, scheduledOnly bool) ([]model.DataBackup, error) {
 	if err := s.ensureDataServicesSchema(); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(`SELECT b.id,b.service_id,s.name,a.name,b.size_bytes,b.created_at,b.scheduled,b.verification,b.verified_at,b.verification_error
-		FROM data_backups b JOIN services s ON s.id=b.service_id JOIN apps a ON a.id=b.app_id WHERE b.service_id=? ORDER BY b.created_at DESC,b.id LIMIT 100`, serviceID)
+	query := `SELECT b.id,b.service_id,s.name,a.name,b.size_bytes,b.created_at,b.scheduled,b.verification,b.verified_at,b.verification_error
+  FROM data_backups b JOIN services s ON s.id=b.service_id JOIN apps a ON a.id=b.app_id WHERE b.service_id=?`
+	args := []any{serviceID}
+	if scheduledOnly {
+		query += ` AND b.app_id=? AND b.scheduled=1`
+		args = append(args, appID)
+	}
+	query += ` ORDER BY b.created_at DESC,b.id DESC`
+	if !scheduledOnly {
+		query += ` LIMIT 100`
+	}
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: list data backups: %w", err)
 	}

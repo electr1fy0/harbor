@@ -13,6 +13,9 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"paas/internal/contracts"
+	"paas/internal/source"
 )
 
 const (
@@ -22,13 +25,13 @@ const (
 	defaultControlWait    = 15 * time.Second
 	deploymentControlWait = 10 * time.Minute
 	onboardingControlWait = 150 * time.Second
+	unboundedControlWait  = -1
 )
 
 var (
 	appNamePattern         = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	githubOwnerPattern     = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
-	githubRepoPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
-	gitRefPattern          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+	githubRepoPattern      = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 	environmentKeyPattern  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 	releaseIDPattern       = regexp.MustCompile(`^(?:[A-Za-z0-9_-]{1,128})?$`)
 	jobIDPattern           = regexp.MustCompile(`^job_[a-f0-9]{32}$`)
@@ -146,6 +149,9 @@ func readDashboardInput(w http.ResponseWriter, r *http.Request) ([]byte, map[str
 	if len(body) == 0 {
 		return nil, nil, errors.New("missing request body")
 	}
+	if strictJSONInvalid(body) {
+		return nil, nil, errors.New("request body contains duplicate keys or trailing data")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	var fields map[string]json.RawMessage
 	if err := decoder.Decode(&fields); err != nil || fields == nil {
@@ -203,11 +209,15 @@ func validAppName(name string) bool { return appNamePattern.MatchString(name) }
 
 func validGitHubRepoURL(value string) (owner, repo string, ok bool) {
 	value = strings.TrimSpace(value)
-	if len(value) > 512 || !strings.HasPrefix(value, "https://github.com/") {
+	if len(value) > 512 || strings.Contains(value, "#") {
 		return "", "", false
 	}
-	path := strings.TrimPrefix(value, "https://github.com/")
-	if strings.ContainsAny(path, "?#") || strings.Count(path, "/") != 1 {
+	u, err := url.Parse(value)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Opaque != "" || u.User != nil || !strings.EqualFold(u.Hostname(), "github.com") || (u.Port() != "" && u.Port() != "443") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" || strings.Contains(u.EscapedPath(), "%") {
+		return "", "", false
+	}
+	path := strings.TrimPrefix(u.Path, "/")
+	if !strings.HasPrefix(u.Path, "/") || strings.ContainsAny(path, "?#") || strings.Count(path, "/") != 1 {
 		return "", "", false
 	}
 	parts := strings.SplitN(path, "/", 2)
@@ -215,22 +225,15 @@ func validGitHubRepoURL(value string) (owner, repo string, ok bool) {
 	if strings.HasSuffix(repo, ".git") {
 		repo = strings.TrimSuffix(repo, ".git")
 	}
-	return owner, repo, githubOwnerPattern.MatchString(owner) && githubRepoPattern.MatchString(repo)
+	return owner, repo, githubOwnerPattern.MatchString(owner) && validGitHubRepoName(repo)
+}
+
+func validGitHubRepoName(name string) bool {
+	return name != "." && name != ".." && githubRepoPattern.MatchString(name)
 }
 
 func validGitRef(ref string) bool {
-	if ref == "" {
-		return true
-	}
-	if len(ref) > 255 || !gitRefPattern.MatchString(ref) || strings.Contains(ref, "..") || strings.Contains(ref, "//") || strings.HasSuffix(ref, "/") || strings.HasSuffix(ref, ".") {
-		return false
-	}
-	for _, part := range strings.Split(ref, "/") {
-		if part == "" || strings.HasPrefix(part, ".") || strings.HasSuffix(strings.ToLower(part), ".lock") {
-			return false
-		}
-	}
-	return true
+	return len(ref) <= 255 && source.ValidateGitHubCheckoutRequest("https://github.com/owner/repo", ref, ".") == nil
 }
 
 func validRepositoryRoot(root string) bool {
@@ -250,7 +253,7 @@ func validRepositoryRoot(root string) bool {
 			return false
 		}
 	}
-	return true
+	return source.ValidateGitHubCheckoutRequest("https://github.com/owner/repo", "", root) == nil
 }
 
 func validateEnvironment(environment map[string]string) bool {
@@ -450,7 +453,11 @@ func dispatchDashboard(ctx context.Context, control http.Handler, name string, b
 		if name == "dataServices" && action == "export" {
 			limit = 70 << 20
 		}
-		response, fail := invokeControlWithLimit(ctx, control, http.MethodPost, endpoint, body, deploymentControlWait, limit)
+		timeout := deploymentControlWait
+		if name == "operations" && action == "rollback" {
+			timeout = unboundedControlWait
+		}
+		response, fail := invokeControlWithLimit(ctx, control, http.MethodPost, endpoint, body, timeout, limit)
 		if fail != nil {
 			return nil, fail
 		}
@@ -547,7 +554,7 @@ func dispatchDashboard(ctx context.Context, control http.Handler, name string, b
 		if input.RootDir != nil {
 			root = *input.RootDir
 		}
-		response, fail := daemonPost(ctx, control, "/deploy", map[string]any{"Name": input.Name, "RepoURL": input.RepoURL, "Ref": ref, "RootDir": root}, deploymentControlWait, "Could not deploy this app. Review the repository settings and app logs.", true)
+		response, fail := daemonPost(ctx, control, "/deploy", map[string]any{"Name": input.Name, "RepoURL": input.RepoURL, "Ref": ref, "RootDir": root}, unboundedControlWait, "Could not deploy this app. Review the repository settings and app logs.", true)
 		if fail != nil {
 			return nil, fail
 		}
@@ -587,7 +594,7 @@ func dispatchDashboard(ctx context.Context, control http.Handler, name string, b
 		if !ok || fields["releaseID"] == nil || rejectNullOptional(fields, "releaseID") || !validAppName(input.Name) || !releaseIDPattern.MatchString(input.ReleaseID) {
 			return nil, invalidRequest()
 		}
-		response, fail := daemonPost(ctx, control, "/rollback", map[string]any{"Name": input.Name, "ReleaseID": input.ReleaseID}, deploymentControlWait, "Could not roll back this app. Review the app logs.", true)
+		response, fail := daemonPost(ctx, control, "/rollback", map[string]any{"Name": input.Name, "ReleaseID": input.ReleaseID}, unboundedControlWait, "Could not roll back this app. Review the app logs.", true)
 		if fail != nil {
 			return nil, fail
 		}
@@ -727,10 +734,19 @@ func invokeControlWithLimit(ctx context.Context, control http.Handler, method, t
 	if control == nil {
 		return response, unavailableFailure()
 	}
-	if timeout <= 0 {
+	if len(body) > contracts.MaxControlRequestBytes {
+		return response, &apiFailure{http.StatusRequestEntityTooLarge, "Control request is too large."}
+	}
+	if timeout == 0 {
 		timeout = defaultControlWait
 	}
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	var callCtx context.Context
+	var cancel context.CancelFunc
+	if timeout < 0 {
+		callCtx, cancel = context.WithCancel(ctx)
+	} else {
+		callCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
 	defer cancel()
 	request, err := http.NewRequestWithContext(callCtx, method, "http://paasd"+target, bytes.NewReader(body))
 	if err != nil {
@@ -1069,6 +1085,12 @@ func getApp(ctx context.Context, control http.Handler, name string) (any, *apiFa
 	releases, releasesFail := daemonPost(ctx, control, "/releases", map[string]any{"Name": name}, defaultControlWait, "Could not load app releases.", false)
 	settingsResponse, settingsFail := daemonPost(ctx, control, "/settings", map[string]any{"Name": name}, defaultControlWait, "Could not load app settings.", false)
 	diagnosticsResponse, diagnosticsFail := daemonPost(ctx, control, "/diagnostics", map[string]any{"Name": name}, defaultControlWait, "Could not load deployment diagnostics.", false)
+	if inspectFail != nil && inspectFail.status == http.StatusNotFound &&
+		releasesFail != nil && releasesFail.status == http.StatusNotFound &&
+		settingsFail != nil && settingsFail.status == http.StatusNotFound &&
+		diagnosticsFail != nil && diagnosticsFail.status == http.StatusNotFound {
+		return nil, notFoundFailure()
+	}
 	for _, fail := range []*apiFailure{inspectFail, releasesFail, settingsFail, diagnosticsFail} {
 		if fail != nil && fail.status != http.StatusNotFound {
 			return nil, fail

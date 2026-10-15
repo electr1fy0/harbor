@@ -25,6 +25,14 @@ var _ contracts.Sandbox = (*HostSandbox)(nil)
 type HostSandbox struct {
 	mu        sync.RWMutex
 	processes map[string]*managedProcess
+	completed []completedProcess
+}
+
+const maxCompletedProcessHistory = 64
+
+type completedProcess struct {
+	id      string
+	process *managedProcess
 }
 
 type managedProcess struct {
@@ -60,7 +68,7 @@ func (h *HostSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) (*c
 	if err != nil {
 		return nil, err
 	}
-	command, err := commandForEnvironment(spec.Command, env)
+	command, err := commandForEnvironment(spec.Command, env, spec.Dir)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +128,7 @@ func (h *HostSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) (*c
 	h.processes[spec.ID] = process
 	h.mu.Unlock()
 
-	go reapProcess(process, releaseTracking)
+	go reapProcess(h, spec.ID, process, releaseTracking)
 
 	if err := ctx.Err(); err != nil {
 		_ = h.stopProcess(context.Background(), process)
@@ -140,6 +148,9 @@ func (h *HostSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) (*c
 
 // Stop terminates a known process group and waits for its members to be reaped.
 func (h *HostSandbox) Stop(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	process, err := h.lookup(id)
 	if err != nil {
 		return err
@@ -150,6 +161,9 @@ func (h *HostSandbox) Stop(ctx context.Context, id string) error {
 func (h *HostSandbox) stopProcess(ctx context.Context, process *managedProcess) error {
 	process.stopMu.Lock()
 	defer process.stopMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	select {
 	case <-process.treeDone:
@@ -224,16 +238,33 @@ func (h *HostSandbox) lookup(id string) (*managedProcess, error) {
 	return process, nil
 }
 
-func reapProcess(process *managedProcess, releaseTracking func()) {
+func reapProcess(host *HostSandbox, id string, process *managedProcess, releaseTracking func()) {
 	_ = process.cmd.Wait()
 	code := exitStatus(process.cmd.ProcessState)
 	process.mu.Lock()
 	process.running = false
 	process.exitCode = &code
+	process.cmd = nil
 	process.mu.Unlock()
 	finishProcessTree(process.pid)
 	releaseTracking()
 	close(process.treeDone)
+
+	// Keep a bounded window of exit metadata for Inspect, while releasing the
+	// exec.Cmd and its retained args/environment as soon as the process ends.
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if host.processes[id] != process {
+		return
+	}
+	host.completed = append(host.completed, completedProcess{id: id, process: process})
+	if len(host.completed) > maxCompletedProcessHistory {
+		oldest := host.completed[0]
+		host.completed = host.completed[1:]
+		if host.processes[oldest.id] == oldest.process {
+			delete(host.processes, oldest.id)
+		}
+	}
 }
 
 func makeEnvironment(explicit []string) ([]string, error) {
@@ -257,22 +288,37 @@ func makeEnvironment(explicit []string) ([]string, error) {
 	return env, nil
 }
 
-func commandForEnvironment(command, env []string) ([]string, error) {
+func commandForEnvironment(command, env []string, workingDirectory string) ([]string, error) {
 	if strings.ContainsRune(command[0], os.PathSeparator) {
 		return command, nil
 	}
 	pathValue := ""
+	hasPath := false
 	for _, entry := range env {
 		if key, value, ok := strings.Cut(entry, "="); ok && key == "PATH" {
 			pathValue = value
+			hasPath = true
 			break
 		}
 	}
-	if pathValue == "" {
+	if !hasPath {
 		return nil, fmt.Errorf("sandbox PATH is required to resolve command %q", command[0])
 	}
-	for _, directory := range filepath.SplitList(pathValue) {
-		candidate := directory + string(os.PathSeparator) + command[0]
+	base, err := filepath.Abs(workingDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("resolve sandbox working directory: %w", err)
+	}
+	directories := filepath.SplitList(pathValue)
+	if pathValue == "" {
+		// An explicitly empty PATH is one empty component, which searches the
+		// child's working directory just like a leading or trailing separator.
+		directories = []string{""}
+	}
+	for _, directory := range directories {
+		if !filepath.IsAbs(directory) {
+			directory = filepath.Join(base, directory)
+		}
+		candidate := filepath.Join(directory, command[0])
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
 			resolved := append([]string(nil), command...)
 			resolved[0] = candidate

@@ -63,6 +63,7 @@ import { featureCall } from "@/lib/features"
 import {
   appQueryOptions,
   deploymentJobQueryOptions,
+  deploymentJobStatus,
   overviewQueryOptions,
 } from "@/lib/queries"
 import {
@@ -557,14 +558,8 @@ function ProjectDetailContent({ name }: { name: string }) {
               <div className="rounded-lg border border-border/70 bg-[#fbfcfb] px-3 py-2.5 text-sm">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium">GitHub redeployment</span>
-                  <StatusBadge
-                    state={
-                      jobQuery.isError
-                        ? "Status unavailable"
-                        : jobQuery.data.state
-                    }
-                  />
-                  {jobQuery.data && !jobQuery.isError ? (
+                  <StatusBadge state={deploymentJobStatus(jobQuery)} />
+                  {jobQuery.data ? (
                     <span className="text-xs text-muted-foreground">
                       {jobQuery.data.stage.toLowerCase().replaceAll("_", " ")}
                     </span>

@@ -65,8 +65,10 @@ func (s *GitHubCredentialStore) Connect(ctx context.Context, token string) (GitH
 	if err != nil {
 		return GitHubConnection{}, err
 	}
-	// Verify repository metadata access before replacing an existing token.
-	if _, err := s.api.Repositories(ctx, token); err != nil {
+	// Verify repository metadata access before replacing an existing token,
+	// without requiring a large account's complete repository list to fit the
+	// repository-picker cap.
+	if err := s.api.verifyRepositoryAccess(ctx, token); err != nil {
 		return GitHubConnection{}, err
 	}
 	connection := GitHubConnection{Connected: true, Login: user.Login, ConnectedAt: time.Now().UTC()}
@@ -107,6 +109,9 @@ func (s *GitHubCredentialStore) Token() (string, error) {
 func (s *GitHubCredentialStore) Disconnect() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dir == "" {
+		return errors.New("Harbor data directory is unavailable")
+	}
 	var failures []error
 	for _, name := range []string{githubTokenFile, githubKeyFile} {
 		path := filepath.Join(s.dir, name)
@@ -156,6 +161,9 @@ func (s *GitHubCredentialStore) persist(token string, connection GitHubConnectio
 }
 
 func (s *GitHubCredentialStore) read() (storedCredential, error) {
+	if s.dir == "" {
+		return storedCredential{}, errors.New("Harbor data directory is unavailable")
+	}
 	path := filepath.Join(s.dir, githubTokenFile)
 	info, err := os.Lstat(path)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,7 +19,6 @@ import (
 	"paas/internal/fsutil"
 	"paas/internal/health"
 	"paas/internal/model"
-	"paas/internal/sandbox"
 	managedservice "paas/internal/service"
 	"paas/internal/store"
 )
@@ -375,10 +375,17 @@ func (s *Service) capacityPreflight(ctx context.Context, memory string, buildReq
 			result.BuildLimitKnown = false
 		}
 	}
+	overlapOverflow := false
 	if result.BuildLimitKnown {
 		result.BuildBytes = &buildBytes
-		overlap := requested + buildBytes
+		overlap, overflow := preflightOverlap(requested, buildBytes)
+		overlapOverflow = overflow
 		result.EstimatedOverlapBytes = &overlap
+		if overflow {
+			canFit := false
+			result.CanFit = &canFit
+			result.Message = "estimated candidate/build overlap exceeds the maximum representable host memory; capacity is advisory and resource limits are ceilings, not reservations"
+		}
 	}
 	snapshot, err := capacity.New("").Sample(ctx, nil)
 	if err != nil {
@@ -394,6 +401,9 @@ func (s *Service) capacityPreflight(ctx context.Context, memory string, buildReq
 		result.Message = "candidate memory can be estimated, but the host build memory limit is unavailable; total overlap is unknown. Estimates are advisory and resource limits are ceilings, not reservations"
 		return result, nil
 	}
+	if overlapOverflow {
+		return result, nil
+	}
 	canFit := *result.EstimatedOverlapBytes <= *available
 	result.CanFit = &canFit
 	if canFit {
@@ -402,6 +412,13 @@ func (s *Service) capacityPreflight(ctx context.Context, memory string, buildReq
 		result.Message = "estimated candidate/build overlap exceeds current host headroom after reserve; this is advisory and resource limits are ceilings, not reservations"
 	}
 	return result, nil
+}
+
+func preflightOverlap(requested, build int64) (int64, bool) {
+	if build > 0 && requested > math.MaxInt64-build {
+		return math.MaxInt64, true
+	}
+	return requested + build, false
 }
 
 func (s *Service) Start(ctx context.Context, name string) (*model.Deployment, error) {
@@ -470,7 +487,7 @@ func (s *Service) deployDesiredRelease(ctx context.Context, name, releaseID stri
 	return s.deployObserved(ctx, "", name, nil, &releaseID, contracts.DeployOptions{}, nil, true)
 }
 
-func (s *Service) deployLatestPromoted(ctx context.Context, name string) (*model.Deployment, error) {
+func (s *Service) deployLatestPromoted(ctx context.Context, name string, scheduledAt time.Time) (*model.Deployment, error) {
 	unlock, generation, err := s.lockAppForAdmission(ctx, name)
 	if err != nil {
 		return nil, err
@@ -488,6 +505,15 @@ func (s *Service) deployLatestPromoted(ctx context.Context, name string) (*model
 			return nil, err
 		}
 		return nil, errors.New("application is explicitly stopped")
+	}
+	operations, err := s.db.OperationSettings(name)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	if !automaticRestartScheduleMatches(operations, scheduledAt) {
+		s.mu.Unlock()
+		return nil, errors.New("automatic restart schedule changed before admission")
 	}
 	if active, activeErr := s.db.ActiveDeployment(name); activeErr == nil && active.State == model.Running {
 		_ = s.db.SetNextRestart(settings.AppID, nil)
@@ -806,6 +832,11 @@ func (s *Service) Delete(ctx context.Context, name string, preserveData bool) er
 
 	}
 	for _, d := range deployments {
+		if d.LogPath == "" {
+			// Older records can predate managed log files; an empty path has
+			// nothing to remove and must not be resolved as the process CWD.
+			continue
+		}
 		if err := removeManagedPath(filepath.Join(s.opts.DataDir, "logs"), d.LogPath); err != nil {
 			return errors.New("could not safely remove an application log file")
 		}
@@ -936,49 +967,72 @@ func (s *Service) StageDurations(name, deploymentID string) (StageDurations, err
 }
 
 func stageDurations(deployment model.Deployment, events []model.Event) StageDurations {
-	first := make(map[model.EventType]time.Time)
-	for _, event := range events {
-		if _, ok := first[event.Type]; !ok {
-			first[event.Type] = event.CreatedAt
-		}
-	}
-	firstOf := func(types ...model.EventType) (time.Time, bool) {
-		for _, event := range events {
-			for _, kind := range types {
-				if event.Type == kind {
-					return event.CreatedAt, true
-				}
+	var result StageDurations
+	var buildStart, startupStart, readinessStart, healthPassed, deploymentEnd *time.Time
+	var buildMS, startupMS, readinessMS int64
+	var buildMeasured, startupMeasured, readinessMeasured bool
+	for i := range events {
+		event := events[i]
+		at := event.CreatedAt
+		switch event.Type {
+		case model.EventBuildStarted:
+			if buildStart == nil {
+				buildStart = &at
+			}
+		case model.EventBuildCompleted, model.EventBuildFailed:
+			if buildStart != nil && !at.Before(*buildStart) {
+				buildMS += at.Sub(*buildStart).Milliseconds()
+				buildMeasured = true
+				buildStart = nil
+			}
+		case model.EventSandboxStarting:
+			startupStart = &at
+		case model.EventSandboxStarted:
+			if startupStart != nil && !at.Before(*startupStart) {
+				startupMS += at.Sub(*startupStart).Milliseconds()
+				startupMeasured = true
+				startupStart = nil
+			}
+			readinessStart = &at
+		case model.EventHealthCheckFailed, model.EventHealthCheckPassed:
+			if readinessStart != nil && !at.Before(*readinessStart) {
+				readinessMS += at.Sub(*readinessStart).Milliseconds()
+				readinessMeasured = true
+				readinessStart = nil
+			}
+			if event.Type == model.EventHealthCheckPassed {
+				healthPassed = &at
+			}
+		case model.EventDeploymentSucceeded, model.EventDeploymentFailed:
+			if startupStart != nil && !at.Before(*startupStart) {
+				startupMS += at.Sub(*startupStart).Milliseconds()
+				startupMeasured = true
+				startupStart = nil
+			}
+			if readinessStart != nil && !at.Before(*readinessStart) {
+				readinessMS += at.Sub(*readinessStart).Milliseconds()
+				readinessMeasured = true
+				readinessStart = nil
+			}
+			if deploymentEnd == nil {
+				deploymentEnd = &at
 			}
 		}
-		return time.Time{}, false
 	}
-	var result StageDurations
-	if start, ok := first[model.EventBuildStarted]; ok {
-		if end, endOK := firstOf(model.EventBuildCompleted, model.EventBuildFailed); endOK && !end.Before(start) {
-			result.BuildMilliseconds = durationMS(end.Sub(start))
-		}
+	if buildMeasured {
+		result.BuildMilliseconds = &buildMS
 	}
-	if start, ok := first[model.EventSandboxStarting]; ok {
-		end, endOK := first[model.EventSandboxStarted]
-		if !endOK {
-			end, endOK = firstOf(model.EventDeploymentFailed)
-		}
-		if endOK && !end.Before(start) {
-			result.StartupMilliseconds = durationMS(end.Sub(start))
-		}
+	if startupMeasured {
+		result.StartupMilliseconds = &startupMS
 	}
-	if start, ok := first[model.EventSandboxStarted]; ok {
-		if end, endOK := firstOf(model.EventHealthCheckPassed, model.EventHealthCheckFailed); endOK && !end.Before(start) {
-			result.ReadinessMilliseconds = durationMS(end.Sub(start))
-		}
+	if readinessMeasured {
+		result.ReadinessMilliseconds = &readinessMS
 	}
-	if start, ok := first[model.EventHealthCheckPassed]; ok {
-		if end, endOK := firstOf(model.EventDeploymentSucceeded, model.EventDeploymentFailed); endOK && !end.Before(start) {
-			result.PromotionMilliseconds = durationMS(end.Sub(start))
-		}
+	if healthPassed != nil && deploymentEnd != nil && !deploymentEnd.Before(*healthPassed) {
+		result.PromotionMilliseconds = durationMS(deploymentEnd.Sub(*healthPassed))
 	}
-	if end, ok := firstOf(model.EventDeploymentSucceeded, model.EventDeploymentFailed); ok && !end.Before(deployment.CreatedAt) {
-		result.TotalMilliseconds = durationMS(end.Sub(deployment.CreatedAt))
+	if deploymentEnd != nil && !deploymentEnd.Before(deployment.CreatedAt) {
+		result.TotalMilliseconds = durationMS(deploymentEnd.Sub(deployment.CreatedAt))
 	}
 	return result
 }
@@ -993,30 +1047,25 @@ func (s *Service) LogsBySource(name, deploymentID, source string) (string, error
 	if err != nil {
 		return "", err
 	}
-	var logs string
 	switch source {
 	case "", "all":
 		return s.LogsForDeployment(name, deploymentID)
 	case "build":
-		logs, err = logTail(deployment.LogPath)
+		return s.redactedLogTail(name, deployment.LogPath)
 	case "runtime":
 		if deployment.SystemdUnit == "" || deployment.SandboxType != "systemd" {
 			return "", errors.New("runtime-specific logs are unavailable for this host runtime; build and runtime output share one log")
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-		logs, err = sandbox.JournalLogs(ctx, deployment.SystemdUnit)
+		logs, err := s.redactedJournalTail(ctx, name, deployment.SystemdUnit)
 		cancel()
+		if err != nil {
+			return "", err
+		}
+		return redactFilesystemPaths(logs), nil
 	default:
 		return "", errors.New("log source must be all, build, or runtime")
 	}
-	if err != nil {
-		return "", err
-	}
-	redacted, err := s.Redact(name, logs)
-	if err != nil {
-		return "", err
-	}
-	return redacted, nil
 }
 
 func validateBuildOptions(options contracts.DeployOptions) error {
@@ -1072,33 +1121,51 @@ func (s *Service) buildRequestOptions(name string, options contracts.DeployOptio
 	return result, nil
 }
 
-func (s *Service) healthProbeDue(deployment model.Deployment, now time.Time) (bool, int, int, int, error) {
+func (s *Service) healthProbeDue(deployment model.Deployment, now time.Time) (bool, *model.OperationSettings, error) {
 	settings, err := s.db.OperationSettings(deployment.AppName)
 	if err != nil {
-		return false, 0, 0, 0, err
+		return false, nil, err
 	}
 	if !settings.HealthProbeEnabled {
-		return false, 0, 0, 0, nil
+		return false, settings, nil
 	}
 	if settings.LastHealthCheckAt != nil && now.Sub(*settings.LastHealthCheckAt) < time.Duration(settings.HealthProbeIntervalSeconds)*time.Second {
-		return false, 0, 0, 0, nil
+		return false, settings, nil
 	}
-	return true, settings.HealthProbeTimeoutSeconds, settings.HealthFailureThreshold, settings.HealthFailureCount, nil
+	return true, settings, nil
 }
 
-func (s *Service) runHealthProbe(deployment model.Deployment, timeoutSeconds, failureThreshold, priorFailures int) {
+func (s *Service) runHealthProbe(deployment model.Deployment, expectedPolicy *model.OperationSettings) {
 	defer s.inflight.Done()
 	defer func() {
 		s.mu.Lock()
 		delete(s.healthProbes, deployment.ID)
 		s.mu.Unlock()
 	}()
-	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(timeoutSeconds)*time.Second)
-	err := health.Probe(ctx, deployment.Port, deployment.HealthPath, time.Duration(timeoutSeconds)*time.Second)
+	if expectedPolicy == nil {
+		return
+	}
+	timeout := time.Duration(expectedPolicy.HealthProbeTimeoutSeconds) * time.Second
+	ctx, cancel := context.WithTimeout(s.ctx, timeout)
+	err := health.Probe(ctx, deployment.Port, deployment.HealthPath, timeout)
 	cancel()
+	if s.ctx.Err() != nil {
+		return
+	}
+	// Serialize result publication with policy changes and other app operations.
+	// The network request intentionally runs without this lock, so the configured
+	// policy must be checked again after it completes.
+	unlockApp, lockErr := s.lockApp(s.ctx, deployment.AppName)
+	if lockErr != nil {
+		return
+	}
+	defer unlockApp()
 	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ctx.Err() != nil {
+		return
+	}
 	current, readErr := s.db.Deployment(deployment.ID)
 	if readErr != nil || current.State != model.Running {
 		return
@@ -1111,6 +1178,12 @@ func (s *Service) runHealthProbe(deployment model.Deployment, timeoutSeconds, fa
 	if settingsErr != nil {
 		return
 	}
+	currentPolicy, policyErr := s.db.OperationSettings(current.AppName)
+	if policyErr != nil || !sameHealthPolicy(currentPolicy, expectedPolicy) {
+		return
+	}
+	priorFailures := currentPolicy.HealthFailureCount
+	failureThreshold := currentPolicy.HealthFailureThreshold
 	if err == nil {
 		if err := s.db.UpdateHealthStatus(current.AppID, "healthy", 0, now); err != nil {
 			return
@@ -1139,6 +1212,23 @@ func (s *Service) runHealthProbe(deployment model.Deployment, timeoutSeconds, fa
 	s.queueAutomaticRestart(current.AppName, current.AppID, current.ID)
 }
 
+func sameHealthPolicy(current, expected *model.OperationSettings) bool {
+	if current == nil || expected == nil {
+		return false
+	}
+	if !current.HealthProbeEnabled ||
+		current.HealthProbeIntervalSeconds != expected.HealthProbeIntervalSeconds ||
+		current.HealthProbeTimeoutSeconds != expected.HealthProbeTimeoutSeconds ||
+		current.HealthFailureThreshold != expected.HealthFailureThreshold ||
+		current.HealthFailureCount != expected.HealthFailureCount {
+		return false
+	}
+	if current.LastHealthCheckAt == nil || expected.LastHealthCheckAt == nil {
+		return current.LastHealthCheckAt == nil && expected.LastHealthCheckAt == nil
+	}
+	return current.LastHealthCheckAt.Equal(*expected.LastHealthCheckAt)
+}
+
 func (s *Service) queueAutomaticRestart(name, appID, deploymentID string) {
 	if s.ctx.Err() != nil {
 		return
@@ -1156,6 +1246,35 @@ func (s *Service) queueAutomaticRestart(name, appID, deploymentID string) {
 	}
 	s.recordEvent(deploymentID, appID, model.EventAutomaticRestartScheduled, fmt.Sprintf("attempt=%d delay=%s", plan.Attempt, time.Until(*plan.RestartAt).Round(time.Second)))
 	s.scheduleAutomaticRestartAtLocked(name, appID, *plan.RestartAt)
+}
+
+func automaticRestartScheduleMatches(operations *model.OperationSettings, scheduledAt time.Time) bool {
+	return operations != nil && operations.AutomaticRestartEnabled && !operations.CrashLoop && operations.NextRestartAt != nil && operations.NextRestartAt.Equal(scheduledAt)
+}
+
+// retryAutomaticRestart only advances a failed timer attempt while its
+// original schedule is still current. A manual Start clears that schedule;
+// without this check a timer that was already waiting for the app lock could
+// undo the manual start by recording a new automatic attempt afterward.
+func (s *Service) retryAutomaticRestart(name, appID string, scheduledAt time.Time) {
+	if s.ctx.Err() != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.db.AppSettings(name)
+	if err != nil || !current.DesiredRunning {
+		return
+	}
+	operations, err := s.db.OperationSettings(name)
+	if err != nil || !automaticRestartScheduleMatches(operations, scheduledAt) || s.ctx.Err() != nil {
+		return
+	}
+	latest, err := s.db.LatestPromotedDeployment(name)
+	if err != nil {
+		return
+	}
+	s.queueAutomaticRestart(name, appID, latest.ID)
 }
 
 // scheduleAutomaticRestartAtLocked resumes a persisted backoff deadline. The
@@ -1180,21 +1299,12 @@ func (s *Service) scheduleAutomaticRestartAtLocked(name, appID string, restartAt
 		}
 		current, err := s.db.AppSettings(name)
 		operations, operationErr := s.db.OperationSettings(name)
-		if err != nil || operationErr != nil || !current.DesiredRunning || !operations.AutomaticRestartEnabled || operations.CrashLoop || operations.NextRestartAt == nil || !operations.NextRestartAt.Equal(restartAt) {
+		if err != nil || operationErr != nil || !current.DesiredRunning || !automaticRestartScheduleMatches(operations, restartAt) {
 			return
 		}
-		_, err = s.deployLatestPromoted(s.ctx, name)
+		_, err = s.deployLatestPromoted(s.ctx, name, restartAt)
 		if err != nil {
-			current, settingsErr := s.db.AppSettings(name)
-			operations, operationErr := s.db.OperationSettings(name)
-			if settingsErr == nil && operationErr == nil && current.DesiredRunning && operations.AutomaticRestartEnabled && !operations.CrashLoop && s.ctx.Err() == nil {
-				s.mu.Lock()
-				latest, latestErr := s.db.LatestPromotedDeployment(name)
-				if latestErr == nil {
-					s.queueAutomaticRestart(name, appID, latest.ID)
-				}
-				s.mu.Unlock()
-			}
+			s.retryAutomaticRestart(name, appID, restartAt)
 		}
 	}()
 }

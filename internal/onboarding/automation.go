@@ -39,9 +39,11 @@ func (m *Manager) CreateHook(ctx context.Context, name, branch string) (HookMeta
 	if isCommitRef(branch) {
 		return HookMetadata{}, "", errors.New("webhook hooks must target a branch name, not a commit")
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	settings, err := m.sources.get(name)
 	if err != nil {
-		return HookMetadata{}, "", ErrJobNotFound
+		return HookMetadata{}, "", savedSourceLookupError(err)
 	}
 	if err := source.ValidateGitHubCheckoutRequest(settings.RepoURL, branch, settings.RootDir); err != nil {
 		return HookMetadata{}, "", err
@@ -70,6 +72,8 @@ func (m *Manager) CreateHook(ctx context.Context, name, branch string) (HookMeta
 // ListHooks returns hook metadata without signing secrets.
 func (m *Manager) ListHooks(name string) ([]HookMetadata, error) {
 	m.ensureAutomationStores()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	state, err := m.protected.read()
 	if err != nil {
 		return nil, err
@@ -90,6 +94,8 @@ func (m *Manager) RevokeHook(id string) error {
 	if !validHookID(id) {
 		return errors.New("invalid webhook id")
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.protected.update(func(state *protectedState) error {
 		if _, ok := state.Hooks[id]; !ok {
 			return ErrJobNotFound
@@ -106,6 +112,8 @@ func (m *Manager) RegenerateHook(id string) (HookMetadata, string, error) {
 	if !validHookID(id) {
 		return HookMetadata{}, "", errors.New("invalid webhook id")
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var secretBytes [32]byte
 	if _, err := rand.Read(secretBytes[:]); err != nil {
 		return HookMetadata{}, "", errors.New("could not create webhook secret")
@@ -180,16 +188,6 @@ func (m *Manager) handleGitHubPush(w http.ResponseWriter, r *http.Request, id st
 		http.Error(w, "invalid webhook delivery", http.StatusBadRequest)
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxGitHubPushBody))
-	if err != nil {
-		status := http.StatusBadRequest
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			status = http.StatusRequestEntityTooLarge
-		}
-		http.Error(w, "invalid webhook body", status)
-		return
-	}
 	state, err := m.protected.read()
 	if err != nil {
 		http.Error(w, "webhook storage unavailable", http.StatusServiceUnavailable)
@@ -198,6 +196,16 @@ func (m *Manager) handleGitHubPush(w http.ResponseWriter, r *http.Request, id st
 	hook, ok := state.Hooks[id]
 	if !ok || !hook.Metadata.Active {
 		http.NotFound(w, r)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxGitHubPushBody))
+	if err != nil {
+		status := http.StatusBadRequest
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, "invalid webhook body", status)
 		return
 	}
 	if !verifyGitHubSignature(hook.Secret, r.Header.Get("X-Hub-Signature-256"), body) {
@@ -209,7 +217,7 @@ func (m *Manager) handleGitHubPush(w http.ResponseWriter, r *http.Request, id st
 		http.Error(w, "invalid push payload", http.StatusBadRequest)
 		return
 	}
-	job, duplicate, accepted, err := m.handlePush(r.Context(), hook, delivery, payload, state)
+	job, duplicate, accepted, err := m.handlePush(r.Context(), hook, delivery, payload)
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, ErrQueueFull) {
@@ -262,7 +270,7 @@ func (m *Manager) handleDeployHook(w http.ResponseWriter, r *http.Request, id st
 	}
 	_ = body // CI providers may send event metadata; it is not trusted for source selection.
 
-	settings, err := m.sources.get(hook.Metadata.Name)
+	settings, buildEnvironment, err := m.sourceAndBuildEnvironment(hook.Metadata.Name)
 	if err != nil {
 		http.Error(w, "saved webhook source is unavailable", http.StatusConflict)
 		return
@@ -309,9 +317,9 @@ func (m *Manager) handleDeployHook(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	request := DeployRequest{Name: hook.Metadata.Name, RepoURL: settings.RepoURL, Ref: hook.Metadata.Branch, RootDir: settings.RootDir,
-		Config: settings.Selection, BuildEnvironment: cloneStringMap(state.BuildEnvironment[hook.Metadata.Name]),
+		Config: settings.Selection, BuildEnvironment: buildEnvironment,
 		BuildTimeoutSeconds: settings.BuildTimeoutSeconds, IncludePaths: append([]string(nil), settings.IncludePaths...),
-		IgnorePaths: append([]string(nil), settings.IgnorePaths...), preserveSettings: true}
+		IgnorePaths: append([]string(nil), settings.IgnorePaths...), preserveSettings: true, explicitSelection: settings.ExplicitSelection}
 	job, duplicate, err := m.enqueueWithDedup(request, keys)
 	if err != nil || duplicate {
 		m.releaseReservation()
@@ -391,7 +399,7 @@ type githubPushCommit struct {
 	Removed  []string `json:"removed"`
 }
 
-func (m *Manager) handlePush(ctx context.Context, hook storedHook, delivery string, payload githubPushPayload, hookState protectedState) (Job, bool, bool, error) {
+func (m *Manager) handlePush(ctx context.Context, hook storedHook, delivery string, payload githubPushPayload) (Job, bool, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return Job{}, false, false, err
 	}
@@ -419,7 +427,7 @@ func (m *Manager) handlePush(ctx context.Context, hook storedHook, delivery stri
 	if err := source.ValidateGitHubCheckoutRequest(repoURL, payload.After, ""); err != nil {
 		return Job{}, false, false, errors.New("push commit or repository is invalid")
 	}
-	settings, err := m.sources.get(hook.Metadata.Name)
+	settings, buildEnvironment, err := m.sourceAndBuildEnvironment(hook.Metadata.Name)
 	if err != nil {
 		return Job{}, false, false, errors.New("saved webhook source is unavailable")
 	}
@@ -464,9 +472,9 @@ func (m *Manager) handlePush(ctx context.Context, hook storedHook, delivery stri
 		return Job{}, false, false, err
 	}
 	request := DeployRequest{Name: hook.Metadata.Name, RepoURL: settings.RepoURL, Ref: strings.ToLower(payload.After), RootDir: settings.RootDir,
-		Config: settings.Selection, BuildEnvironment: cloneStringMap(hookState.BuildEnvironment[hook.Metadata.Name]),
+		Config: settings.Selection, BuildEnvironment: buildEnvironment,
 		BuildTimeoutSeconds: settings.BuildTimeoutSeconds, IncludePaths: append([]string(nil), settings.IncludePaths...), IgnorePaths: append([]string(nil), settings.IgnorePaths...),
-		preserveSettings: true, requireCommitMatch: true}
+		preserveSettings: true, requireCommitMatch: true, explicitSelection: settings.ExplicitSelection}
 	job, duplicate, err := m.enqueueWithDedup(request, keys)
 	if err != nil || duplicate {
 		m.releaseReservation()
