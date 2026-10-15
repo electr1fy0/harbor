@@ -258,7 +258,8 @@
         showRepositories(form, result);
         return;
       } else if (result.id && result.state && ["submitOnboardingJob", "retryGitHubDeployment"].includes(form.dataset.api)) {
-        location.assign("/projects/" + encodeURIComponent(result.name) + "?tab=automation");
+        // A queued import may still be cloning and have no project record yet.
+        location.assign("/deployments");
       } else if (result.job) {
         report(form, [result.job.state, result.job.stage, result.job.error, ...(result.job.logs || [])].filter(Boolean).join("\n"));
       } else if (form.dataset.api === "getOnboardingJob") {

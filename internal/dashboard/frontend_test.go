@@ -56,6 +56,31 @@ func nativeTestAPI(t *testing.T) (http.Handler, *[]string) {
 	}), &calls
 }
 
+func TestRepositoryJobsLinkOnlyToCreatedProjects(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		state      string
+		deployment any
+		wantURL    string
+	}{
+		{name: "queued import", state: "QUEUED"},
+		{name: "cloning import", state: "RUNNING"},
+		{name: "failed checkout", state: "FAILED"},
+		{name: "build started", state: "RUNNING", deployment: map[string]any{"ID": "dep_building"}, wantURL: "/projects/demo"},
+		{name: "failed runtime", state: "FAILED", deployment: map[string]any{"ID": "dep_failed"}, wantURL: "/projects/demo"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			section := jobsSection(map[string]any{"jobs": []any{map[string]any{
+				"id": "job_demo", "name": "demo", "state": tc.state, "deployment": tc.deployment,
+			}}})
+			project := section.Table.Rows[0].Cells[0]
+			if project.Text != "demo" || project.URL != tc.wantURL {
+				t.Fatalf("project cell = %+v, want name demo and URL %q", project, tc.wantURL)
+			}
+		})
+	}
+}
+
 func TestNativePagesRenderDataAndKeepReadOperationsReadOnly(t *testing.T) {
 	api, calls := nativeTestAPI(t)
 	handler, err := NewHandler(api, ui.Assets, testConfig(ModeLocal))

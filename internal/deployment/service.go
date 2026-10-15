@@ -577,6 +577,9 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 		}
 		d.Port = port
 		defaultPath := "/usr/local/bin:/usr/bin:/bin"
+		if runtime.GOOS == "darwin" {
+			defaultPath = "/opt/homebrew/bin:" + defaultPath
+		}
 		if home, err := os.UserHomeDir(); err == nil {
 			defaultPath = filepath.Join(home, ".local", "bin") + ":" + defaultPath
 		}

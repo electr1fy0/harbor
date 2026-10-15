@@ -112,15 +112,6 @@ func BuildBwrapArgs(spec contracts.SandboxSpec) ([]string, error) {
 		}
 	}
 
-	// Mount additional bind mounts (e.g. persistent service volumes).
-	for _, bind := range spec.Binds {
-		if bind.ReadOnly {
-			args = append(args, "--ro-bind", bind.HostPath, bind.MountPath)
-		} else {
-			args = append(args, "--bind", bind.HostPath, bind.MountPath)
-		}
-	}
-
 	if artifactDir != "" {
 		args = append(args,
 			"--dir", "/app",
@@ -134,6 +125,14 @@ func BuildBwrapArgs(spec contracts.SandboxSpec) ([]string, error) {
 		"--proc", "/proc",
 		"--dev", "/dev",
 	)
+	// Install service volumes after tmpfs so bindings under /tmp remain visible.
+	for _, bind := range spec.Binds {
+		if bind.ReadOnly {
+			args = append(args, "--ro-bind", bind.HostPath, bind.MountPath)
+		} else {
+			args = append(args, "--bind", bind.HostPath, bind.MountPath)
+		}
+	}
 
 	// Expose only runtime resolver/certificate data, not host credentials in /etc.
 	for _, path := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/ssl/certs", "/etc/ca-certificates"} {

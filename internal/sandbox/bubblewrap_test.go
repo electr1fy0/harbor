@@ -81,6 +81,13 @@ func TestBubblewrapMountIsolationAndTmpfs(t *testing.T) {
 	if err := os.WriteFile(markerFile, []byte("hello read-only"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	volumeDir := sandboxArtifactDir(t)
+	if err := os.Chmod(volumeDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(volumeDir, "marker"), []byte("persistent"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	sbx, err := NewBubblewrap()
 	if err != nil {
@@ -97,8 +104,9 @@ func TestBubblewrapMountIsolationAndTmpfs(t *testing.T) {
 		Dir: tmpDir,
 		Command: []string{
 			"/bin/sh", "-c",
-			`if touch /app/new_file 2>/dev/null; then exit 10; fi && touch /tmp/new_file && exit 0`,
+			`if touch /app/new_file 2>/dev/null; then exit 10; fi && touch /tmp/new_file && test "$(cat /tmp/managed/marker)" = persistent && printf saved > /tmp/managed/result`,
 		},
+		Binds:   []contracts.BindMount{{HostPath: volumeDir, MountPath: "/tmp/managed"}},
 		Env:     []string{"PATH=/bin:/usr/bin"},
 		LogPath: logPath,
 	}
@@ -129,6 +137,9 @@ func TestBubblewrapMountIsolationAndTmpfs(t *testing.T) {
 	if info.ExitCode == nil || *info.ExitCode != 0 {
 		logContent, _ := os.ReadFile(logPath)
 		t.Fatalf("expected exit code 0, got %v; logs: %s", info.ExitCode, string(logContent))
+	}
+	if result, err := os.ReadFile(filepath.Join(volumeDir, "result")); err != nil || string(result) != "saved" {
+		t.Fatalf("persistent volume write = %q, %v; want saved", result, err)
 	}
 }
 

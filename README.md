@@ -195,7 +195,7 @@ Each running application is isolated using Bubblewrap (`bwrap`) executed inside 
 
 ### Linux Host
 
-Harbor is designed and verified for Debian 12 (Bookworm) and Ubuntu 22.04 / 24.04 LTS:
+Harbor targets Debian 12 (Bookworm) and Ubuntu 22.04 LTS or newer with these prerequisites:
 
 - **Linux Kernel**: cgroup v2 unified hierarchy enabled (`/sys/fs/cgroup/cgroup.controllers`).
 - **Init System**: systemd as PID 1.
@@ -206,13 +206,23 @@ Harbor is designed and verified for Debian 12 (Bookworm) and Ubuntu 22.04 / 24.0
   - `bwrap` (Bubblewrap 0.4.1+)
   - `systemd`, `systemd-sysv`, `curl`
   - `apparmor`, `apparmor-utils` (if user namespace restrictions are enabled)
+- **Node Application Packages**: Linux Node.js 22+ and `npm`, installed system-wide
+  (for example with `sudo apt install nodejs npm`). These are needed to deploy
+  Node applications; the dashboard itself does not need Node. An installation
+  under a user's `nvm` directory or a Windows `node.exe` is not available to the
+  dedicated Linux runtime account inside Bubblewrap.
 - **Production Package (Optional)**: Caddy (v2.11+) for public HTTPS reverse proxying.
 
 ### WSL 2 (Windows Subsystem for Linux)
 
-Harbor runs inside WSL 2 with Ubuntu provided systemd and cgroup v2 are active:
+Use WSL 2 with Ubuntu, systemd, and the `cpu`, `memory`, and `pids` cgroup v2
+controllers. Run these commands inside Ubuntu unless marked PowerShell.
 
-1. Confirm systemd is running as PID 1:
+1. Confirm the distribution uses WSL 2 from **PowerShell**:
+   ```powershell
+   wsl --list --verbose
+   ```
+   The Ubuntu distribution must show version `2`. Confirm systemd is PID 1 inside Ubuntu:
    ```sh
    ps -p 1 -o comm=
    # Must output: systemd
@@ -222,12 +232,76 @@ Harbor runs inside WSL 2 with Ubuntu provided systemd and cgroup v2 are active:
    [boot]
    systemd=true
    ```
-   Then restart WSL from PowerShell (`wsl --shutdown`).
+   Merge these settings into the existing file. Then run `wsl --shutdown` from
+   **PowerShell** and reopen Ubuntu. This stops all running WSL distributions.
+   See Microsoft's [systemd setup instructions](https://learn.microsoft.com/en-us/windows/wsl/systemd).
 2. Verify cgroup v2 availability:
    ```sh
-   test -f /sys/fs/cgroup/cgroup.controllers && echo "cgroup v2 available"
+   cat /sys/fs/cgroup/cgroup.controllers
    ```
-3. Always keep your checkout inside the Linux filesystem (e.g., `~/harbor`), **never** under `/mnt/c/`.
+   The output must include `cpu`, `memory`, and `pids`.
+3. Install Linux dependencies, including the Node demo's runtime:
+   ```sh
+   sudo apt update
+   sudo apt install -y build-essential git curl bubblewrap systemd systemd-sysv apparmor apparmor-utils python3 nodejs npm
+   ```
+   If Ubuntu's package provides Node older than 22, install a current
+   [Node.js LTS Linux build](https://nodejs.org/en/download) system-wide under
+   `/usr/local` before continuing.
+   Install Go 1.23+ system-wide using the [official Go instructions](https://go.dev/doc/install).
+   Both your shell and `sudo` must find Go, Node, and npm:
+   ```sh
+   go version
+   node --version
+   npm --version
+   sudo go version
+   sudo node --version
+   sudo npm --version
+   ```
+   For Go under `/usr/local/go`, ensure `/usr/local/bin/go` points to its
+   executable so `sudo` and the unprivileged build process can find it.
+4. Keep the checkout inside the Linux filesystem, such as `~/harbor`, rather than `/mnt/c/`:
+   ```sh
+   cd ~
+   git clone https://github.com/electr1fy0/harbor.git
+   cd harbor
+   make build
+   sudo ./scripts/setup-linux.sh
+   ```
+5. Run the suites sequentially before the demo. Use root for the Linux suites
+   so deployment tests use the system manager rather than requiring delegation
+   to a user systemd manager:
+   ```sh
+   sudo -H make test
+   sudo -H go test -race ./...
+   make test-privileged
+   ```
+   The privileged suite includes real Node and Go deployments through systemd
+   and Bubblewrap, HTTP readiness, routing, concurrent traffic, and stop checks.
+   Some unprivileged Linux probes can skip when user-systemd delegation is
+   unavailable; a skip does not verify that capability. The privileged suite
+   must pass on the target WSL installation.
+6. Start Harbor in one Ubuntu terminal:
+   ```sh
+   sudo ./bin/paasd
+   ```
+   In another Ubuntu terminal, deploy and query the Node demo:
+   ```sh
+   sudo ./bin/paas deploy ./examples/hello-node --name hello-node
+   curl -H 'Host: hello-node.localhost' http://127.0.0.1:8080/
+   curl -H 'Host: hello-node.localhost' http://127.0.0.1:8080/health
+   ```
+   Expect `hello from harbor node` and `ok`. Open `http://localhost:3000` in
+   your Windows browser for the dashboard. For GitHub import, enter this
+   repository's HTTPS URL, leave the branch blank to use its default, and set
+   the root directory to `examples/hello-node`. Import opens the Deployments
+   page while the repository is being prepared.
+
+Windows can access WSL web applications through localhost; see Microsoft's
+[networking guide](https://learn.microsoft.com/en-us/windows/wsl/networking).
+The curl commands above set the hostname explicitly and need no Windows hosts-file edit.
+Actual WSL acceptance remains unverified until the suites pass on a Windows WSL host;
+macOS tests or an ordinary Linux VM do not establish that result.
 
 ### macOS Development
 
@@ -359,7 +433,7 @@ build:
 # Start instructions
 start:
   # For Go: must be exactly "/app/server"
-  # For Node: command to execute (e.g., "node /app/server.js")
+  # For Node: command to execute (e.g., "node server.js")
   command: /app/server
 
 # Runtime resource limits (optional; defaults shown)
@@ -388,8 +462,10 @@ Harbor's memory parser accepts positive binary byte values:
 - **CGO & SQLite**: By default, the builder injects `CGO_ENABLED=0` into the build environment. If your Go application relies on CGO (such as `github.com/mattn/go-sqlite3`), prefix the build command with `CGO_ENABLED=1`:
   ```yaml
   build:
-    command: CGO_ENABLED=1 go build -o "$PAAS_OUT/server" main.go
+    command: CGO_ENABLED=1 CGO_CFLAGS="-O1 -g0" GOMEMLIMIT=128MiB go build -o "$PAAS_OUT/server" main.go
   ```
+  The bundled SQLite example lowers C compiler optimization, omits C debug
+  symbols, and sets Go's memory target so cold builds fit the 512 MiB build unit.
 - **Port Binding**: The application must read the `PORT` environment variable and bind to `127.0.0.1:$PORT`.
 
 ### Node.js Application Contract
@@ -398,8 +474,12 @@ Harbor's memory parser accepts positive binary byte values:
 - **Start Command**: `start.command` can be any valid shell invocation, such as:
   ```yaml
   start:
-    command: node /app/server.js
+    command: node server.js
   ```
+  The working directory is the release app directory (`/app` inside the Linux
+  sandbox). Relative entry points work on Linux/WSL and macOS host mode;
+  absolute `/app/...` paths require the Linux sandbox mount. Apps must honor
+  Harbor's injected `PORT` and bind to `127.0.0.1`.
 - **Symlink Validation**: Package manager symlinks (e.g., `node_modules/.bin`) are preserved during artifact copy, but are strictly validated before publication. Any symlink with an absolute target or one that escapes `/app` will fail the deployment.
 
 ### Environment Variables (Build vs. Runtime)

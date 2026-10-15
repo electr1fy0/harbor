@@ -63,7 +63,11 @@ func jobsSection(data map[string]any) ui.Section {
 		id := str(j, "id")
 		name := str(j, "name")
 		state := str(j, "state")
-		row := ui.Row{Cells: []ui.Cell{{Text: name, URL: projectURL(name, "")}, {Text: shortID(id)}, {Text: state, Badge: state}, {Text: str(j, "stage")}, {Text: date(j["updatedAt"])}}}
+		project := ui.Cell{Text: name}
+		if str(obj(j["deployment"]), "ID") != "" {
+			project.URL = projectURL(name, "")
+		}
+		row := ui.Row{Cells: []ui.Cell{project, {Text: shortID(id)}, {Text: state, Badge: state}, {Text: str(j, "stage")}, {Text: date(j["updatedAt"])}}}
 		row.Actions = append(row.Actions, ui.Form{ID: "job-" + id, Function: "getOnboardingJob", Submit: "View logs", Inline: true, Fields: []ui.Field{hidden("id", id)}})
 		if state == "RUNNING" || state == "QUEUED" {
 			row.Actions = append(row.Actions, ui.Form{ID: "cancel-job-" + id, Function: "cancelOnboardingJob", Submit: "Cancel", Inline: true, Fields: []ui.Field{hidden("id", id)}})

@@ -3,7 +3,7 @@ runtime: node
 build:
   command: npm run build
 start:
-  command: node /app/server.js
+  command: node server.js
 resources:
   memory: 128Mi
   cpu: 0.5

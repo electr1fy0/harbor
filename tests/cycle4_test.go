@@ -24,8 +24,16 @@ import (
 )
 
 func TestCycle4NodeDeploymentAndConcurrency(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("skipping Linux-only Cycle 4 integration test")
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("Node deployment acceptance requires Linux or macOS")
+	}
+	for _, tool := range []string{"node", "npm"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			if runtime.GOOS == "darwin" {
+				t.Skipf("Node deployment acceptance requires %s", tool)
+			}
+			t.Fatalf("Node deployment acceptance requires system-wide %s: %v", tool, err)
+		}
 	}
 
 	root, err := filepath.Abs("..")
@@ -38,7 +46,15 @@ func TestCycle4NodeDeploymentAndConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = os.RemoveAll(work)
+		_ = filepath.WalkDir(work, func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				return os.Chmod(path, 0700)
+			}
+			return err
+		})
+		if err := os.RemoveAll(work); err != nil {
+			t.Errorf("clean Node acceptance workspace: %v", err)
+		}
 	})
 	_ = os.Chmod(work, 0755)
 
@@ -198,8 +214,12 @@ func TestCycle4NodeDeploymentAndConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inspect nodeapp failed: %v: %s", err, inspectOut)
 	}
-	if !strings.Contains(inspectOut, "PID isolation:     yes") {
-		t.Errorf("inspect missing PID isolation: %s", inspectOut)
+	wantIsolation := "no"
+	if runtime.GOOS == "linux" {
+		wantIsolation = "yes"
+	}
+	if !strings.Contains(inspectOut, "PID isolation:     "+wantIsolation) {
+		t.Errorf("inspect missing expected PID isolation %q: %s", wantIsolation, inspectOut)
 	}
 
 	// 7. Stop nodeapp and goapp
