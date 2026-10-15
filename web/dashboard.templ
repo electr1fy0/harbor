@@ -1,0 +1,339 @@
+package web
+
+templ Dashboard(p Page) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<meta name="theme-color" content="#f4f7f5"/>
+			<title>{ p.TitleText() }</title>
+			<link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+			<link rel="stylesheet" href={ templ.SafeURL(p.CSS) }/>
+			<script src={ templ.SafeURL(p.JS) } defer></script>
+		</head>
+		<body data-page={ p.Path } data-project={ p.Name }>
+			<a class="skip-link" href="#main">Skip to content</a>
+			if p.Login() {
+				<main id="main" class="login">
+					@brand()
+					<section class="card">
+						<h1>Welcome back</h1>
+						<p>Sign in to manage your applications.</p>
+						if p.Public {
+							@actionForm(Form{ID: "login", Function: "auth/login", Submit: "Sign in", Redirect: "/", Fields: []Field{{Name: "password", Label: "Administrator password", Type: "password", Required: true}}})
+						} else {
+							<p>Local access is enabled on this machine.</p>
+							<a class="button" href="/">Open dashboard</a>
+						}
+					</section>
+				</main>
+			} else {
+				<aside class="sidebar">
+					@brand()
+					<nav aria-label="Main navigation">
+						for _, l := range p.Nav {
+							<a href={ templ.SafeURL(l.URL) } class={ templ.KV("active",l.Active),templ.KV("nav-settings",l.URL=="/settings") } aria-current={ current(l.Active) }>
+								@navIcon(l.URL)
+								<span>{ l.Label }</span>
+							</a>
+						}
+					</nav>
+					if p.Public {
+						<div class="sidebar-foot">
+							@actionForm(Form{ID: "logout", Function: "auth/logout", Submit: "Sign out", Redirect: "/login", Inline: true})
+						</div>
+					}
+				</aside>
+				<main id="main" class={ "workspace",templ.KV("import-workspace",p.Path=="/new") }>
+					<header class="page-header">
+						<div>
+							<h1>{ p.Title }</h1>
+							if p.Description!="" {
+								<p>{ p.Description }</p>
+							}
+						</div>
+						<div class="header-actions">
+							if p.Path!="/new" {
+								<button class="icon-button secondary" type="button" data-refresh aria-label="Refresh status">
+									@refreshIcon()
+								</button>
+							}
+							for _, l := range p.HeaderLinks {
+								<a class={ "button",templ.KV("secondary",p.Path=="/new") } href={ templ.SafeURL(l.URL) }>{ l.Label }</a>
+							}
+						</div>
+					</header>
+					if len(p.Tabs)>0 {
+						<nav class="tabs" aria-label="Page sections">
+							for _, l := range p.Tabs {
+								<a href={ templ.SafeURL(l.URL) } class={ templ.KV("active", l.Active) } aria-current={ current(l.Active) }>{ l.Label }</a>
+							}
+						</nav>
+					}
+					<div id="refresh-error" role="status" class="notice bad" hidden></div>
+					if p.Error!="" {
+						<div role="alert" class="notice bad"><p>{ p.Error }</p><a href={ templ.SafeURL(p.Path) }>Try again</a></div>
+					}
+					<noscript><p class="notice">Reload to update status. Enable JavaScript to use project actions.</p></noscript>
+					if p.Path=="/new" {
+						<ol class="import-steps" aria-label="Import progress">
+							<li class="current" data-step="source"><span>1</span>Choose repository</li>
+							<li data-step="review"><span>2</span>Review settings</li>
+							<li data-step="deploy"><span>3</span>Deploy</li>
+						</ol>
+					}
+					for _, s := range p.Sections {
+						if s.ID=="projects" {
+							if p.ShowProjectFilters {
+								<form class="filter-bar" method="get" action="/" data-filter>
+									<label class="search-field"><span class="sr-only">Search projects</span><input type="search" name="q" value={ p.Filter.Query } placeholder="Search projects by name or tag"/></label>
+									<label class="check"><input type="checkbox" name="favorites" value="1" checked?={ p.Filter.Favorites }/>Favorites</label>
+									<label class="check"><input type="checkbox" name="archived" value="1" checked?={ p.Filter.Archived }/>Include archived</label>
+									<button class="secondary" type="submit">Filter</button>
+									if p.Filter.Query!="" || p.Filter.Favorites || p.Filter.Archived {
+										<a href="/">Clear filters</a>
+									}
+								</form>
+							}
+						}
+						@section(s)
+					}
+					if len(p.Forms)>0 {
+						<div class="form-grid">
+							for _, f := range p.Forms {
+								@formPanel(f)
+							}
+						</div>
+					}
+				</main>
+			}
+			<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+		</body>
+	</html>
+}
+
+templ section(s Section) {
+	<section class={ "card",templ.KV("compact-section",s.Compact) } id={ s.ID }>
+		<div data-live={ s.ID }>
+			<div class="section-heading"><h2>{ s.Title }</h2></div>
+			if s.Description!="" {
+				<p>{ s.Description }</p>
+			}
+			if s.Text!="" {
+				<p class="preserve">{ s.Text }</p>
+			}
+			if len(s.Metrics)>0 {
+				<dl class="metrics">
+					for _, m := range s.Metrics {
+						<div>
+							<dt>{ m.Label }</dt>
+							<dd>{ m.Value }</dd>
+							if m.Detail!="" {
+								<small>{ m.Detail }</small>
+							}
+						</div>
+					}
+				</dl>
+			}
+			if len(s.Chart)>0 {
+				<svg viewBox="0 0 600 120" role="img" aria-label={ s.Title } class="chart">
+					for _, pt := range s.Chart {
+						<circle cx={ fmtFloat(pt.X) } cy={ fmtFloat(pt.Y) } r="3" fill="currentColor"><title>{ pt.Label }</title></circle>
+					}
+				</svg>
+			}
+			if len(s.Table.Headers)>0 {
+				@dataTable(s.Table)
+			}
+			if s.Log!="" {
+				<pre class="logs">{ s.Log }</pre>
+			}
+			if len(s.Links)>0 {
+				<div class="toolbar">
+					for _, l := range s.Links {
+						<a class="button secondary" href={ templ.SafeURL(l.URL) }>{ l.Label }</a>
+					}
+				</div>
+			}
+			if len(s.Actions)>0 {
+				<div class="section-actions">
+					for _, f := range s.Actions {
+						@actionForm(f)
+					}
+				</div>
+			}
+		</div>
+	</section>
+}
+
+templ dataTable(t Table) {
+	if len(t.Rows)==0 {
+		<div class="empty-state">
+			<img src="/favicon.svg" alt="" width="44" height="44"/>
+			if t.EmptyTitle!="" {
+				<h3>{ t.EmptyTitle }</h3>
+			}
+			<p>{ t.Empty }</p>
+			for _, l := range t.EmptyLinks {
+				<a class="button secondary" href={ templ.SafeURL(l.URL) }>{ l.Label }</a>
+			}
+		</div>
+	} else {
+		<div class="table-scroll">
+			<table>
+				<thead>
+					<tr>
+						for _, h := range t.Headers {
+							<th scope="col">{ h }</th>
+						}
+					</tr>
+				</thead>
+				<tbody>
+					for _, row := range t.Rows {
+						<tr>
+							for _, c := range row.Cells {
+								<td>
+									if c.URL!="" {
+										<a href={ templ.SafeURL(c.URL) }>{ c.Text }</a>
+									} else if c.Badge!="" {
+										<span class={ "badge",StatusClass(c.Badge) }>{ StatusLabel(c.Text) }</span>
+									} else {
+										<span class="preserve">{ c.Text }</span>
+									}
+									if c.Detail!="" {
+										<small class="cell-detail">{ c.Detail }</small>
+									}
+								</td>
+							}
+							if len(row.Actions)>0 {
+								<td class="row-actions">
+									for _, f := range row.Actions {
+										@actionForm(f)
+									}
+								</td>
+							}
+						</tr>
+					}
+				</tbody>
+			</table>
+		</div>
+	}
+}
+
+templ formPanel(f Form) {
+	if f.Collapsible {
+		<details class={ "card","form-card","disclosure-card",templ.KV("danger-zone",f.Danger) }>
+			<summary><span>{ f.Title }</span><span class="disclosure-chevron" aria-hidden="true">⌄</span></summary>
+			@actionForm(f)
+		</details>
+	} else {
+		<section class={ "card","form-card",templ.KV("danger-zone",f.Danger) }>
+			@actionForm(f)
+		</section>
+	}
+}
+
+templ actionForm(f Form) {
+	<form id={ f.ID } data-api={ f.Function } data-action={ f.Action } data-confirm={ f.Confirm } data-redirect={ f.Redirect } data-unavailable={ f.Unavailable } data-success={ f.Success } class={ "action-form",templ.KV("inline",f.Inline) } aria-describedby={ f.ResultID() }>
+		<div class="form-layout">
+			if (f.Title!="" && !f.Collapsible) || f.Description!="" {
+				<div class="form-description">
+					if f.Title!="" && !f.Collapsible {
+						<h2>{ f.Title }</h2>
+					}
+					if f.Description!="" {
+						<p>{ f.Description }</p>
+					}
+				</div>
+			}
+			<div class="form-controls">
+				@formFields(f, f.PrimaryFields())
+				if f.Inspect {
+					<div class="toolbar form-actions"><button type="button" data-inspect>Inspect repository</button></div>
+					<div id={ f.ResultID() } class="form-result" role="status" aria-live="polite"></div>
+				}
+				for _, group := range f.FieldGroups() {
+					<details class="field-group" data-review={ fmtBool(f.Inspect && group.Label == "Build settings") }>
+						<summary>{ group.Label }<span class="disclosure-chevron" aria-hidden="true">⌄</span></summary>
+						@formFields(f, group.Fields)
+					</details>
+				}
+				if f.Unavailable!="" {
+					<p class="form-help" data-unavailable-hint>{ f.Unavailable }</p>
+				}
+				<div class="toolbar form-actions">
+					<button type="submit" class={ templ.KV("danger", f.Danger) } disabled?={ f.Disabled } hidden?={ f.Inspect }>{ f.Submit }</button>
+					for _, l := range f.Links {
+						<a href={ templ.SafeURL(l.URL) }>{ l.Label }</a>
+					}
+				</div>
+				if !f.Inspect {
+					<div id={ f.ResultID() } class="form-result" role="status" aria-live="polite"></div>
+				}
+			</div>
+		</div>
+	</form>
+}
+
+templ formFields(f Form, fields []Field) {
+	<div class="form-fields">
+		for _, v := range fields {
+			if v.Type=="hidden" {
+				<input type="hidden" name={ v.Name } value={ v.Value }/>
+			} else {
+				<label for={ v.TextID(f.ID) } class={ templ.KV("check",v.Type=="checkbox"),templ.KV("field-wide",v.Wide()) }>
+					if v.Type=="checkbox" {
+						<input id={ v.TextID(f.ID) } type="checkbox" name={ v.Name } checked?={ v.Checked } data-type="bool"/>{ v.Label }
+					} else {
+						<span>
+							{ v.Label }
+							if !v.Required {
+								<small class="optional">Optional</small>
+							}
+						</span>
+						if v.Type=="select" {
+							<select id={ v.TextID(f.ID) } name={ v.Name } required?={ v.Required } data-omit-empty={ fmtBool(v.OmitEmpty) }>
+								for _, opt := range v.Options {
+									<option value={ opt.Value } selected?={ opt.Value==v.Value }>{ opt.Label }</option>
+								}
+							</select>
+						} else if v.Type=="textarea" || v.Type=="env" || v.Type=="list" {
+							<textarea id={ v.TextID(f.ID) } name={ v.Name } placeholder={ v.Placeholder } required?={ v.Required } data-type={ v.Type } data-omit-empty={ fmtBool(v.OmitEmpty) } rows="3">{ v.Value }</textarea>
+						} else {
+							<input id={ v.TextID(f.ID) } type={ v.InputType() } name={ v.Name } value={ v.Value } placeholder={ v.Placeholder } required?={ v.Required } min={ v.Min } max={ v.Max } step={ v.Step } data-type={ v.Type } data-omit-empty={ fmtBool(v.OmitEmpty) } autocomplete={ autocomplete(v.Type) }/>
+						}
+					}
+					if v.Help!="" {
+						<small class="field-help">{ v.Help }</small>
+					}
+				</label>
+			}
+		}
+	</div>
+}
+
+templ brand() {
+	<a class="brand" href="/" aria-label="Harbor home"><img src="/favicon.svg" width="36" height="36" alt=""/><span>Harbor</span></a>
+}
+
+templ refreshIcon() {
+	<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"></path><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"></path></svg>
+}
+
+templ navIcon(path string) {
+	<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+		switch path {
+			case "/":
+				<rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect>
+			case "/deployments":
+				<path d="M12 16V3m-5 5 5-5 5 5M4 15v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"></path>
+			case "/services":
+				<ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"></path>
+			case "/capacity":
+				<path d="M4 20V12h4v8m2 0V4h4v16m2 0V9h4v11"></path>
+			default:
+				<path d="M4 7h16M4 17h16"></path><circle cx="9" cy="7" r="3" fill="var(--sidebar)"></circle><circle cx="15" cy="17" r="3" fill="var(--sidebar)"></circle>
+		}
+	</svg>
+}

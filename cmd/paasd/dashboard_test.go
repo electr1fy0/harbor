@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-
-	webassets "paas/web"
 )
 
 func localDashboardEnv(t *testing.T) {
@@ -40,9 +38,6 @@ func TestDashboardListenerInProcessAndConfigFailure(t *testing.T) {
 		t.Fatal("partial public configuration accepted")
 	}
 	t.Setenv("PAASD_PUBLIC_ORIGIN", "")
-	if webassets.HasPlaceholderAssets() {
-		t.Skip("run make build before testing the compiled frontend listener")
-	}
 	// The fake handler represents the private control API. No Unix socket is
 	// created, so a successful overview proves direct in-process dispatch.
 	calls := make(chan string, 4)

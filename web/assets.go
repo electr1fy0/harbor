@@ -1,20 +1,9 @@
 package web
 
-import (
-	"embed"
-	"io/fs"
-)
+import "embed"
 
-// Assets contains the production frontend distribution. The committed
-// .gitkeep keeps `go test ./...` working in a fresh checkout; NewHandler
-// refuses to serve it until the frontend build has produced index.html.
+// Assets contains the browser assets. templ components compile directly into
+// Go; no JavaScript toolchain or frontend build is required.
 //
-//go:embed all:dist
+//go:embed assets favicon.svg
 var Assets embed.FS
-
-// HasPlaceholderAssets reports whether the source-tree scaffold has not yet
-// been replaced with a frontend build.
-func HasPlaceholderAssets() bool {
-	_, err := fs.Stat(Assets, "dist/index.html")
-	return err != nil
-}

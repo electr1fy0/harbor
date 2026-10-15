@@ -1,9 +1,2 @@
-node_modules
 .DS_Store
-dist
 *.local
-.output
-.tanstack
-
-# typescript
-*.tsbuildinfo

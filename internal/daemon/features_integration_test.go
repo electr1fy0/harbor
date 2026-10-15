@@ -22,7 +22,7 @@ import (
 	managedservice "paas/internal/service"
 	"paas/internal/store"
 
-	"testing/fstest"
+	webassets "paas/web"
 )
 
 // featureGatewayFixture deliberately assembles the same in-process route stack
@@ -54,7 +54,7 @@ func newFeatureGatewayFixture(t *testing.T) *featureGatewayFixture {
 	services := managedservice.NewManager(state, filepath.Join(root, "data"))
 	server := NewPlatformServerWithServices("", appService, services)
 	api := dashboard.NewAPI(server.http.Handler)
-	assets := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<!doctype html><title>Harbor test</title>")}}
+	assets := webassets.Assets
 	handler, err := dashboard.NewHandlerWithHooks(api, assets, dashboard.Config{Mode: dashboard.ModeLocal}, server.PublicHooks())
 	if err != nil {
 		_ = server.Shutdown(context.Background())

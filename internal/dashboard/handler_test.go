@@ -27,10 +27,11 @@ func testConfig(mode Mode) Config {
 
 func testAssets() fstest.MapFS {
 	return fstest.MapFS{
-		"index.html":    &fstest.MapFile{Data: []byte("<!doctype html><title>Harbor</title>")},
-		"assets/app.js": &fstest.MapFile{Data: []byte("console.log('harbor')")},
-		"favicon.svg":   &fstest.MapFile{Data: []byte("<svg></svg>")},
-		"robots.txt":    &fstest.MapFile{Data: []byte("User-agent: *\nDisallow:\n")},
+		"index.html":     &fstest.MapFile{Data: []byte("<!doctype html><title>Harbor</title>")},
+		"assets/app.css": &fstest.MapFile{Data: []byte("body { color: black; }")},
+		"assets/app.js":  &fstest.MapFile{Data: []byte("console.log('harbor')")},
+		"favicon.svg":    &fstest.MapFile{Data: []byte("<svg></svg>")},
+		"robots.txt":     &fstest.MapFile{Data: []byte("User-agent: *\nDisallow:\n")},
 	}
 }
 
@@ -86,12 +87,12 @@ func TestConfigFromEnvFailsClosedOnPartialPublicSettings(t *testing.T) {
 	}
 }
 
-func TestNewHandlerRequiresBuiltFrontendIndex(t *testing.T) {
+func TestNewHandlerRequiresEmbeddedBrowserAssets(t *testing.T) {
 	_, err := NewHandler(http.NotFoundHandler(), fstest.MapFS{
 		".gitkeep": &fstest.MapFile{Data: []byte("compile scaffold")},
 	}, testConfig(ModeLocal))
-	if err == nil || !strings.Contains(err.Error(), "build web/dist") {
-		t.Fatalf("NewHandler error = %v, want a clear frontend-build error", err)
+	if err == nil || !strings.Contains(err.Error(), "dashboard browser asset is missing") {
+		t.Fatalf("NewHandler error = %v, want a clear missing-asset error", err)
 	}
 }
 
@@ -151,10 +152,10 @@ func TestPublicStaticRoutesAndMissingFiles(t *testing.T) {
 				t.Fatalf("Location = %q, want %q", got.Header().Get("Location"), test.wantLocation)
 			}
 			if test.path == "/login" && !strings.Contains(got.Body.String(), "Harbor") {
-				t.Fatalf("login page did not serve index.html: %s", got.Body.String())
+				t.Fatalf("login page did not render: %s", got.Body.String())
 			}
-			if strings.HasPrefix(test.path, "/assets/") && test.wantStatus == http.StatusOK && got.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
-				t.Fatalf("hashed asset cache policy = %q", got.Header().Get("Cache-Control"))
+			if strings.HasPrefix(test.path, "/assets/") && test.wantStatus == http.StatusOK && got.Header().Get("Cache-Control") != "no-cache" {
+				t.Fatalf("unversioned asset cache policy = %q", got.Header().Get("Cache-Control"))
 			}
 		})
 	}

@@ -15,9 +15,10 @@ The Unix socket remains private for CLI administration.
   checkout is needed on the target host.
 
 When building a release from source, run `make build` on the build machine.
-That requires Bun 1.4+ and Go/C tooling: it builds the React dashboard first,
-then embeds its output in `bin/paasd`. A direct `go build` before the frontend
-build cannot produce a working dashboard; startup reports missing assets.
+Only Go/C tooling is required: templ components and embedded CSS/JavaScript
+compile directly into `bin/paasd`. Generated Go components are checked in, so
+`go build ./cmd/paasd` from a fresh checkout includes a working dashboard.
+After editing `.templ` files, run `make web` and include the regenerated Go files.
 
 Create a dedicated admin group containing only trusted CLI operators, and a
 root-only dashboard configuration file:

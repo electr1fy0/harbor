@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -31,15 +30,11 @@ func listenDashboard(address string, control http.Handler, hookHandlers ...http.
 	if err != nil {
 		return nil, nil, fmt.Errorf("dashboard configuration: %w", err)
 	}
-	assets, err := fs.Sub(webassets.Assets, "dist")
-	if err != nil {
-		return nil, nil, fmt.Errorf("dashboard assets: %w", err)
-	}
 	var hooks http.Handler
 	if len(hookHandlers) > 0 {
 		hooks = hookHandlers[0]
 	}
-	handler, err := dashboard.NewHandlerWithHooks(dashboard.NewAPI(control), assets, config, hooks)
+	handler, err := dashboard.NewHandlerWithHooks(dashboard.NewAPI(control), webassets.Assets, config, hooks)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dashboard handler: %w", err)
 	}

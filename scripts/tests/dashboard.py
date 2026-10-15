@@ -93,16 +93,21 @@ def run(public):
                 assert all(flag in issued.lower() for flag in ("secure", "httponly", "samesite=lax", "path=/")), issued
                 cookie = issued.split(";", 1)[0]
             status, _, html = request(address, "/login" if public else "/", host=host, cookie=cookie)
-            assert status == 200 and b'<div id="root"' in html, (status, html[:100])
+            assert status == 200 and b'<h1' in html and b'Harbor' in html, (status, html[:100])
             assets = re.findall(r'(?:src|href)="(/assets/[^\"]+)"', html.decode())
-            assert any(path.endswith(".js") for path in assets), html
-            assert any(path.endswith(".css") for path in assets), html
+            assert any(path.split("?", 1)[0].endswith(".js") for path in assets), html
+            assert any(path.split("?", 1)[0].endswith(".css") for path in assets), html
             for asset in assets:
                 status, headers, body = request(address, asset, host=host)
                 assert status == 200 and len(body) > 0, (asset, status)
                 assert "immutable" in headers.get("Cache-Control", ""), headers
-            status, _, body = request(address, "/projects/example", host=host, cookie=cookie)
-            assert status == 200 and body == html, (status, body[:100])
+            for page, title in (("/", b"Projects"), ("/new", b"Import project"),
+                                ("/capacity", b"Capacity"), ("/deployments", b"Deployments"),
+                                ("/services", b"Services"), ("/settings", b"Settings")):
+                status, _, body = request(address, page, host=host, cookie=cookie)
+                assert status == 200 and title in body, (page, status, body[:200])
+            status, _, body = request(address, "/projects/missing", host=host, cookie=cookie)
+            assert status == 404, (status, body[:100])
             status, _, body = request(address, "/api/dashboard/getOverview", {}, host, origin, cookie)
             overview = json.loads(body)
             assert status == 200 and overview["connected"] and overview["apps"] == [], (status, overview)

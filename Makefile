@@ -3,12 +3,12 @@
 all: test
 
 web:
-	cd web && bun install --frozen-lockfile && bun run build
+	go generate ./web
 
-web-check: web
-	cd web && bun run typecheck && bun run test
+web-check:
+	go test ./web ./internal/dashboard
 
-build: web
+build:
 	mkdir -p bin
 	go build -o bin/paas ./cmd/paas
 	go build -o bin/paasd ./cmd/paasd
@@ -18,7 +18,7 @@ build: web
 	go build -o bin/memory-hog ./examples/memory-hog
 	(cd examples/sqlite-app && CGO_ENABLED=1 go build -o ../../bin/sqlite-app .)
 
-vet: web
+vet:
 	go vet ./...
 
 fmt:
@@ -36,7 +36,7 @@ test-privileged: build
 	sudo ./bin/builder.test -test.run TestRootBuildResourceProperties -test.v
 	cd tests && sudo ../bin/acceptance.test -test.count=1 -test.v
 
-test: web-check vet build
+test: vet build
 	go test ./...
 	./scripts/tests/cli-ping.sh
 	python3 ./scripts/tests/dashboard.py

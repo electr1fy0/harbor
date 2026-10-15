@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	frontend "paas/web"
 )
 
 const (
@@ -83,7 +85,7 @@ func NewHandlerWithHooks(api http.Handler, assets fs.FS, config Config, hooks ht
 }
 
 // NewHandler wraps the dashboard API and embedded frontend in host, origin,
-// and session checks. assets must be rooted at the frontend's dist directory.
+// and session checks. assets contains the embedded browser assets.
 func NewHandler(api http.Handler, assets fs.FS, config Config) (http.Handler, error) {
 	if api == nil {
 		return nil, errors.New("dashboard API handler is required")
@@ -94,9 +96,11 @@ func NewHandler(api http.Handler, assets fs.FS, config Config) (http.Handler, er
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
-	indexInfo, err := fs.Stat(assets, "index.html")
-	if err != nil || indexInfo.IsDir() {
-		return nil, errors.New("dashboard frontend index.html is missing; build web/dist before enabling the web listener")
+	for _, name := range []string{"assets/app.js", "assets/app.css"} {
+		info, err := fs.Stat(assets, name)
+		if err != nil || info.IsDir() {
+			return nil, errors.New("dashboard browser asset is missing: " + name)
+		}
 	}
 	return &handler{
 		api:       api,
@@ -371,7 +375,7 @@ func (h *handler) serveFrontend(w http.ResponseWriter, r *http.Request) {
 	}
 	requestPath := r.URL.Path
 	if requestPath == "/" || requestPath == "/index.html" {
-		h.serveSPA(w, r, requestPath)
+		h.servePage(w, r, requestPath)
 		return
 	}
 	if !strings.HasPrefix(requestPath, "/") || strings.ContainsAny(requestPath, "\\\x00") {
@@ -386,11 +390,14 @@ func (h *handler) serveFrontend(w http.ResponseWriter, r *http.Request) {
 	info, err := fs.Stat(h.assets, assetName)
 	if err == nil && !info.IsDir() {
 		if assetName == "index.html" {
-			h.serveSPA(w, r, requestPath)
+			h.servePage(w, r, requestPath)
 			return
 		}
 		if strings.HasPrefix(assetName, "assets/") {
-			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			w.Header().Set("Cache-Control", "no-cache")
+			if r.URL.Query().Get("v") == assetVersion(h.assets, assetName) {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
 		}
 		copyRequest := r.Clone(r.Context())
 		copyURL := *r.URL
@@ -400,39 +407,42 @@ func (h *handler) serveFrontend(w http.ResponseWriter, r *http.Request) {
 		h.static.ServeHTTP(w, copyRequest)
 		return
 	}
-	if isSPARoute(requestPath) {
-		h.serveSPA(w, r, requestPath)
+	if isPageRoute(requestPath) {
+		h.servePage(w, r, requestPath)
 		return
 	}
 	http.NotFound(w, r)
 }
 
-func (h *handler) serveSPA(w http.ResponseWriter, r *http.Request, requestPath string) {
+func (h *handler) servePage(w http.ResponseWriter, r *http.Request, requestPath string) {
 	if h.config.Mode == ModePublic && requestPath != "/login" && !h.authenticated(r) {
 		w.Header().Set("Location", "/login")
 		w.WriteHeader(http.StatusFound)
 		return
 	}
-	h.serveIndex(w, r)
+	h.renderPage(w, r)
 }
 
-func (h *handler) serveIndex(w http.ResponseWriter, r *http.Request) {
-	content, err := fs.ReadFile(h.assets, "index.html")
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	info, err := fs.Stat(h.assets, "index.html")
-	if err != nil {
-		http.NotFound(w, r)
+func (h *handler) renderPage(w http.ResponseWriter, r *http.Request) {
+	page := h.frontendPage(r)
+	var content bytes.Buffer
+	if err := frontend.Dashboard(page).Render(r.Context(), &content); err != nil {
+		writeError(w, http.StatusInternalServerError, "Dashboard could not be rendered.")
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	http.ServeContent(w, r, "index.html", info.ModTime(), bytes.NewReader(content))
+	if page.Status != http.StatusOK {
+		w.WriteHeader(page.Status)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(content.Bytes())
+		}
+		return
+	}
+	http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(content.Bytes()))
 }
 
-func isSPARoute(requestPath string) bool {
+func isPageRoute(requestPath string) bool {
 	switch requestPath {
 	case "/login", "/capacity", "/deployments", "/new", "/services", "/settings":
 		return true

@@ -1,78 +1,78 @@
 # Harbor dashboard
 
-The dashboard is a React single-page app using TanStack Router, Query, Form,
-and Table. The Go daemon serves the same-origin `/api` endpoints and the built
-static files from `web/dist`; the browser never connects to the control socket
-or GitHub directly.
+The dashboard uses [templ](https://templ.guide/) components rendered by the Go
+daemon, plain CSS, and a small browser script. There is no npm, Bun, Node,
+React, Vite, CDN, or frontend package installation in the dashboard workflow.
+Node applications deployed *by* Harbor remain supported independently.
 
-## Development
+## Build and develop
 
-Start the Go daemon with its dashboard listener on `127.0.0.1:3000` using the
-local development instructions in the [root README](../README.md). Then run:
+A fresh checkout contains the generated Go components. Build and run the daemon:
 
 ```sh
-cd web
-bun install
-bun run dev
+make build
+./bin/paasd -socket /tmp/paasd.sock -data-dir /tmp/harbor-dev -listen 127.0.0.1:8080 -web-listen 127.0.0.1:3000 -sandbox host
 ```
 
-Open <http://127.0.0.1:5173>. Vite proxies `/api` requests to the Go dashboard
-listener and keeps the browser's local Host and Origin headers intact.
+Open <http://127.0.0.1:3000>. The same process renders every page, serves embedded
+assets, authenticates requests, and calls the control plane in process.
 
-## GitHub import
+Edit `dashboard.templ` for page structure, `view.go` for typed component inputs,
+and `assets/app.css` / `assets/app.js` for styling and browser enhancements.
+Page data and form definitions live in `internal/dashboard/frontend*.go`.
+After editing templates:
 
-The dashboard can browse public repositories by owner and accepts GitHub HTTPS
-repository URLs. A user can connect a personal access token to browse private
-repositories and clone them. The token is sent to the Go API and stored by the
-daemon in its private data directory; the API returns connection metadata only.
-Legacy `GITHUB_TOKEN` configuration is also read by the daemon. GitHub OAuth is not implemented. The project Automation tab supports signed
-GitHub push callbacks and authenticated CI deployment hooks.
+```sh
+make web        # run the pinned Go-based templ generator
+make build      # rebuild embedded assets and Go components
+```
 
-The daemon inspects `paas.yaml` or detects supported Go and Node layouts, then
-lets the user review build settings, runtime environment values, and an optional
-managed SQLite service before starting an asynchronous deployment. See
-[`../docs/onboarding.md`](../docs/onboarding.md) for repository permissions and
-API details.
+Restart `paasd` to load changes. Commit `.templ` files and their generated
+`*_templ.go` together. Normal builds and tests do not run the generator or
+require a globally installed templ executable. The pinned templ release supports
+the project's Go 1.23 baseline.
+
+## Behavior
+
+Pages render usable project status on the server. Browser JavaScript submits
+allowlisted JSON actions and refreshes live sections every five seconds without
+overwriting forms being edited. Successful saves preserve other drafts, show
+contextual feedback, and refresh selector choices. Import reveals detected build
+settings after inspection; advanced controls use native disclosure panels.
+Services, backups, and encrypted exports have separate views, and unavailable
+actions explain their prerequisites. The log viewer follows redacted log deltas every
+two seconds, caps retained output at 1 MiB, and supports source/deployment
+selection, pause, search, and download. Asset URLs carry content hashes for safe
+caching across upgrades; HTML is never cached.
+
+GitHub repository inspection precedes deployment and becomes invalid when its
+source or build settings change. Runtime/build secrets and GitHub tokens are
+write-only and cleared from forms after a successful save. Backup downloads,
+encrypted exports, signed deployment hooks, operations, and diagnostic exports
+use the existing authenticated Go API.
 
 ## Authentication and deployment
 
-Public dashboard authentication is configured on the Go daemon with
-`PAASD_PUBLIC_ORIGIN`, `PAASD_ADMIN_PASSWORD_HASH`, and `PAASD_SESSION_SECRET`.
-Keep these values out of frontend environment variables and bundles. Generate a
-compatible scrypt hash with `./bin/paasd -hash-password`; deployment setup is
-documented in [`../deploy/README.md`](../deploy/README.md).
+Public access uses `PAASD_PUBLIC_ORIGIN`, `PAASD_ADMIN_PASSWORD_HASH`, and
+`PAASD_SESSION_SECRET` in the Go daemon. Generate a compatible password hash with
+`./bin/paasd -hash-password`. See [deployment](../deploy/README.md).
 
-Optional failure explanations use `OPENAI_API_KEY` in the Go daemon's
-environment and the OpenAI `gpt-5.4-mini` model. The project diagnostics button
-sends redacted evidence only when clicked. Never set the key in Vite variables
-or application settings. See [diagnostics](../docs/diagnostics.md#ai-failure-explanations)
-for configuration and behavior.
+Private repositories use a personal access token connected through Settings.
+The daemon stores it encrypted and returns connection metadata only. Legacy
+`GITHUB_TOKEN` is supported. GitHub OAuth is not implemented.
 
-The frontend build writes static files to `web/dist`. `make build` installs and
-builds the SPA before compiling `paasd`, which embeds those assets. Production
-serving uses the Go binary and does not need a Bun server process.
-
-## Operations, data services, and observability
-
-Project tabs expose operations, all deployment attempts and events, repository
-automation, incremental redacted logs, historical metrics, maintenance
-mode, notifications, and diagnostic exports. The Services
-page manages SQLite bindings, snapshots, scheduled retention, verification,
-clone restore, and encrypted Harbor exports. See [`../docs/features.md`](../docs/features.md)
-for behavior, authentication, limits, and the first 50 feature coverage map.
+Optional failure explanations use `OPENAI_API_KEY` in the daemon environment.
+The Explain failure action sends redacted evidence only when requested. See
+[diagnostics](../docs/diagnostics.md#ai-failure-explanations).
 
 ## Checks
 
 ```sh
-bun run generate-routes
-bun run typecheck
-bun run lint
-bun run test
-bun run build
+make web-check
+make test
 ```
 
-The browser client calls `GET /api/auth/status`, `POST /api/auth/login`,
-`POST /api/auth/logout`, and the allowlisted
-`POST /api/dashboard/<functionName>` endpoints. Dashboard request bodies contain
-the function input directly. The API returns typed frontend data and reports
-errors as JSON; a 404 becomes a browser `HarborNotFoundError`.
+The API contract remains `GET /api/auth/status`, `POST /api/auth/login`,
+`POST /api/auth/logout`, and `POST /api/dashboard/<functionName>`. Request bodies
+contain function input directly. Host/origin/session checks, strict request
+validation, bounds, and response redaction remain in Go.

@@ -13,20 +13,22 @@ hostnames. Apps and operators must be trusted; applications share the host netwo
 
 ## Web dashboard
 
-The complete React dashboard is embedded in the Go `paasd` executable. The same
+The dashboard is rendered with [templ](https://templ.guide/) and embedded in the Go `paasd` executable. The same
 process serves the UI, authenticates dashboard API requests, and manages
 applications. Production needs no separate web service or Bun/Node runtime.
-The UI uses TanStack Router, Query, Form, and Table with the Base UI shadcn preset.
+Pages, CSS, and browser actions are owned by Go. No npm packages, JavaScript
+build tools, or separate frontend server are required.
 
-Build from source with `make build` (Bun 1.4+ is required on the build machine),
+Build from source with `make build` (Go and a C compiler for SQLite),
 then start the daemon using the local development commands below. Open
 <http://127.0.0.1:3000>. The default dashboard listener is numeric loopback;
 `-web-listen` selects another loopback address and `-web-listen ''` disables it.
 The CLI continues to use the private Unix socket.
 
-For frontend development, run `bun install` and `bun run dev` inside `web/`.
-Vite serves <http://127.0.0.1:5173> and proxies API calls to the daemon on port
-3000. See [web/README.md](web/README.md) for the development and verification steps.
+For UI development, edit `web/dashboard.templ`, run `make web` to regenerate
+the Go components, then rebuild and restart `paasd`. Generated Go is checked in,
+so a fresh checkout supports `go build ./cmd/paasd` directly. See
+[web/README.md](web/README.md) for development and verification steps.
 
 Import a repository by browsing a GitHub owner or entering its HTTPS URL. Connect
 a fine-grained personal access token in the dashboard to browse and clone private
