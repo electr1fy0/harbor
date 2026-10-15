@@ -1,0 +1,405 @@
+diff --git a/README.md b/README.md
+index 5dede4b..43cda25 100644
+--- a/README.md
++++ b/README.md
+@@ -27,6 +27,28 @@ go run main.go 2
+ go run main.go 3
+ ```
+ 
++## Deploying a standalone node on Harbor
++
++Import this repository with its included `paas.yaml`. Harbor builds the server,
++starts it without arguments, and supplies `PORT`. Ink then runs as one standalone
++node on `127.0.0.1:$PORT`; writes require one local acknowledgement. `/health`
++is the readiness endpoint. No cluster config files or peers are needed.
++
++`go run . 1`, `2`, and `3` continue to use the original cluster configs and
++two-acknowledgement writes. Supplying `PORT` with a config ID overrides that
++node's listener, so its peers must also be configured with the correct address.
++
++Set `INK_DATA_DIR` to a writable, persistent directory to retain the write-ahead
++log. Local cluster mode defaults to the current directory. Platform mode defaults
++to `/tmp/ink-standalone`; Harbor's Linux sandbox gives it temporary storage that
++is lost when the sandbox stops. A healthy deployment with that default is a demo,
++not durable storage. Harbor currently mounts persistent directories only through
++its managed SQLite bindings; adding `INK_DATA_DIR` alone does not create a mount.
++Do not bind a SQLite service to Ink: Ink uses its own WAL, not `DATABASE_URL`.
++Persistent standalone operation requires a writable volume mounted by the host.
++Stop the old standalone process before starting another against the same WAL;
++live overlapping releases are not supported for this in-memory store.
++
+ ## API Usage
+ 
+ Clients can interact with any node in the cluster.
+diff --git a/internal/app/app.go b/internal/app/app.go
+index 10b4738..4dac1e4 100644
+--- a/internal/app/app.go
++++ b/internal/app/app.go
+@@ -16,9 +16,10 @@ import (
+ )
+ 
+ type Config struct {
+-	Address string          `yaml:"address"`
+-	NodeID  string          `yaml:"node_id"`
+-	Peers   map[string]Peer `yaml:"peers"` // NodeID -> Peer
++	Standalone bool            `yaml:"-"` // Set only by the platform standalone entrypoint.
++	Address    string          `yaml:"address"`
++	NodeID     string          `yaml:"node_id"`
++	Peers      map[string]Peer `yaml:"peers"` // NodeID -> Peer
+ }
+ 
+ type Peer struct {
+@@ -207,7 +208,7 @@ func (a *App) Put(key string, value string) error {
+ 		Timestamp: time.Now(),
+ 	}
+ 
+-	if a.ReplicateWrite(&entry, key, 3) < 2 {
++	if a.ReplicateWrite(&entry, key, 3) < a.writeQuorum() {
+ 		return fmt.Errorf("failed to reach quorum of 2 acks")
+ 	}
+ 
+@@ -236,7 +237,7 @@ func (a *App) Delete(key string) error {
+ 		Deleted:   true,
+ 	}
+ 
+-	if a.ReplicateWrite(&entry, key, 3) < 2 {
++	if a.ReplicateWrite(&entry, key, 3) < a.writeQuorum() {
+ 		return fmt.Errorf("failed to reach quorum of 2 acks")
+ 	}
+ 
+@@ -308,9 +309,18 @@ func (a *App) ReplicateWrite(v *store.Entry, key string, n int) int {
+ 	case <-time.After(2 * time.Second):
+ 	}
+ 
++	mu.Lock()
++	defer mu.Unlock()
+ 	return acks
+ }
+ 
++func (a *App) writeQuorum() int {
++	if a.Cfg.Standalone {
++		return 1
++	}
++	return 2
++}
++
+ func (a *App) Recover() error {
+ 	f, err := os.Open(a.Wal.Filename)
+ 	if err != nil {
+diff --git a/internal/ring/ring.go b/internal/ring/ring.go
+index 6776cd1..8c52e0a 100644
+--- a/internal/ring/ring.go
++++ b/internal/ring/ring.go
+@@ -100,7 +100,9 @@ func (r *Ring) GetNodes(key string, n int) []string {
+ 	var nodes []string
+ 	// collect unique physical nodes starting from valid index
+ 	seen := make(map[string]struct{})
+-	for len(nodes) < n && len(seen) < len(r.hashMap) {
++	// hashMap contains virtual nodes. Stop after one turn of the ring even
++	// when fewer than n physical nodes exist, as in standalone mode.
++	for visited := 0; visited < len(r.keys) && len(nodes) < n; visited++ {
+ 		node := r.hashMap[r.keys[idx%len(r.keys)]]
+ 
+ 		_, ok := seen[node]
+@@ -113,4 +115,3 @@ func (r *Ring) GetNodes(key string, n int) []string {
+ 
+ 	return nodes
+ }
+-
+diff --git a/main.go b/main.go
+index d1b74ef..ff766df 100644
+--- a/main.go
++++ b/main.go
+@@ -3,8 +3,12 @@ package main
+ import (
+ 	"fmt"
+ 	"log"
++	"net"
+ 	"net/http"
+ 	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
+ 
+ 	"github.com/electr1fy0/ink/internal/app"
+ 	"github.com/electr1fy0/ink/internal/handler"
+@@ -15,20 +19,12 @@ import (
+ )
+ 
+ func main() {
+-	if len(os.Args) < 2 {
+-		log.Fatal("Usage: ink <config_id>")
+-	}
+-
+-	configID := os.Args[1]
+-
+-	config, err := os.Open("config" + configID + ".yaml")
++	cfg, dataDir, err := runtimeConfig(os.Args[1:], os.Getenv)
+ 	if err != nil {
+-		log.Fatal("failed to open config: ", err)
++		log.Fatal(err)
+ 	}
+-
+-	var cfg app.Config
+-	if err = yaml.NewDecoder(config).Decode(&cfg); err != nil {
+-		log.Fatal("failed to parse config: ", err)
++	if err := os.MkdirAll(dataDir, 0700); err != nil {
++		log.Fatal("failed to create data directory: ", err)
+ 	}
+ 
+ 	hashRing := ring.NewRing(10)
+@@ -40,7 +36,15 @@ func main() {
+ 	fmt.Printf("Starting node %s on %s\n", cfg.NodeID, cfg.Address)
+ 
+ 	s := &store.MapStore{Data: make(map[string]store.Entry)}
+-	w := &wal.Wal{Filename: "ink-wal-" + cfg.NodeID} // unique wal per node
++	w := &wal.Wal{Filename: filepath.Join(dataDir, "ink-wal-"+cfg.NodeID)}
++	// Check write access before becoming healthy, including on read-only releases.
++	f, err := os.OpenFile(w.Filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
++	if err != nil {
++		log.Fatal("failed to open writable log: ", err)
++	}
++	if err := f.Close(); err != nil {
++		log.Fatal("failed to close log: ", err)
++	}
+ 
+ 	inkApp := app.NewApp(s, w, hashRing, &cfg)
+ 
+@@ -70,3 +74,44 @@ func SetupRoutes(h *handler.Handler) *http.ServeMux {
+ 
+ 	return mux
+ }
++
++// A platform-provided PORT selects a standalone node when no cluster config
++// is supplied. Explicit config IDs retain the original two-ack cluster mode.
++func runtimeConfig(args []string, getenv func(string) string) (app.Config, string, error) {
++	var cfg app.Config
++	port := getenv("PORT")
++	if len(args) > 1 || len(args) == 0 && port == "" {
++		return cfg, "", fmt.Errorf("usage: ink <config_id>, or set PORT for standalone mode")
++	}
++	if len(args) == 1 {
++		config, err := os.Open("config" + args[0] + ".yaml")
++		if err != nil {
++			return cfg, "", fmt.Errorf("failed to open config: %w", err)
++		}
++		defer config.Close()
++		if err := yaml.NewDecoder(config).Decode(&cfg); err != nil {
++			return cfg, "", fmt.Errorf("failed to parse config: %w", err)
++		}
++	} else {
++		cfg.NodeID = "standalone"
++		cfg.Standalone = true
++	}
++	if cfg.NodeID == "" || cfg.NodeID == "." || cfg.NodeID == ".." || strings.ContainsAny(cfg.NodeID, `/\`+"\x00") {
++		return cfg, "", fmt.Errorf("node_id must be a nonempty file name")
++	}
++	if port != "" {
++		n, err := strconv.Atoi(port)
++		if err != nil || n < 1 || n > 65535 {
++			return cfg, "", fmt.Errorf("PORT must be an integer between 1 and 65535")
++		}
++		cfg.Address = net.JoinHostPort("127.0.0.1", strconv.Itoa(n))
++	}
++	dataDir := getenv("INK_DATA_DIR")
++	if dataDir == "" {
++		dataDir = "."
++		if port != "" {
++			dataDir = filepath.Join(os.TempDir(), "ink-"+cfg.NodeID)
++		}
++	}
++	return cfg, dataDir, nil
++}
+diff --git a/internal/ring/ring_test.go b/internal/ring/ring_test.go
+new file mode 100644
+index 0000000..76026e6
+--- /dev/null
++++ b/internal/ring/ring_test.go
+@@ -0,0 +1,35 @@
++package ring
++
++import (
++	"fmt"
++	"testing"
++)
++
++func TestGetNodesWithFewerPhysicalNodesThanReplicas(t *testing.T) {
++	for _, count := range []int{0, 1, 2, 3, 5} {
++		for _, requested := range []int{0, 1, 2, 3, 10} {
++			t.Run(fmt.Sprintf("nodes=%d/requested=%d", count, requested), func(t *testing.T) {
++				r := NewRing(10)
++				for i := 0; i < count; i++ {
++					r.AddNode(fmt.Sprintf("node-%d", i))
++				}
++				got := r.GetNodes("key", requested)
++				if len(got) != min(count, requested) {
++					t.Fatalf("nodes = %v", got)
++				}
++				seen := make(map[string]bool)
++				for _, node := range got {
++					if seen[node] {
++						t.Fatalf("duplicate node: %v", got)
++					}
++					seen[node] = true
++				}
++				if requested > 0 && count > 0 {
++					if first, _ := r.GetNode("key"); first != got[0] {
++						t.Fatalf("first = %q, nodes = %v", first, got)
++					}
++				}
++			})
++		}
++	}
++}
+diff --git a/paas.yaml b/paas.yaml
+new file mode 100644
+index 0000000..346969b
+--- /dev/null
++++ b/paas.yaml
+@@ -0,0 +1,12 @@
++name: ink
++runtime: go
++build:
++  command: go build -o "$PAAS_OUT/server" .
++start:
++  command: /app/server
++resources:
++  memory: 128Mi
++  cpu: 0.5
++  tasks: 64
++health:
++  path: /health
+diff --git a/runtime_config_test.go b/runtime_config_test.go
+new file mode 100644
+index 0000000..3477545
+--- /dev/null
++++ b/runtime_config_test.go
+@@ -0,0 +1,128 @@
++package main
++
++import (
++	"bytes"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/electr1fy0/ink/internal/app"
++	"github.com/electr1fy0/ink/internal/handler"
++	"github.com/electr1fy0/ink/internal/ring"
++	"github.com/electr1fy0/ink/internal/store"
++	"github.com/electr1fy0/ink/internal/wal"
++)
++
++func TestRuntimeConfig(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		args       []string
++		env        map[string]string
++		wantError  string
++		address    string
++		standalone bool
++	}{
++		{name: "platform standalone", env: map[string]string{"PORT": "45555"}, address: "127.0.0.1:45555", standalone: true},
++		{name: "local cluster unchanged", args: []string{"1"}, address: ":8001"},
++		{name: "platform port overrides cluster", args: []string{"1"}, env: map[string]string{"PORT": "37029"}, address: "127.0.0.1:37029"},
++		{name: "no arguments or port", wantError: "usage:"},
++		{name: "extra arguments", args: []string{"1", "2"}, wantError: "usage:"},
++		{name: "missing config", args: []string{"missing"}, wantError: "failed to open config"},
++		{name: "invalid port", env: map[string]string{"PORT": "bad"}, wantError: "PORT must"},
++		{name: "zero port", env: map[string]string{"PORT": "0"}, wantError: "PORT must"},
++		{name: "large port", env: map[string]string{"PORT": "65536"}, wantError: "PORT must"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			cfg, dataDir, err := runtimeConfig(tc.args, func(k string) string { return tc.env[k] })
++			if tc.wantError != "" {
++				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
++					t.Fatalf("error = %v", err)
++				}
++				return
++			}
++			if err != nil || cfg.Address != tc.address || cfg.Standalone != tc.standalone {
++				t.Fatalf("config = %+v, error = %v", cfg, err)
++			}
++			if tc.standalone && (len(cfg.Peers) != 0 || dataDir != filepath.Join(os.TempDir(), "ink-standalone")) {
++				t.Fatalf("standalone config = %+v, data = %q", cfg, dataDir)
++			}
++			if len(tc.args) == 1 && len(cfg.Peers) != 2 {
++				t.Fatalf("lost cluster peers: %+v", cfg)
++			}
++		})
++	}
++}
++
++func TestStandaloneCRUDAndRecovery(t *testing.T) {
++	dataDir := t.TempDir()
++	cfg, gotDir, err := runtimeConfig(nil, func(k string) string {
++		return map[string]string{"PORT": "45555", "INK_DATA_DIR": dataDir}[k]
++	})
++	if err != nil || gotDir != dataDir {
++		t.Fatalf("config: %q, %v", gotDir, err)
++	}
++	start := func() *httptest.Server {
++		r := ring.NewRing(10)
++		r.AddNode(cfg.NodeID)
++		a := app.NewApp(&store.MapStore{Data: make(map[string]store.Entry)}, &wal.Wal{Filename: filepath.Join(gotDir, "ink-wal-"+cfg.NodeID)}, r, &cfg)
++		if err := a.Recover(); err != nil {
++			t.Fatal(err)
++		}
++		server := httptest.NewServer(SetupRoutes(&handler.Handler{App: a}))
++		t.Cleanup(server.Close)
++		return server
++	}
++	request := func(s *httptest.Server, method, path, body string, status int) map[string]string {
++		t.Helper()
++		req, err := http.NewRequest(method, s.URL+path, bytes.NewBufferString(body))
++		if err != nil {
++			t.Fatal(err)
++		}
++		resp, err := s.Client().Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer resp.Body.Close()
++		if resp.StatusCode != status {
++			t.Fatalf("%s %s = %d, want %d", method, path, resp.StatusCode, status)
++		}
++		var result map[string]string
++		if resp.Header.Get("Content-Type") == "application/json" && path != "/" {
++			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
++				t.Fatal(err)
++			}
++		}
++		return result
++	}
++	s := start()
++	request(s, "GET", "/health", "", 200)
++	request(s, "PUT", "/keep", `{"value":"persisted"}`, 200)
++	request(s, "PUT", "/remove", `{"value":"deleted"}`, 200)
++	request(s, "DELETE", "/remove", "", 204)
++	request(s, "GET", "/remove", "", 404)
++	s.Close()
++	s = start()
++	if got := request(s, "GET", "/keep", "", 200); got["value"] != "persisted" {
++		t.Fatalf("recovered = %+v", got)
++	}
++	request(s, "GET", "/remove", "", 404)
++	request(s, "GET", "/", "", 200)
++	request(s, "PUT", "/keep", `{"value":"updated"}`, 200)
++	if got := request(s, "GET", "/keep", "", 200); got["value"] != "updated" {
++		t.Fatalf("updated = %+v", got)
++	}
++}
++
++func TestClusterStillRequiresTwoAcknowledgements(t *testing.T) {
++	cfg := &app.Config{NodeID: "alone"}
++	r := ring.NewRing(10)
++	r.AddNode(cfg.NodeID)
++	a := app.NewApp(&store.MapStore{Data: make(map[string]store.Entry)}, &wal.Wal{Filename: filepath.Join(t.TempDir(), "wal")}, r, cfg)
++	if err := a.Put("key", "value"); err == nil || !strings.Contains(err.Error(), "quorum") {
++		t.Fatalf("cluster accepted one ack: %v", err)
++	}
++}

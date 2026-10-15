@@ -21,6 +21,13 @@ const (
 // Check polls a loopback TCP port or HTTP path until it responds or attempts
 // are exhausted. Redirect responses are accepted without following them.
 func Check(ctx context.Context, port int, path string) error {
+	return CheckWithLiveness(ctx, port, path, nil)
+}
+
+// CheckWithLiveness stops retrying readiness when the caller can confirm that
+// the runtime has exited. A nil callback preserves Check's polling behavior.
+// The callback is consulted after a failed probe, while ctx is still active.
+func CheckWithLiveness(ctx context.Context, port int, path string, liveness func(context.Context) error) error {
 	if ctx == nil {
 		return errors.New("health check context must not be nil")
 	}
@@ -66,6 +73,11 @@ func Check(ctx context.Context, port int, path string) error {
 			return ctx.Err()
 		}
 		lastErr = err
+		if liveness != nil {
+			if liveErr := liveness(ctx); liveErr != nil {
+				return fmt.Errorf("readiness failed: %w", errors.Join(liveErr, lastErr))
+			}
+		}
 		if attempt+1 == maxAttempts {
 			break
 		}

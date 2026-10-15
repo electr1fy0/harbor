@@ -399,6 +399,8 @@ func (s *fakeSandbox) Start(_ context.Context, spec contracts.SandboxSpec) (*con
 			s.mu.Lock()
 			if entry := s.entries[spec.ID]; entry != nil {
 				entry.info.Running = false
+				code := 1
+				entry.info.ExitCode = &code
 			}
 			s.mu.Unlock()
 			http.Error(w, "startup retry fixture", http.StatusServiceUnavailable)
@@ -905,6 +907,40 @@ func TestStartupRetryStageTimingsIncludeEveryAttempt(t *testing.T) {
 	}
 	if stages.ReadinessMilliseconds == nil || *stages.ReadinessMilliseconds < 15 {
 		t.Fatalf("readiness duration omitted the failed readiness attempt: %+v", stages)
+	}
+}
+
+func TestStartupExitReportsProcessFailureAndKeepsProduction(t *testing.T) {
+	healthConfig := strings.Replace(testConfig, "start:\n", "health:\n  path: /ready\nstart:\n", 1)
+	h := newServiceHarness(t, healthConfig)
+	production, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.sandbox.failHealthAttempts = 4
+	failed, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err == nil || failed.State != model.StartFailed || !strings.Contains(err.Error(), "application exited before becoming ready (exit code 1)") {
+		t.Fatalf("startup failure = %+v, %v", failed, err)
+	}
+	active, err := h.service.Production("demo")
+	if err != nil || active == nil || active.ID != production.ID {
+		t.Fatalf("production = %+v, %v", active, err)
+	}
+	events, err := h.db.Events(failed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failures int
+	for _, event := range events {
+		if event.Type == model.EventHealthCheckFailed {
+			failures++
+			if !strings.Contains(event.Payload, "exit code 1") {
+				t.Errorf("event omitted exit: %+v", event)
+			}
+		}
+	}
+	if failures != 3 {
+		t.Fatalf("startup retries = %d, want 3", failures)
 	}
 }
 

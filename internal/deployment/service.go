@@ -646,7 +646,19 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 		}
 		s.mu.Unlock()
 		locked = false
-		err = health.Check(ctx, port, cfg.Health.Path)
+		err = health.CheckWithLiveness(ctx, port, cfg.Health.Path, func(ctx context.Context) error {
+			inspectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			info, inspectErr := s.sandbox.Inspect(inspectCtx, d.ID)
+			// A manager error or a transitioning unit is not evidence of an exit.
+			if inspectErr != nil || info == nil || info.Running || info.Transitioning {
+				return nil
+			}
+			if info.ExitCode != nil {
+				return fmt.Errorf("application exited before becoming ready (exit code %d); check runtime logs", *info.ExitCode)
+			}
+			return errors.New("application exited before becoming ready; check runtime logs")
+		})
 		s.mu.Lock()
 		locked = true
 		if err == nil {

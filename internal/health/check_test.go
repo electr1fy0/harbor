@@ -51,6 +51,34 @@ func TestCheckTCPReadiness(t *testing.T) {
 	}
 }
 
+func TestCheckStopsWhenRuntimeExits(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	exited := errors.New("application exited with code 1")
+	err := CheckWithLiveness(context.Background(), portFromAddress(t, server.Listener.Addr()), "/ready", func(context.Context) error { return exited })
+	if !errors.Is(err, exited) || requests.Load() != 1 {
+		t.Fatalf("readiness = %v, requests = %d; want exit after first failed probe", err, requests.Load())
+	}
+}
+
+func TestCheckLiveRuntimeCanBecomeReady(t *testing.T) {
+	var requests, inspections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer server.Close()
+	err := CheckWithLiveness(context.Background(), portFromAddress(t, server.Listener.Addr()), "/ready", func(context.Context) error { inspections.Add(1); return nil })
+	if err != nil || requests.Load() != 2 || inspections.Load() != 1 {
+		t.Fatalf("readiness = %v, requests = %d, inspections = %d", err, requests.Load(), inspections.Load())
+	}
+}
+
 func TestCheckCancellation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
