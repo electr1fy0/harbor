@@ -14,7 +14,7 @@ rejects writes with only one node.
 
 ## Apply the Ink fix
 
-The fix is available on Ink's `codex/harbor-deployment` branch in
+The fix is available on Ink's `main` branch through
 [pull request #1](https://github.com/electr1fy0/ink/pull/1). The same changes are
 packaged as [ink-harbor.patch](../deploy/patches/ink-harbor.patch), based on commit
 `4f7bada`. Alternatively, apply that patch in an unchanged Ink checkout:
@@ -32,10 +32,11 @@ retain two-ack writes. Ring traversal is bounded by one pass through its virtual
 nodes, and the replication acknowledgement count is read under its mutex.
 Startup checks that its WAL is writable before serving health checks.
 
-In Harbor, select Ink's `codex/harbor-deployment` branch and deploy it using the
+In Harbor, select Ink's `main` branch and deploy it using the
 included `paas.yaml`. A rollback to the original release still contains the
-incompatible executable; it does not apply this source fix. The branch is pushed
-for review; it has not been merged or applied to a production deployment.
+incompatible executable; it does not apply this source fix. The source fix is
+published; redeploying Ink and updating the Harbor daemon are separate steps
+needed to update running installations.
 
 ## Storage
 
