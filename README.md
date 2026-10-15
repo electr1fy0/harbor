@@ -29,6 +29,7 @@
   - [WSL 2 (Windows Subsystem for Linux)](#wsl-2-windows-subsystem-for-linux)
   - [macOS Development](#macos-development)
 - [Installation & Quick Start](#installation--quick-start)
+  - [Local Development with `scripts/dev.sh`](#local-development-with-scriptsdevsh)
   - [1. Build Binaries from Source](#1-build-binaries-from-source)
   - [2. Configure Linux Host Dependencies](#2-configure-linux-host-dependencies)
   - [3. Start the Control-Plane Daemon](#3-start-the-control-plane-daemon)
@@ -313,6 +314,68 @@ macOS is supported for local development and testing without systemd isolation:
 ---
 
 ## Installation & Quick Start
+
+### Local Development with `scripts/dev.sh`
+
+From the repository root, start the local dashboard with Go 1.23+, a C compiler,
+and `make` installed:
+
+```sh
+./scripts/dev.sh
+```
+
+To enable **Explain failure**, export your API key in the same terminal before
+starting Harbor. Replace the placeholder with your actual key:
+
+```sh
+export OPENAI_API_KEY="your-key-here"
+./scripts/dev.sh
+```
+
+The key is optional; deployment and ordinary failure logs work without it.
+It configures Harbor's daemon, so enter it in the shell rather than a deployed
+project's environment settings. The script inherits exported environment
+variables and does not load `.env` files automatically. See the
+[environment variable reference](#environment-variables) for other options.
+
+The script regenerates dashboard templates, builds the binaries, and runs
+`paasd` in the foreground. It uses these local addresses and paths:
+
+| Purpose | Address or path |
+|---|---|
+| Dashboard | <http://127.0.0.1:3000> |
+| Application router | `http://127.0.0.1:8080` |
+| Control socket | `/tmp/paasd.sock` |
+| Local data | `/tmp/harbor-dev` |
+
+With the `PAASD_PUBLIC_ORIGIN`, `PAASD_ADMIN_PASSWORD_HASH`, and
+`PAASD_SESSION_SECRET` variables unset, the local dashboard opens without login.
+Stop an existing local daemon before starting the script. Use **Ctrl+C** in
+its terminal to stop it, then rerun the script after changing code or exported
+variables. The API key is read at startup, so exporting it in another terminal
+does not update an already running daemon.
+
+In a second terminal, deploy the Node demo using the local socket:
+
+```sh
+./bin/paas --socket /tmp/paasd.sock ping
+./bin/paas --socket /tmp/paasd.sock deploy ./examples/hello-node --name hello-node
+curl -H 'Host: hello-node.localhost' http://127.0.0.1:8080/
+```
+
+Install Node and npm before deploying Node applications. On macOS, the script
+uses host mode automatically. On Linux/WSL, complete the
+[Linux/WSL setup](#wsl-2-windows-subsystem-for-linux) first, then run the script
+with the system manager and preserve the optional API key explicitly:
+
+```sh
+export OPENAI_API_KEY="your-key-here"
+sudo --preserve-env=OPENAI_API_KEY ./scripts/dev.sh
+```
+
+Use `sudo ./bin/paas --socket /tmp/paasd.sock ...` for CLI commands when the
+daemon runs as root. The local data directory is under `/tmp`; use the
+production setup below for durable server storage.
 
 ### 1. Build Binaries from Source
 
@@ -906,7 +969,10 @@ Validate Returned Citations & Evidence Against Local Logs
 Render Concise Failure Summary, Verified Evidence, and Suggested Next Step
 ```
 
-- **Opt-In & Server-Side**: Requires `OPENAI_API_KEY` set in `/etc/harbor/harbor.env`.
+- **Opt-In & Server-Side**: Set `OPENAI_API_KEY` in the daemon environment. For
+  local development, use `export OPENAI_API_KEY="your-key-here"` before
+  `./scripts/dev.sh`; for the production systemd service, set it in
+  `/etc/harbor/harbor.env`. Restart the daemon after changing the key.
 - **Privacy Guarantees**: Calls the OpenAI Responses API with `store: false`. Sent payloads include only sanitized deployment metadata and redacted log excerpts. Application source trees and environment variables are never sent.
 - **Evidence Verification**: Harbor verifies that citations in the model's response match actual lines in local diagnostic logs.
 - **In-Memory Caching**: Responses are cached in memory for identical deployment evidence. No model calls run automatically or on page refresh.

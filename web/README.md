@@ -14,6 +14,19 @@ make build
 ./bin/paasd -socket /tmp/paasd.sock -data-dir /tmp/harbor-dev -listen 127.0.0.1:8080 -web-listen 127.0.0.1:3000 -sandbox host
 ```
 
+For local development, `./scripts/dev.sh` regenerates templates, rebuilds, and
+starts the daemon in one command. To enable optional failure explanations:
+
+```sh
+export OPENAI_API_KEY="your-key-here"
+./scripts/dev.sh
+```
+
+Replace the placeholder with your key, stop any existing daemon first, and
+restart after code or environment changes. The script inherits exported
+variables; it does not read `.env` files. For Linux/WSL setup and the root
+invocation, see the [local development guide](../README.md#local-development-with-scriptsdevsh).
+
 Open <http://127.0.0.1:3000>. The same process renders every page, serves embedded
 assets, authenticates requests, and calls the control plane in process.
 
