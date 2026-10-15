@@ -235,6 +235,11 @@
       if (form.id === "import-project" && inspection.get(form) !== JSON.stringify(inspectInput(input))) throw new Error("Inspect the repository before deploying.");
       if (form.id === "live-logs") { await pollLogs(true); return; }
       inflightForms.add(form); button.disabled = true; report(form, "Working…");
+      if (form.id === "browse-repos") {
+        $(".repository-results", form).replaceChildren();
+        $(".repository-search", form).hidden = true;
+        $(".repository-empty", form).hidden = true;
+      }
       const result = await api(form.dataset.api, input);
       clearSecrets(form);
       if (form.dataset.api === "auth/login" && !result.ok) throw new Error(result.message || "Sign-in failed.");
@@ -251,6 +256,7 @@
         report(form, [result.explanation, ...result.evidence || [], "Next step: " + result.nextStep].join("\n\n"));
       } else if (form.dataset.api === "listGitHubRepos") {
         showRepositories(form, result);
+        return;
       } else if (result.id && result.state && ["submitOnboardingJob", "retryGitHubDeployment"].includes(form.dataset.api)) {
         location.assign("/projects/" + encodeURIComponent(result.name) + "?tab=automation");
       } else if (result.job) {
@@ -276,21 +282,56 @@
   });
 
   function showRepositories(form, repos) {
-    const target = $(".form-result", form); target.replaceChildren();
-    if (!repos.length) { target.textContent = "No repositories found."; return; }
+    const target = $(".repository-results", form); target.replaceChildren();
+    $(".form-result", form).textContent = repos.length ? `${repos.length} repositories` : "No repositories found for this owner.";
+    $(".repository-search", form).hidden = !repos.length;
+    $("[data-repository-search]", form).value = "";
     for (const repo of repos) {
-      const button = document.createElement("button"); button.type = "button"; button.className = "secondary";
+      const button = document.createElement("button"); button.type = "button";
       button.textContent = repo.fullName + (repo.private ? " · private" : "");
       button.addEventListener("click", () => {
         const importer = $("#import-project");
-        importer.elements.namedItem("repoURL").value = repo.url;
-        importer.elements.namedItem("ref").value = repo.defaultBranch;
-        importer.elements.namedItem("name").value = repo.name.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 63);
-        inspection.delete(importer); $('button[type="submit"]', importer).disabled = true;
-        importer.scrollIntoView({ behavior: "smooth" });
+        const url = importer.elements.namedItem("repoURL");
+        url.value = repo.url;
+        importer.elements.namedItem("ref").value = repo.defaultBranch || "";
+        const projectName = importer.elements.namedItem("name");
+        if (!projectName.value) projectName.value = repo.name.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 63);
+        url.dispatchEvent(new Event("input", { bubbles: true }));
+        $("#repository-menu").hidePopover();
+        url.focus();
       });
-      const p = document.createElement("p"); p.append(button); target.append(p);
+      target.append(button);
     }
+  }
+
+  const repositoryMenu = $("#repository-menu");
+  if (repositoryMenu) {
+    const form = $("#browse-repos", repositoryMenu);
+    function positionRepositoryMenu() {
+      const rect = $(".repository-trigger").getBoundingClientRect();
+      const width = Math.min(420, innerWidth - 36);
+      const top = Math.max(18, Math.min(rect.bottom + 8, innerHeight - 260));
+      repositoryMenu.style.left = Math.max(18, Math.min(rect.right - width, innerWidth - width - 18)) + "px";
+      repositoryMenu.style.top = top + "px";
+      repositoryMenu.style.maxHeight = Math.max(0, innerHeight - top - 18) + "px";
+    }
+    let firstOpen = true;
+    repositoryMenu.addEventListener("beforetoggle", event => {
+      if (event.newState !== "open") return;
+      positionRepositoryMenu();
+      if (firstOpen) { firstOpen = false; form.requestSubmit(); }
+    });
+    window.addEventListener("resize", positionRepositoryMenu);
+    window.addEventListener("scroll", positionRepositoryMenu);
+    $("[data-repository-search]", form).addEventListener("input", event => {
+      const query = event.target.value.toLowerCase().trim();
+      const buttons = $$(".repository-results button", form);
+      for (const button of buttons) button.hidden = !button.textContent.toLowerCase().includes(query);
+      $(".repository-empty", form).hidden = buttons.some(button => !button.hidden);
+    });
+    $("[data-repository-search]", form).addEventListener("keydown", event => {
+      if (event.key === "Enter") event.preventDefault();
+    });
   }
 
   let logBusy = false, cursor = "", logIdentity = "", logText = "", generation = 0;

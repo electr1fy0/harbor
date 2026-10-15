@@ -21,17 +21,10 @@ func presentPage(p ui.Page) ui.Page {
 		p.HeaderLinks = []ui.Link{{Label: "Import project", URL: "/new"}}
 	case "/new":
 		p.HeaderLinks = []ui.Link{{Label: "Cancel", URL: "/"}}
-		if len(p.Forms) == 2 {
-			p.Forms[0], p.Forms[1] = p.Forms[1], p.Forms[0]
-		}
 	}
 	for i := range p.Forms {
 		f := &p.Forms[i]
 		switch f.ID {
-		case "browse-repos":
-			f.Title = "Find a repository"
-			f.Description = "Browse repositories by owner, then choose one to import."
-			f.Links = []ui.Link{{Label: "Connect GitHub for private repositories", URL: "/settings"}}
 		case "import-project":
 			f.Title = "Repository"
 			f.Description = "Enter a GitHub URL. Inspect it to detect the build settings before deploying."

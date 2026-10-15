@@ -155,7 +155,6 @@ func (h *handler) frontendPage(r *http.Request) ui.Page {
 	case "/new":
 		p.Title = "Import project"
 		p.Description = "Connect a repository, review its configuration, and deploy."
-		p.Forms = append(p.Forms, ui.Form{ID: "browse-repos", Title: "Find a repository", Function: "listGitHubRepos", Submit: "Browse repositories", Fields: []ui.Field{field("owner", "GitHub owner", "text", "", false)}})
 		fields := []ui.Field{field("name", "Project name", "text", "", true), field("repoURL", "GitHub HTTPS repository URL", "url", "", true), field("ref", "Branch, tag, or commit (blank uses default)", "text", "", false), field("rootDir", "Repository root directory", "text", "", false)}
 		fields = append(fields, configFields("config.", empty)...)
 		fields = append(fields, ui.Field{Name: "environment", Label: "Runtime environment · KEY=value, one per line", Type: "env", OmitEmpty: true}, field("sqliteService", "SQLite service name (optional)", "text", "", false), check("createSqlite", "Create the SQLite service if needed", false))

@@ -6,7 +6,7 @@ templ Dashboard(p Page) {
 		<head>
 			<meta charset="utf-8"/>
 			<meta name="viewport" content="width=device-width, initial-scale=1"/>
-			<meta name="theme-color" content="#f4f7f5"/>
+			<meta name="theme-color" content="#fafafa"/>
 			<title>{ p.TitleText() }</title>
 			<link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
 			<link rel="stylesheet" href={ templ.SafeURL(p.CSS) }/>
@@ -106,6 +106,9 @@ templ Dashboard(p Page) {
 						</div>
 					}
 				</main>
+				if p.Path=="/new" {
+					@repositoryMenu()
+				}
 			}
 			<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 		</body>
@@ -280,13 +283,21 @@ templ formFields(f Form, fields []Field) {
 		for _, v := range fields {
 			if v.Type=="hidden" {
 				<input type="hidden" name={ v.Name } value={ v.Value }/>
+			} else if f.ID=="import-project" && v.Name=="repoURL" {
+				<div class="field-wide repository-field">
+					<label for={ v.TextID(f.ID) }>@fieldLabel(v)</label>
+					<div class="repository-input">
+						<input id={ v.TextID(f.ID) } type="url" name={ v.Name } value={ v.Value } placeholder={ v.Placeholder } required?={ v.Required }/>
+						<button class="secondary repository-trigger" type="button" popovertarget="repository-menu">Browse repositories <span aria-hidden="true">⌄</span></button>
+					</div>
+				</div>
 			} else {
 				<label for={ v.TextID(f.ID) } class={ templ.KV("check",v.Type=="checkbox"),templ.KV("field-wide",v.Wide()) }>
 					if v.Type=="checkbox" {
-						<input id={ v.TextID(f.ID) } type="checkbox" name={ v.Name } checked?={ v.Checked } data-type="bool"/>{ v.Label }
+						<input id={ v.TextID(f.ID) } type="checkbox" name={ v.Name } checked?={ v.Checked } required?={ v.Required } data-type="bool"/>@fieldLabel(v)
 					} else {
 						<span>
-							{ v.Label }
+							@fieldLabel(v)
 							if !v.Required {
 								<small class="optional">Optional</small>
 							}
@@ -312,8 +323,32 @@ templ formFields(f Form, fields []Field) {
 	</div>
 }
 
+templ fieldLabel(v Field) {
+	<span class="field-label">
+		{ v.Label }
+		if v.Required {
+			<span class="required-marker" aria-hidden="true">*</span>
+		}
+	</span>
+}
+
 templ brand() {
 	<a class="brand" href="/" aria-label="Harbor home"><img src="/favicon.svg" width="36" height="36" alt=""/><span>Harbor</span></a>
+}
+
+templ repositoryMenu() {
+	<div id="repository-menu" class="repository-menu" popover="auto" role="dialog" aria-label="Browse repositories">
+		<div class="section-heading"><h2>Browse repositories</h2><button type="button" class="secondary icon-button" popovertarget="repository-menu" popovertargetaction="hide" aria-label="Close repositories">×</button></div>
+		<form id="browse-repos" class="action-form" data-api="listGitHubRepos" aria-describedby="browse-repos-result">
+			<label for="repository-owner">GitHub owner <small>Leave blank to use your connected account.</small></label>
+			<div class="repository-owner"><input id="repository-owner" name="owner" type="text" placeholder="Username or organization" autocomplete="off"/><button type="submit" class="secondary">Load</button></div>
+			<div id="browse-repos-result" class="form-result" role="status" aria-live="polite"></div>
+			<label class="repository-search" hidden><span class="sr-only">Filter repositories</span><input type="search" placeholder="Filter repositories…" data-repository-search/></label>
+			<div class="repository-results" aria-label="Repositories"></div>
+			<p class="repository-empty" hidden>No matching repositories.</p>
+		</form>
+		<a class="repository-connect" href="/settings">Connect GitHub for private repositories</a>
+	</div>
 }
 
 templ refreshIcon() {
