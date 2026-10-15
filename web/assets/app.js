@@ -3,6 +3,8 @@
   "use strict";
   const $ = (s, root = document) => root.querySelector(s);
   const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+  const currentPage = $('.topbar nav [aria-current="page"]');
+  if (currentPage) currentPage.scrollIntoView({ block: "nearest", inline: "nearest" });
   const name = document.body.dataset.project || "";
   const encoder = new TextEncoder();
   let refreshBusy = false;
