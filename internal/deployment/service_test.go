@@ -50,6 +50,20 @@ type blockedStartSandbox struct {
 	entered chan struct{}
 }
 
+type retryStartFailureSandbox struct {
+	contracts.Sandbox
+	starts int
+	err    error
+}
+
+func (s *retryStartFailureSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) (*contracts.SandboxHandle, error) {
+	s.starts++
+	if s.starts > 1 {
+		return nil, s.err
+	}
+	return s.Sandbox.Start(ctx, spec)
+}
+
 type gatedStartSandbox struct {
 	contracts.Sandbox
 	entered chan struct{}
@@ -941,6 +955,24 @@ func TestStartupExitReportsProcessFailureAndKeepsProduction(t *testing.T) {
 	}
 	if failures != 3 {
 		t.Fatalf("startup retries = %d, want 3", failures)
+	}
+}
+
+func TestStartupRetryFailureRetainsOriginalReadinessExit(t *testing.T) {
+	healthConfig := strings.Replace(testConfig, "start:\n", "health:\n  path: /ready\nstart:\n", 1)
+	h := newServiceHarness(t, healthConfig)
+	h.sandbox.failHealthAttempts = 1
+	retryErr := errors.New("verify memory.max enforcement: no such file or directory")
+	h.service.sandbox = &retryStartFailureSandbox{Sandbox: h.sandbox, err: retryErr}
+	failed, err := h.service.Deploy(context.Background(), h.source, "demo")
+	if err == nil || failed == nil || failed.State != model.StartFailed || !errors.Is(err, retryErr) || !strings.Contains(err.Error(), "application exited before becoming ready (exit code 1)") {
+		t.Fatalf("startup retry = %+v, %v; want both the original process exit and retry error", failed, err)
+	}
+	if !strings.Contains(failed.Error, "exit code 1") {
+		t.Fatalf("persisted failure hid the original exit: %s", failed.Error)
+	}
+	if response := routerRequest(h.router, "demo.localhost", "/app"); response.Code != http.StatusNotFound {
+		t.Fatalf("failed startup published a route: status %d", response.Code)
 	}
 }
 

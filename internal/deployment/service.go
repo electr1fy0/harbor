@@ -569,6 +569,7 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 	// PORT-only apps cannot inherit a reserved listener. Retry a bounded number
 	// of starts if a process fails during the loopback port handoff.
 	var handle *contracts.SandboxHandle
+	var readinessErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		s.recordEvent(d.ID, app.ID, model.EventSandboxStarting, "")
 		port, portErr := allocatePort()
@@ -635,7 +636,7 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 			if errors.Is(inspectErr, sandbox.ErrSandboxNotFound) {
 				inspectErr = nil
 			}
-			return s.fail(&d, model.StartFailed, errors.Join(err, inspectErr))
+			return s.fail(&d, model.StartFailed, errors.Join(readinessErr, err, inspectErr))
 		}
 		if handle == nil {
 			return s.fail(&d, model.StartFailed, errors.New("sandbox returned no process handle"))
@@ -668,6 +669,7 @@ func (s *Service) deployObservedLocked(ctx context.Context, sourceDir, name stri
 			break
 		}
 		s.recordEvent(d.ID, app.ID, model.EventHealthCheckFailed, err.Error())
+		readinessErr = err
 		info, inspectErr := s.inspectRuntime(d.ID)
 		stopErr := s.stopRuntime(d.ID)
 		if stopErr != nil {

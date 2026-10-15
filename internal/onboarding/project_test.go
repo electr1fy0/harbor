@@ -55,6 +55,19 @@ func TestInspectNodeUsesLockfileAndEditableSelection(t *testing.T) {
 	}
 }
 
+func TestInspectSQLiteExampleExplainsManagedDatabaseSetup(t *testing.T) {
+	inspection, err := Inspect(filepath.Join("..", "..", "examples", "sqlite-app"), "sqlite-demo", ConfigSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.ExistingConfig || slices.Contains(inspection.EnvironmentKeys, "DATABASE_URL") {
+		t.Fatalf("inspection should keep the repository config and omit the managed connection value: %+v", inspection)
+	}
+	if warnings := strings.Join(inspection.Warnings, "\n"); !strings.Contains(warnings, "Choose a service under Database before deploying") {
+		t.Fatalf("SQLite import omitted database setup instructions: %s", warnings)
+	}
+}
+
 func TestYarnLockfileUsesClassicOrBerryInstallMode(t *testing.T) {
 	for _, tc := range []struct{ name, header, declared, want string }{
 		{"classic", "# yarn lockfile v1\n", "", "yarn install --frozen-lockfile"},

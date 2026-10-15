@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"reflect"
 	"runtime"
 	"slices"
@@ -472,6 +473,34 @@ func TestSystemdRejectsUnenforcedLimitsAndCleansUp(t *testing.T) {
 	}
 	if runner.stops != 1 {
 		t.Fatal("unenforced runtime left alive")
+	}
+}
+
+func TestSystemdStartupExitDuringLimitVerificationPreservesExitStatus(t *testing.T) {
+	for _, output := range []string{
+		"LoadState=loaded\nActiveState=failed\nSubState=failed\nMainPID=0\nExecMainCode=1\nExecMainStatus=1\nResult=exit-code\n",
+		oomUnit,
+	} {
+		t.Run(parseSystemdProperties(output)["Result"], func(t *testing.T) {
+			spec := systemdTestSpec(t)
+			runner := &systemdRunner{}
+			sb := testSystemd(runner)
+			sb.verifyLimits = func(*contracts.SandboxInfo, contracts.SandboxSpec) error {
+				runner.state = output
+				return &os.PathError{Op: "open", Path: "/sys/fs/cgroup/test/memory.max", Err: os.ErrNotExist}
+			}
+			handle, err := sb.Start(context.Background(), spec)
+			if handle != nil || err == nil || !strings.Contains(err.Error(), "exited during startup (exit code") || strings.Contains(err.Error(), "memory.max") {
+				t.Fatalf("Start = %+v, %v; want the process exit rather than missing cgroup files", handle, err)
+			}
+			info, err := sb.Inspect(context.Background(), spec.ID)
+			if err != nil || info.Running || info.ExitCode == nil || runner.stops != 1 {
+				t.Fatalf("terminal inspection = %+v, %v; stops = %d", info, err, runner.stops)
+			}
+			if wantOOM := output == oomUnit; info.OOMKilled != wantOOM {
+				t.Fatalf("OOM classification = %v, want %v", info.OOMKilled, wantOOM)
+			}
+		})
 	}
 }
 

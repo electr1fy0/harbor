@@ -256,7 +256,7 @@ templ actionForm(f Form) {
 					<div id={ f.ResultID() } class="form-result" role="status" aria-live="polite"></div>
 				}
 				for _, group := range f.FieldGroups() {
-					<details class="field-group" data-review={ fmtBool(f.Inspect && group.Label == "Build settings") }>
+					<details class="field-group" data-review={ fmtBool(f.Inspect && (group.Label == "Build settings" || group.Label == "Database")) }>
 						<summary>{ group.Label }<span class="disclosure-chevron" aria-hidden="true">⌄</span></summary>
 						@formFields(f, group.Fields)
 					</details>

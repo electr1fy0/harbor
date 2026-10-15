@@ -20,7 +20,7 @@ func main() {
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		log.Fatal("DATABASE_URL is required")
+		log.Fatal("DATABASE_URL is required; bind a managed SQLite service in Data services, then deploy again")
 	}
 	db, err := sql.Open("sqlite3", databaseURL)
 	if err != nil {

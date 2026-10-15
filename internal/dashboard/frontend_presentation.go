@@ -77,6 +77,9 @@ func presentPage(p ui.Page) ui.Page {
 				v.Placeholder = "apps/api"
 				v.Help = "Leave blank if the app is in the repository root."
 			}
+			if v.Name == "sqliteService" {
+				v.Help = "Required for apps that use DATABASE_URL. Harbor supplies the database connection when this service is bound."
+			}
 			if v.Name == "removeEnvironment" {
 				v.Placeholder = "OLD_API_KEY, UNUSED_SETTING"
 				v.Help = "Separate variable names with commas or new lines."

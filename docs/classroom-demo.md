@@ -18,6 +18,25 @@ GitHub dashboard import flow, connect and test the repository in advance.
 Custom domains, DNS/HTTPS checks, primary-domain redirects, and application
 certificate authorization have been removed. Local hostname routing remains.
 
+## SQLite through the dashboard
+
+1. Choose **Import project**, enter the Harbor GitHub repository, and give the
+   project a name such as `sqlite-app`.
+2. Under **Repository options**, set **Root directory** to `examples/sqlite-app`.
+3. Click **Inspect repository**. Under **Database**, enter a service name such as
+   `demo-db` and check **Create the SQLite service if needed**. If the service
+   already exists, enter its name and leave the creation box unchecked.
+4. Click **Deploy project**, wait for the project to run, then choose
+   **Open application** and append `/counter` to its URL. Each visit increments
+   the stored counter.
+5. Choose **Deploy again** on the project's Overview, wait for deployment, and
+   refresh `/counter` to show that the value continues from the existing data.
+
+To repair an import made without a database, open **Data services**, create a
+SQLite service, select it under **Bind a service**, and click **Bind service**.
+Then return to **Overview** and click **Deploy again**. Harbor supplies
+`DATABASE_URL`; do not enter it manually in environment settings.
+
 ## Features to explain or show with prepared evidence
 
 | Feature | Why a live classroom demo is awkward |

@@ -343,6 +343,21 @@ func TestCycle4SQLiteManagedServiceAndPersistence(t *testing.T) {
 		return resp.StatusCode, string(body), nil
 	}
 
+	// Importing without a database must explain the application exit, even if
+	// its short-lived systemd cgroup disappears while limits are being checked.
+	sqliteSrc := filepath.Join(root, "examples", "sqlite-app")
+	missingDBOut, err := cli("deploy", sqliteSrc, "--name", "sqliteapp")
+	if err == nil || !strings.Contains(missingDBOut, "State: START_FAILED") || !strings.Contains(missingDBOut, "exit") || strings.Contains(missingDBOut, "memory.max") {
+		t.Fatalf("unbound SQLite app should report its startup exit: %v: %s", err, missingDBOut)
+	}
+	missingDBLogs, err := cli("logs", "sqliteapp")
+	if err != nil || !strings.Contains(missingDBLogs, "DATABASE_URL is required") {
+		t.Fatalf("missing database diagnostics: %v: %s", err, missingDBLogs)
+	}
+	if status, _, err := query("sqliteapp.localhost", "/counter"); err != nil || status != http.StatusNotFound {
+		t.Fatalf("unbound SQLite app published a route: status=%d err=%v", status, err)
+	}
+
 	// 1. Add SQLite managed service
 	addOut, err := cli("add", "sqlite", "--name", "db")
 	if err != nil {
@@ -371,7 +386,6 @@ func TestCycle4SQLiteManagedServiceAndPersistence(t *testing.T) {
 	}
 
 	// 4. Deploy the SQLite counter app
-	sqliteSrc := filepath.Join(root, "examples", "sqlite-app")
 	deployOut, err := cli("deploy", sqliteSrc, "--name", "sqliteapp")
 	if err != nil {
 		buildLogs, _ := cli("logs", "sqliteapp")

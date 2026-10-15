@@ -216,13 +216,23 @@ func (s *SystemdSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) 
 		}
 		if info.Running {
 			if err := s.verifyLimits(info, spec); err != nil {
+				// A short-lived process can exit after show reports it running.
+				// systemd then removes its cgroup, so missing limit files are
+				// evidence of that exit rather than an enforcement failure.
+				current, inspectErr := s.inspectUnit(startCtx, spec.ID)
+				if inspectErr == nil && !current.Running && !current.Transitioning {
+					s.rememberCompletedUnit(spec.ID, current)
+					err = systemdStartupExit(unit, current)
+				} else {
+					err = errors.Join(err, inspectErr)
+				}
 				return nil, s.cleanupStart(spec.ID, err)
 			}
 			return &contracts.SandboxHandle{ID: spec.ID, PID: info.PID}, nil
 		}
 		if info.ExitCode != nil || info.Result != "" && info.Result != "success" {
 			s.rememberCompletedUnit(spec.ID, info)
-			return nil, s.cleanupStart(spec.ID, fmt.Errorf("systemd unit %s exited during startup: result=%s", unit, info.Result))
+			return nil, s.cleanupStart(spec.ID, systemdStartupExit(unit, info))
 		}
 		select {
 		case <-startCtx.Done():
@@ -230,6 +240,13 @@ func (s *SystemdSandbox) Start(ctx context.Context, spec contracts.SandboxSpec) 
 		case <-ticker.C:
 		}
 	}
+}
+
+func systemdStartupExit(unit string, info *contracts.SandboxInfo) error {
+	if info.ExitCode != nil {
+		return fmt.Errorf("systemd unit %s exited during startup (exit code %d; result=%s); check runtime logs", unit, *info.ExitCode, info.Result)
+	}
+	return fmt.Errorf("systemd unit %s exited during startup: result=%s; check runtime logs", unit, info.Result)
 }
 
 // Caller holds mu. Cleanup uses a fresh bounded context even if Start was canceled.

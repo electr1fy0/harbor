@@ -568,6 +568,10 @@ func readEnvironmentKeys(sourceDir string) ([]string, []string, error) {
 				continue
 			}
 			if reservedEnvironmentKey(key) {
+				if key == "DATABASE_URL" {
+					warnings = appendUnique(warnings, "DATABASE_URL is supplied by a managed SQLite service. Choose a service under Database before deploying.")
+					continue
+				}
 				warnings = appendUnique(warnings, "Reserved environment names were omitted.")
 				continue
 			}
